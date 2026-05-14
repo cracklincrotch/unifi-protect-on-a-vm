@@ -4,6 +4,8 @@ Run UniFi Protect (and Access) in a Debian VM on macOS or Linux, replacing or su
 
 This is a working setup running UniFi Protect with smart detection, face recognition, and UniFi Access. The scripts and configuration in this repo were fully vibe-coded with Claude, which dramatically sped up the process and produced thorough inline documentation along the way.
 
+> **In a hurry?** [QUICKSTART.md](QUICKSTART.md) has the 10-minute version. Come back here for the full reference.
+
 > **Disclaimer**: This is not officially supported by Ubiquiti. It uses Ubiquiti's binaries which you must download yourself from official sources. Use at your own risk. The author and contributors take no responsibility for data loss, security issues, or Ubiquiti deciding to deprecate this approach.
 
 ## Why?
