@@ -8,6 +8,13 @@ This is a working setup running UniFi Protect with smart detection, face recogni
 
 > **Disclaimer**: This is not officially supported by Ubiquiti. It uses Ubiquiti's binaries which you must download yourself from official sources. Use at your own risk. The author and contributors take no responsibility for data loss, security issues, or Ubiquiti deciding to deprecate this approach.
 
+> **Side effects may include**: data loss, unbootable VMs, frustration, learning something, the urge to write your 
+> own NVR firmware and/or software, accidentally becoming a Linux sysadmin, neighbors asking why your Mac is making 
+> fan noise at 3am, Ubiquiti sending a cease-and-desist letter (this has not happened), the realization that the 
+> original UNVR wasn't that bad after all, and/or the possibility of success. Consult your local sysadmin if symptoms 
+> persist for more than 22 hours of uptime.  DO NOT CONSULT A SPOUSE OR PARTNER AS THEY MAY CONSIDER THIS TO BE A 
+> COLOSSAL WASTE OF YOUR TIME.
+
 ## Why?
 
 Ubiquiti markets the UNVR as capable of handling many 2K cameras, and in many deployments it does fine. In my particular deployment with a mix of cameras and active smart detection / face recognition, the UNVR was struggling — the UI was sluggish, face search took minutes, and Protect would sometimes crash. Upgrading to an ENVR would have cost significantly more than building this VM-based setup.
