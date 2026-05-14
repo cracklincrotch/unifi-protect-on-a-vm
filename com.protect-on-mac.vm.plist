@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.protect-on-mac.vm.plist
+
+  Launches the Protect VM at boot and keeps it running. Place this file
+  at /Library/LaunchDaemons/ and load it with launchctl. See the
+  install-launchd.sh script in this repo for a one-shot installer.
+
+  TEMPLATE NOTES:
+    Replace YOUR_USERNAME with the macOS user the script runs as. This
+    user needs the passwordless qemu sudoers entry from the README
+    setup section. Replace SCRIPT_PATH with the absolute path to your
+    start-protect-vm.sh.
+
+  WHY LaunchDaemon (not LaunchAgent):
+    LaunchDaemons run as root at boot, even before any user logs in.
+    LaunchAgents only run inside a logged-in user session. For a
+    headless server you want LaunchDaemon — the VM should start whether
+    or not anyone has logged in to the Mac console.
+
+  WHY KeepAlive:
+    If the VM exits for any reason (clean shutdown from inside, crash,
+    out-of-memory, etc.), launchd restarts it. The 30-second throttle
+    prevents tight restart loops if something is consistently failing.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.protect-on-mac.vm</string>
+
+    <key>UserName</key>
+    <string>YOUR_USERNAME</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME</string>
+
+    <!-- The actual command to run. ProgramArguments wins over Program
+         when both are present, and ProgramArguments lets us pass args
+         explicitly even if there aren't any here. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>SCRIPT_PATH</string>
+    </array>
+
+    <!-- Start at boot, restart if it exits -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't restart faster than every 30 seconds. Prevents busy-loops
+         if QEMU is consistently failing (e.g. DAS not connected). -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Capture pre-QEMU script output to a log file. This is the output
+         from start-protect-vm.sh itself (disk resolution, mode detection,
+         "Starting VM..." messages, etc.) plus anything QEMU writes to
+         stderr.
+
+         The VM's actual console output (kernel boot, login prompt, etc.)
+         is captured separately via the chardev logfile inside QEMU, in
+         /var/log/protect-vm.console.log. This is so you can attach to the
+         live console via attach-console.sh AND have a persistent log of
+         everything that's happened on the console.
+    -->
+    <key>StandardOutPath</key>
+    <string>/var/log/protect-vm.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/protect-vm.error.log</string>
+
+    <!-- Inherit a sane PATH so the script can find qemu-system-aarch64,
+         networksetup, smartctl, etc. without absolute paths. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

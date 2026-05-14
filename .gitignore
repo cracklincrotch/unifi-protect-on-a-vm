@@ -1,0 +1,14 @@
+# Personal configuration — never commit this
+protect-on-mac.conf
+
+# Local VM artifacts (in case anyone keeps them in-repo)
+vm-data/
+*.qcow2
+*.fd
+
+# macOS noise
+.DS_Store
+
+# Editor swap files
+*.swp
+*~

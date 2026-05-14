@@ -1,0 +1,155 @@
+#!/bin/bash
+###############################################################################
+# protect-on-mac.conf.example
+#
+# Configuration file for the host-side scripts (start-protect-vm.sh,
+# install-launchd.sh, attach-console.sh).
+#
+# SETUP:
+#   1. Copy this file to protect-on-mac.conf (in the same directory as
+#      the scripts, or wherever you want via PROTECT_ON_MAC_CONF env var)
+#   2. Edit the values below for your environment
+#   3. Add protect-on-mac.conf to .gitignore so your specific config
+#      doesn't end up in the repo
+#
+# OVERRIDE:
+#   PROTECT_ON_MAC_CONF=/path/to/other.conf ./start-protect-vm.sh
+#
+# This is a bash file that gets sourced. You can include any valid bash
+# syntax (arrays, functions, conditional logic, etc.) — it's just config
+# data by convention.
+###############################################################################
+
+###############################################################################
+# VM file paths
+###############################################################################
+
+# Where your VM files live. Everything else under here unless you override
+# specific paths individually.
+VM_DATA_DIR="$HOME/unifi-protect/vm-data"
+
+# The VM's main disk (Debian rootfs). Created with qemu-img during setup.
+VM_DISK="${VM_DATA_DIR}/protect.qcow2"
+
+# UEFI variables file. The firmware writes boot config here. Created
+# during initial setup with `dd if=/dev/zero of=efi_vars.fd bs=1M count=64`.
+EFI_VARS="${VM_DATA_DIR}/efi_vars.fd"
+
+# QEMU's UEFI firmware. Comes with Homebrew's qemu package.
+EFI_CODE="/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+
+###############################################################################
+# VM resources
+###############################################################################
+
+# CPU count and RAM (MB). The UNVR baseline is 4 CPUs and 4096 MB.
+# More RAM is generally better for UI responsiveness — more page cache
+# means more of the postgres working set stays in memory.
+VM_CPUS=4
+VM_RAM=4096
+
+###############################################################################
+# Storage
+###############################################################################
+
+# Two ways to attach storage to the VM:
+#
+#   1. Raw passthrough (DISK_SERIALS): /dev/diskN devices get passed
+#      through directly. Lowest overhead. Required if you want the VM
+#      to see existing UNVR disks. Requires sudo to access the devices.
+#
+#   2. Disk image files (STORAGE_IMAGES): qcow2 files attached as
+#      virtual disks. Slightly more overhead. Doesn't require sudo for
+#      the storage layer. Portable — you can move the file to another
+#      machine. Compatible with UTM if you prefer that frontend.
+#
+# Use either, both, or neither (an array can be empty).
+
+# Physical disks identified by ATA serial number.
+# Find serials with: smartctl -i /dev/diskN | grep "Serial Number"
+DISK_SERIALS=(
+    # "9QG22F5Q"
+    # "9QF241GW"
+    # Add your serials here
+)
+
+# Disk image files to attach as virtual disks. Path to each qcow2.
+STORAGE_IMAGES=(
+    # "${VM_DATA_DIR}/postgres-disk.qcow2"
+    # Add more here if you want bulk storage as image files
+)
+
+###############################################################################
+# Network
+###############################################################################
+
+# MAC address of the network adapter to bridge to. Works with any wired
+# adapter (built-in, USB, Thunderbolt). The VM will appear on your network
+# using this MAC.
+# Find adapters with: networksetup -listallhardwareports
+NIC_MAC="aa:bb:cc:dd:ee:ff"
+
+###############################################################################
+# QEMU tuning
+###############################################################################
+
+# Cache mode. writeback is faster but slightly less crash-safe than
+# writethrough. For a continuously-running VM on a UPS, writeback is fine.
+DISK_CACHE="writeback"
+
+# Async I/O mode. macOS doesn't support 'native' (Linux aio_*), so use
+# threads. Don't change this on macOS.
+DISK_AIO="threads"
+
+###############################################################################
+# Console (background mode only)
+###############################################################################
+#
+# When the VM is started via launchd or otherwise in the background, the
+# console becomes available as a unix socket. attach-console.sh reads
+# these paths to find and attach to it.
+
+# Path to the console socket. /var/run is cleared on reboot, so we don't
+# leave stale sockets behind.
+CONSOLE_SOCKET="/var/run/protect-vm.console.sock"
+
+# Path to the persistent console log. All console output written here
+# regardless of whether anyone is currently attached.
+CONSOLE_LOG="/var/log/protect-vm.console.log"
+
+###############################################################################
+# Scripts ISO (used during initial install + for refreshing in-VM scripts)
+###############################################################################
+#
+# Path to the ISO file produced by make-scripts-iso.sh. If the file
+# exists, start-protect-vm.sh attaches it to the VM as a CD-ROM, where
+# the VM can mount it to copy scripts. If the file doesn't exist when
+# running interactively, start-protect-vm.sh offers to create it. In
+# background mode (launchd) the missing-ISO case is silently skipped.
+#
+# Set to empty string to disable ISO handling entirely.
+
+SCRIPTS_ISO="${VM_DATA_DIR}/protect-on-mac-scripts.iso"
+
+###############################################################################
+# QMP (QEMU Machine Protocol)
+###############################################################################
+#
+# Used by snapshot.sh to pause/resume the running VM for live snapshots,
+# so you don't need a full shutdown to take one. Always exposed.
+
+QMP_SOCKET="/var/run/protect-vm.qmp.sock"
+
+###############################################################################
+# Launchd (used by install-launchd.sh)
+###############################################################################
+
+# Label and path for the launchd daemon. Generally no reason to change
+# these unless you're running multiple Protect VMs on the same host.
+LAUNCHD_LABEL="com.protect-on-mac.vm"
+LAUNCHD_PLIST_PATH="/Library/LaunchDaemons/${LAUNCHD_LABEL}.plist"
+
+# Where script stdout/stderr from launchd go. The VM's own console log
+# is separate — see CONSOLE_LOG above.
+LAUNCHD_LOG="/var/log/protect-vm.log"
+LAUNCHD_ERROR_LOG="/var/log/protect-vm.error.log"
