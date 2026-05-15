@@ -61,6 +61,7 @@ HOST_SCRIPTS=(
     snapshot.sh
     install-launchd.sh
     make-scripts-iso.sh
+    smartctl-host-helper.sh
 )
 
 OTHER_FILES=(

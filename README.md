@@ -588,6 +588,142 @@ That's intentional and correct — those packages are managed by `unifi-update.s
 
 **Unattended upgrades**: if you want automatic security patches, install `unattended-upgrades` and configure it for security-only updates. Since the Ubiquiti packages are already held, unattended-upgrades will leave them alone automatically.
 
+## Optional: smartctl proxy (real disk health in Protect)
+
+By default the installer drops a fake `/usr/sbin/smartctl` into the VM that always reports a healthy virtual disk. That keeps Protect happy, but it means Protect's UI can never warn you about a disk that's actually dying — bad sectors, climbing reallocated-sector counts, SMART failures. The data lives on USB-attached disks on the Mac; the VM only ever sees virtio-scsi devices with no real SMART data.
+
+The smartctl proxy bridges that gap. The fake `smartctl` is replaced with a wrapper that forwards SMART queries back to the Mac, which *can* read the physical disks over USB. Protect then shows genuine per-disk health.
+
+This is **optional and opt-in**. If you don't set it up, nothing changes — the fake `smartctl` is used and the VM behaves exactly as before.
+
+### How it works
+
+1. Protect runs `smartctl <flags> /dev/sdX` inside the VM.
+2. The VM-side wrapper resolves `/dev/sdX` to its disk serial (via `lsblk`).
+3. It SSHes to the Mac with a key locked to a single forced command, passing the serial and flags.
+4. The host helper validates the input, looks the serial up in a serial-to-device map (`disk-serial.map`, rewritten by `start-protect-vm.sh` on every VM start — macOS renumbers `/dev/diskN` constantly), and runs the real `smartctl` against the matching `/dev/diskN`.
+5. The output travels back and the wrapper hands it to Protect.
+
+If anything fails — proxy not configured, Mac unreachable, unknown disk, SSH error — the wrapper falls through to the local real `smartctl`. The proxy is strictly best-effort; it can't break the VM.
+
+Only **raw-passthrough disks** (`DISK_SERIALS` in `protect-on-mac.conf`) are proxied. qcow2 disk images have no underlying physical disk, so they keep returning local data.
+
+### Prerequisite: SAT SMART pass-through on the Mac
+
+macOS does **not** expose ATA/SMART pass-through for USB-attached disks natively. You need the kasbert `OS-X-SAT-SMART-Driver` kext — most easily obtained by installing [DriveDx](https://binaryfruit.com/drivedx), which bundles and installs it. On Apple Silicon, loading a third-party kext requires **Reduced Security** mode (set in the recoveryOS Startup Security Utility). See "Limitations and known issues" below — this is a real dependency, not a footnote.
+
+Verify pass-through works for your enclosure before bothering with the rest. With the kext loaded:
+
+```bash
+# Confirm the enclosure's bridge supports SAT pass-through
+ioreg -r -w 0 -c fi_dungeon_driver_IOSATDriver \
+  | egrep 'Enclosure|PassThroughMode|Capable|KnownEnclosure'
+
+# And that smartctl actually reads the disk
+brew install smartmontools
+sudo smartctl -a /dev/diskN
+```
+
+If `SATSMARTCapable = Yes` shows up and `smartctl -a` returns real attributes, you're good. If not, the proxy has nothing to forward and there's no point setting it up.
+
+### Setup
+
+**1. Install the VM with the proxy enabled.** Run the bare-metal installer with `SMARTCTL_PROXY=1`:
+
+```bash
+SMARTCTL_PROXY=1 sudo bash /root/install-protect-baremetal.sh
+```
+
+This installs real `smartmontools` (as `/usr/sbin/smartctl.real`), the wrapper at `/usr/sbin/smartctl`, a config file at `/etc/default/smartctl-proxy`, and generates an SSH keypair under `/etc/protect-smartctl-proxy/`. The installer prints the VM's public key at the end — keep it.
+
+(Already installed without the proxy? Re-run Phase 7's logic by re-running the installer with the flag, or set it up by hand following the same file layout.)
+
+**2. Point the VM at the Mac.** Edit `/etc/default/smartctl-proxy` in the VM:
+
+```sh
+PROXY_HOST=192.168.1.50        # the Mac's LAN IP
+PROXY_USER=donnie              # your macOS username
+PROXY_KEY=/etc/protect-smartctl-proxy/id_ed25519
+```
+
+**3. On the Mac — install smartmontools and enable Remote Login:**
+
+```bash
+brew install smartmontools
+# System Settings → General → Sharing → Remote Login (on)
+```
+
+**4. On the Mac — install the host helper:**
+
+```bash
+sudo cp smartctl-host-helper.sh /usr/local/bin/
+sudo chmod +x /usr/local/bin/smartctl-host-helper.sh
+```
+
+The helper's `DISK_MAP` path must match `DISK_MAP` in `protect-on-mac.conf`. Both default to `$VM_DATA_DIR/disk-serial.map`, so if you didn't change `VM_DATA_DIR` there's nothing to do.
+
+**5. On the Mac — add the sudoers rule.** The helper needs root to read raw disks:
+
+```bash
+sudo visudo -f /etc/sudoers.d/smartctl-proxy
+# Add this line (replace `donnie` with your username):
+#   donnie ALL=(root) NOPASSWD: /opt/homebrew/bin/smartctl
+```
+
+**6. On the Mac — authorize the VM's key with a forced command.** Add the public key the installer printed to `~/.ssh/authorized_keys`, prefixed so the key can *only* run the helper:
+
+```
+command="/usr/local/bin/smartctl-host-helper.sh",no-pty,no-port-forwarding,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA...the VM's public key... protect-smartctl-proxy
+```
+
+Optionally tighten further with `from="<VM-IP>"` at the front of that line.
+
+### Verify
+
+From inside the VM:
+
+```bash
+# Pick a raw-passthrough disk, e.g. /dev/sda
+smartctl -a /dev/sda
+```
+
+If the proxy is working you'll see the real disk's model, serial, temperature, and SMART attributes — not the fake "Virtual Storage Device". A failing disk shows `SMART overall-health self-assessment test result: FAILED` to anything that runs `smartctl`. Whether Protect's *Storage Manager panel* renders that is a separate, unresolved matter — see [Storage health and the Storage Manager panel](#storage-health-and-the-storage-manager-panel) below.
+
+To watch what the proxy is doing, the host helper writes diagnostics to stderr (visible in the VM via SSH stderr) and `start-protect-vm.sh` prints the disk-map path and count on every start.
+
+### Caveats
+
+- **Per-disk only.** RAID devices (`/dev/md3`) have no single serial, so a `smartctl` call against the array falls back to local data. Protect mostly queries individual disks, which is what gets proxied.
+- **The map is only as fresh as the last VM start.** If you hot-swap a disk while the VM is running, the map is stale until the next `start-protect-vm.sh`. The wrapper falls back gracefully in the meantime.
+- **State-changing flags are refused.** The host helper only ever runs read-only SMART queries — it rejects self-test triggers (`-t`), `--set`, and SMART enable/disable. Protect doesn't need those.
+
+## Storage health and the Storage Manager panel
+
+The smartctl proxy is one piece of a larger goal: **getting real disk health — and disk-failure alerts — into Protect on a VM.** This section is an honest account of what works, what doesn't, and why.
+
+### The goal
+
+On a real UNVR, a failing disk turns the Storage panel red ("Drive Failure Detected") and raises an alert. The aim here is the same on the VM: a dying disk in the DAS should be *noticed*, not silently ignored behind a faked-healthy virtual disk.
+
+### What works
+
+- **`smartctl` returns real data.** With the smartctl proxy (`smartctl-vm-wrapper.sh` + `smartctl-host-helper.sh`), any `smartctl` call in the VM is forwarded to the Mac and answered with genuine SMART data for the real USB-attached disks.
+- **`ustorage` returns real data.** `ustorage-vm.py` replaces the installer's static fake `/usr/bin/ustorage` with a dynamic one that reports real per-disk health and array state — including failure detection from both SMART *and* md-array member state (a dropped disk shows as `faulty`).
+- **`mdadm --detail /dev/md3` works on migrated arrays.** `mdadm-vm-wrapper.sh` redirects that hardcoded call (UniFi software always asks for `/dev/md3`) to whatever device the imported array actually assembled as (`/dev/md12x` on a migration).
+- **`unifi-core`'s background storage health poll runs on real data.** Once the `unifi-core` → `smartctl` sudoers rule is in place, the every-60-seconds storage check succeeds with genuine SMART instead of failing.
+
+### What doesn't — the Storage Manager panel
+
+The UniFi OS **Storage Manager panel** (Settings → Control Plane → Storage) does not render — it sits on a loading spinner.
+
+The cause is architectural. The panel is driven by `ucore`'s live `system.ustorage` object, and `ucore` builds the disk portion of that object with help from **`usd`**, the UNVR storage daemon. `usd` cannot run on this VM: it's built for the UNVR's read-only-squashfs + overlay-root boot layout and crashes resolving the root volume on a normal Debian install. With `usd` dead, `ucore`'s `ustorage.disks` stays empty and the panel waits forever.
+
+Things that were *ruled out* along the way, in case it saves someone else the trip: it is not the `md3`-vs-`md12x` naming (fixed by the wrapper), not the `smartctl` sudo denial (fixed by the sudoers rule), and not the `usd`↔`usdbd` status database (populating it directly had no effect — the panel doesn't read it).
+
+### The aim / open work
+
+Disk health *is* on the box and queryable today — by CLI, by script, and by `unifi-core`'s health poll. The remaining goal is the UI/alert path: making a failing disk visibly raise an alert in Protect. The route under exploration is a small daemon that supplies `ucore` the storage data `usd` normally would, without `usd`'s VM-incompatible code. That work is unfinished.
+
 ## Migrating back to a real UNVR (or ENVR, or other host)
 
 If you decide to go back to a real UNVR, upgrade to an ENVR, or move to a different VM host, the reverse-migration workflow is close to the forward one — backup-first, restore on the new system, then move the disks for the recording history.
@@ -651,6 +787,8 @@ A 16GB host would give substantial headroom for more cameras and heavier smart d
 - **Firmware updates can break things**: a UniFi OS update can introduce new services or change package contents. Test in a separate VM first if possible. The masked-services list may need to grow.
 - **Cameras may need re-adoption** in some cases. The backup-restore approach handles most of this automatically, but if a camera was briefly adopted by another controller during testing, it may need manual re-adoption.
 - **Initial setup is hands-on**. The Debian install step isn't automated. Once Debian is installed, the rest is scripted.
+- **Real disk health needs a kext**. By default Protect sees a faked-healthy virtual disk. The optional [smartctl proxy](#optional-smartctl-proxy-real-disk-health-in-protect) surfaces genuine SMART data, but macOS has no native ATA pass-through for USB disks — it depends on the kasbert `OS-X-SAT-SMART-Driver` kext (bundled with DriveDx), and loading a third-party kext on Apple Silicon requires booting once into recoveryOS to enable **Reduced Security** mode. If you don't set up the proxy, none of this applies.
+- **The Storage Manager panel doesn't render**. The UniFi OS Storage panel sits on a loading spinner — it depends on the `usd` daemon, which can't run on a VM. Real disk health is still available via `smartctl`/`ustorage` and `unifi-core`'s health poll; only the visual panel is affected. See [Storage health and the Storage Manager panel](#storage-health-and-the-storage-manager-panel).
 
 ## Possible future enhancements
 
@@ -664,6 +802,10 @@ VM-side (live inside the Debian VM):
 - **`unifi-update.sh`** — query API, download, install latest UniFi packages.
 - **`mount-storage.sh`** — import existing RAID, migrate postgres to SSD, show status.
 - **`uninstall.sh`** — migrate postgres back to the RAID to prep disks for moving to other hardware.
+- **`smartctl-vm-wrapper.sh`** — VM side of the optional smartctl proxy. Installs as `/usr/sbin/smartctl`; forwards SMART queries to the Mac host. See the "smartctl proxy" section.
+- **`smartctl-proxy.conf.example`** — config template for the proxy wrapper. Copy to `/etc/default/smartctl-proxy` in the VM.
+- **`ustorage-vm.py`** — dynamic `ustorage` replacement: reports real per-disk and array health instead of the installer's static fake. See "Storage health".
+- **`mdadm-vm-wrapper.sh`** — redirects `mdadm --detail /dev/md3` to the real array on migrated setups. See "Storage health".
 
 Host-side (live on the Mac):
 
@@ -674,6 +816,7 @@ Host-side (live on the Mac):
 - **`snapshot.sh`** — create/restore/list/delete qcow2 snapshots before risky operations.
 - **`install-launchd.sh`** — install/manage the launchd daemon that auto-starts the VM at boot.
 - **`com.protect-on-mac.vm.plist`** — launchd configuration template used by `install-launchd.sh`.
+- **`smartctl-host-helper.sh`** — host side of the optional smartctl proxy. Forced-command target that returns real disk SMART data to the VM. See the "smartctl proxy" section.
 
 ## Credits
 

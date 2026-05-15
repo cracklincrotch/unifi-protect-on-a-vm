@@ -9,6 +9,10 @@ vm-data/
 # macOS noise
 .DS_Store
 
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Editor swap files
 *.swp
 *~

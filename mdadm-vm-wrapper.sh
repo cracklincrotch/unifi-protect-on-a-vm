@@ -1,0 +1,72 @@
+#!/bin/bash
+###############################################################################
+# mdadm-vm-wrapper.sh
+#
+# VM-side mdadm wrapper. Install INSIDE the Protect VM as /sbin/mdadm.
+#
+# WHY
+#
+# unifi-core's storage code hardcodes `mdadm --detail /dev/md3` — on a real
+# UNVR the recording array is always /dev/md3. On this VM that holds only
+# for a *fresh* install; a migrated/imported array assembles under a
+# foreign homehost as /dev/md12x instead (e.g. /dev/md126). `mdadm --detail
+# /dev/md3` then doesn't return the real array — it returns a stale
+# leftover (the raid0 the installer's fresh-install step created) or
+# nothing — and unifi-core's Storage panel hangs on the wait bar, never
+# advancing to disk inspection.
+#
+# This wrapper intercepts exactly that one call: `mdadm --detail /dev/md3`
+# is redirected to whatever array is really mounted at /volume1. Every
+# other mdadm invocation passes straight through to the real binary.
+#
+# A /dev/md3 symlink does NOT solve this — mdadm resolves /dev/md3 by md
+# identity, not by the path handed to it, so it ignores the symlink. The
+# command itself has to be rewritten, which is what this wrapper does.
+#
+# REQUIRES /sbin/mdadm.real — the real mdadm binary. The bare-metal
+# installer saves it in Phase 1 (`cp /sbin/mdadm /sbin/mdadm.real`). If it
+# is missing, create it from the real binary before installing this:
+#
+#   cp /sbin/mdadm /sbin/mdadm.real
+#
+# INSTALL (inside the VM, as root)
+#
+#   [ -e /sbin/mdadm.real ] || cp /sbin/mdadm /sbin/mdadm.real
+#   install -m 0755 mdadm-vm-wrapper.sh /sbin/mdadm
+#
+# Boot-time RAID assembly uses the mdadm bundled in the initramfs, not
+# /sbin/mdadm, so this wrapper does not affect how arrays are assembled.
+###############################################################################
+
+REAL=/sbin/mdadm.real
+
+# Without the real binary there is nothing useful we can do.
+if [ ! -x "$REAL" ]; then
+    echo "mdadm wrapper: $REAL not found — see mdadm-vm-wrapper.sh header" >&2
+    exit 1
+fi
+
+# Detect the `--detail /dev/md3` call. Match flexibly: any argument list
+# containing both --detail and /dev/md3.
+detail=0
+md3=0
+for arg in "$@"; do
+    case "$arg" in
+        --detail) detail=1 ;;
+        /dev/md3) md3=1 ;;
+    esac
+done
+
+if [ "$detail" -eq 1 ] && [ "$md3" -eq 1 ]; then
+    # Resolve the device currently backing /volume1 (the recording array).
+    real_md=$(awk '$2 == "/volume1" { print $1; exit }' /proc/self/mounts)
+    if [ -n "$real_md" ] && [ "$real_md" != "/dev/md3" ]; then
+        # Report the real array, but relabel the header line as /dev/md3
+        # so the caller sees the device path it asked for.
+        "$REAL" --detail "$real_md" 2>&1 \
+            | sed "1s#^${real_md}:#/dev/md3:#"
+        exit "${PIPESTATUS[0]}"
+    fi
+fi
+
+exec "$REAL" "$@"

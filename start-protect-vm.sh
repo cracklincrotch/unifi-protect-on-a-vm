@@ -207,6 +207,7 @@ print_connected_disks() {
 # diagnostic is printed once at the end, listing everything we did find.
 DISK_ARGS=()
 MISSING_SERIALS=()
+MAP_ENTRIES=()
 for serial in "${DISK_SERIALS[@]}"; do
     bsd=$(resolve_disk_by_serial "$serial")
     if [ -z "$bsd" ]; then
@@ -218,6 +219,8 @@ for serial in "${DISK_SERIALS[@]}"; do
         -drive "if=none,id=disk_$serial,file=/dev/$bsd,format=raw,cache=$DISK_CACHE,aio=$DISK_AIO"
         -device "scsi-hd,bus=scsi0.0,drive=disk_$serial,serial=$serial"
     )
+    # serial<TAB>/dev/diskN — consumed by the optional smartctl proxy.
+    MAP_ENTRIES+=("$serial"$'\t'"/dev/$bsd")
 done
 
 if [ "${#MISSING_SERIALS[@]}" -gt 0 ]; then
@@ -229,6 +232,38 @@ if [ "${#MISSING_SERIALS[@]}" -gt 0 ]; then
     echo "" >&2
     print_connected_disks
     exit 1
+fi
+
+###############################################################################
+# Serial → device map (for the optional smartctl proxy)
+###############################################################################
+#
+# The optional smartctl proxy lets Protect's UI show real disk health by
+# forwarding SMART queries from inside the VM back to this host. The VM
+# sends the disk's serial; the host helper needs to translate that serial
+# into the /dev/diskN it currently maps to. macOS renumbers /dev/diskN on
+# every reconnect, so the map is rewritten here on every VM start.
+#
+# Only raw-passthrough disks (DISK_SERIALS) appear in the map — qcow2
+# images in STORAGE_IMAGES have no underlying host device to query.
+#
+# This is written unconditionally and is harmless if the proxy isn't set
+# up. It lives under VM_DATA_DIR (not /var/run) so start-protect-vm.sh can
+# write it without root, and the host helper — which runs as the same
+# macOS user — can read it. See the README "smartctl proxy" section.
+DISK_MAP="${DISK_MAP:-$VM_DATA_DIR/disk-serial.map}"
+if [ -n "$DISK_MAP" ]; then
+    if {
+        for e in "${MAP_ENTRIES[@]}"; do
+            printf '%s\n' "$e"
+        done
+    } > "$DISK_MAP" 2>/dev/null; then
+        echo "Disk serial map: $DISK_MAP (${#MAP_ENTRIES[@]} disk(s))"
+    else
+        echo "WARNING: could not write disk serial map $DISK_MAP" >&2
+        echo "         The smartctl proxy (if enabled) will fall back to" >&2
+        echo "         local SMART data until this is writable." >&2
+    fi
 fi
 
 # Disk images. Each qcow2 in STORAGE_IMAGES gets attached as a virtual

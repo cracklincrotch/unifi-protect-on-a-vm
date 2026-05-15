@@ -85,6 +85,19 @@ STORAGE_IMAGES=(
     # Add more here if you want bulk storage as image files
 )
 
+# Serial-to-device map file for the optional smartctl proxy.
+#
+# start-protect-vm.sh writes a "serial<TAB>/dev/diskN" line here for each
+# raw-passthrough disk every time the VM starts. The host-side proxy
+# helper (smartctl-host-helper.sh) reads it to translate a serial sent
+# by the VM into the /dev/diskN it currently maps to.
+#
+# If you build the smartctl proxy, the DISK_MAP value here must match the
+# DISK_MAP path baked into smartctl-host-helper.sh. The default works
+# out of the box. If you don't use the proxy, this file is still written
+# but nothing reads it. See the README "smartctl proxy" section.
+DISK_MAP="${VM_DATA_DIR}/disk-serial.map"
+
 ###############################################################################
 # Network
 ###############################################################################
