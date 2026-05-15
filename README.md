@@ -244,7 +244,7 @@ The config covers:
 
 - **VM file paths** — qcow2, EFI variables, EFI code
 - **VM resources** — CPU count, RAM (4096 MB is the UNVR baseline, more recommended)
-- **Storage** — disk serial numbers for raw passthrough, or qcow2 paths for disk images
+- **Storage** — disk serial numbers for raw passthrough, or `"path|serial"` entries for qcow2 disk images. Both forms produce VM-visible serials (lsblk -o NAME,SERIAL inside the VM) so each disk has a stable, identifiable identity. Used for consistent ordering, mdadm coherence, and the optional smartctl proxy if you build it.
 - **Network** — MAC address of the adapter to bridge to
 - **Console** — paths for the background-mode console socket and log
 - **Launchd** — labels and log paths used by the daemon installer

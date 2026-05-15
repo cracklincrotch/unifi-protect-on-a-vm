@@ -234,22 +234,38 @@ fi
 # Disk images. Each qcow2 in STORAGE_IMAGES gets attached as a virtual
 # disk. These appear after any raw disks in the VM, as /dev/sdX devices
 # in the order listed.
+#
+# Each STORAGE_IMAGES entry is "path|serial" — the qcow2 file path and
+# the serial number the VM should see for that disk. The serial appears
+# in lsblk -o NAME,SERIAL inside the VM and (importantly) is what the
+# smartctl proxy uses to identify the disk if you've enabled host-side
+# SMART forwarding. Keep serials unique across all attached disks.
 IMG_ARGS=()
 idx=0
-for img in "${STORAGE_IMAGES[@]}"; do
+for entry in "${STORAGE_IMAGES[@]}"; do
+    # Parse "path|serial". If no | is present, treat the whole entry as
+    # the path and synthesize a serial from the basename — backward
+    # compatibility with older configs.
+    if [[ "$entry" == *"|"* ]]; then
+        img="${entry%%|*}"
+        serial="${entry##*|}"
+    else
+        img="$entry"
+        serial="img-$(basename "$entry" .qcow2)"
+        echo "WARNING: STORAGE_IMAGES entry has no serial — using '$serial'" >&2
+        echo "         Update config to 'path|serial' format for stable identity." >&2
+    fi
+
     if [ ! -f "$img" ]; then
         echo "ERROR: Storage image not found: $img" >&2
         exit 1
     fi
-    # Build a unique serial/id from the filename so each image gets a
-    # distinct identity inside the VM. lsblk -o NAME,SERIAL will show
-    # these in the VM, which helps identify which disk image is which.
-    name=$(basename "$img" .qcow2)
-    id="img_${idx}_${name}"
-    echo "Storage image: $img"
+
+    id="img_${idx}"
+    echo "Storage image: $img (serial: $serial)"
     IMG_ARGS+=(
         -drive "if=none,id=$id,file=$img,format=qcow2,cache=$DISK_CACHE,aio=$DISK_AIO"
-        -device "scsi-hd,bus=scsi0.0,drive=$id,serial=$name"
+        -device "scsi-hd,bus=scsi0.0,drive=$id,serial=$serial"
     )
     idx=$((idx + 1))
 done

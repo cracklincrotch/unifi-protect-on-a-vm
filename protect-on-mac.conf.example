@@ -73,9 +73,15 @@ DISK_SERIALS=(
     # Add your serials here
 )
 
-# Disk image files to attach as virtual disks. Path to each qcow2.
+# Disk image files to attach as virtual disks. Each entry is
+# "path|serial" — the qcow2 file path and the serial number the VM will
+# see for that disk. Serials should be unique per disk (across both
+# DISK_SERIALS and STORAGE_IMAGES) and stable across reboots so the VM
+# sees consistent identity for each image. Use anything memorable —
+# letters, digits, and hyphens are safe.
 STORAGE_IMAGES=(
-    # "${VM_DATA_DIR}/postgres-disk.qcow2"
+    # "${VM_DATA_DIR}/postgres-disk.qcow2|postgres-001"
+    # "${VM_DATA_DIR}/recordings.qcow2|recordings-001"
     # Add more here if you want bulk storage as image files
 )
 
