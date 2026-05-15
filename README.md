@@ -687,7 +687,7 @@ From inside the VM:
 smartctl -a /dev/sda
 ```
 
-If the proxy is working you'll see the real disk's model, serial, temperature, and SMART attributes — not the fake "Virtual Storage Device". A failing disk shows `SMART overall-health self-assessment test result: FAILED` to anything that runs `smartctl`. Whether Protect's *Storage Manager panel* renders that is a separate, unresolved matter — see [Storage health and the Storage Manager panel](#storage-health-and-the-storage-manager-panel) below.
+If the proxy is working you'll see the real disk's model, serial, temperature, and SMART attributes — not the fake "Virtual Storage Device". A failing disk shows `SMART overall-health self-assessment test result: FAILED` to anything that runs `smartctl`. For that health to surface in Protect's *Storage Manager panel*, see [Storage health and the Storage Manager panel](#storage-health-and-the-storage-manager-panel) below.
 
 To watch what the proxy is doing, the host helper writes diagnostics to stderr (visible in the VM via SSH stderr) and `start-protect-vm.sh` prints the disk-map path and count on every start.
 
@@ -699,30 +699,64 @@ To watch what the proxy is doing, the host helper writes diagnostics to stderr (
 
 ## Storage health and the Storage Manager panel
 
-The smartctl proxy is one piece of a larger goal: **getting real disk health — and disk-failure alerts — into Protect on a VM.** This section is an honest account of what works, what doesn't, and why.
+The smartctl proxy is one piece of a larger goal: **getting real disk health — and disk-failure alerts — into Protect on a VM, and making the Storage Manager panel render.** With the storage shim described below, that goal is met.
 
 ### The goal
 
-On a real UNVR, a failing disk turns the Storage panel red ("Drive Failure Detected") and raises an alert. The aim here is the same on the VM: a dying disk in the DAS should be *noticed*, not silently ignored behind a faked-healthy virtual disk.
+On a real UNVR, the Storage panel lists every disk with its health, and a failing disk turns the panel red ("Drive Failure Detected") and raises an alert. The aim here is the same on the VM: a dying disk in the DAS should be *noticed*, not silently ignored behind a faked-healthy virtual disk.
 
 ### What works
 
-- **`smartctl` returns real data.** With the smartctl proxy (`smartctl-vm-wrapper.sh` + `smartctl-host-helper.sh`), any `smartctl` call in the VM is forwarded to the Mac and answered with genuine SMART data for the real USB-attached disks.
-- **`ustorage` returns real data.** `ustorage-vm.py` replaces the installer's static fake `/usr/bin/ustorage` with a dynamic one that reports real per-disk health and array state — including failure detection from both SMART *and* md-array member state (a dropped disk shows as `faulty`).
-- **`mdadm --detail /dev/md3` works on migrated arrays.** `mdadm-vm-wrapper.sh` redirects that hardcoded call (UniFi software always asks for `/dev/md3`) to whatever device the imported array actually assembled as (`/dev/md12x` on a migration).
-- **`unifi-core`'s background storage health poll runs on real data.** Once the `unifi-core` → `smartctl` sudoers rule is in place, the every-60-seconds storage check succeeds with genuine SMART instead of failing.
+- **`smartctl` returns real data** — with the optional [smartctl proxy](#optional-smartctl-proxy-real-disk-health-in-protect), any `smartctl` call in the VM is forwarded to the Mac and answered with genuine SMART data for the real USB-attached disks.
+- **`ustorage` returns real data** — `ustorage-vm.py` replaces the installer's static fake `/usr/bin/ustorage` with a dynamic one that reports real per-disk health, array state, and all three space types (primary, swap, root). Failure detection covers both SMART self-assessment *and* md-array member state — a dropped disk shows as `faulty`.
+- **`mdadm --detail /dev/md3` works on migrated arrays** — `mdadm-vm-wrapper.sh` redirects that hardcoded call (UniFi software always asks for `/dev/md3`) to whatever device the imported array actually assembled as (`/dev/md12x` on a migration).
+- **`unifi-core`'s background storage health poll runs on real data** — once the `unifi-core` → `smartctl` sudoers rule is in place, the every-60-seconds storage check succeeds with genuine SMART instead of failing.
+- **The Storage Manager panel renders** — with the storage shim below installed, Settings → System → Storage shows the array, every disk with model / serial / temperature / health, and capacity. A failing disk surfaces the same red state a real UNVR shows.
 
-### What doesn't — the Storage Manager panel
+### Why the panel needs a shim
 
-The UniFi OS **Storage Manager panel** (Settings → Control Plane → Storage) does not render — it sits on a loading spinner.
+The panel is driven by `unifi-core`'s live `nvr.systemInfo.ustorage` object. On a real UNVR that data flows:
 
-The cause is architectural. The panel is driven by `ucore`'s live `system.ustorage` object, and `ucore` builds the disk portion of that object with help from **`usd`**, the UNVR storage daemon. `usd` cannot run on this VM: it's built for the UNVR's read-only-squashfs + overlay-root boot layout and crashes resolving the root volume on a normal Debian install. With `usd` dead, `ucore`'s `ustorage.disks` stays empty and the panel waits forever.
+```
+usd  (storage daemon, :10055)
+  -> ustated  (UI State Exporter — translates events to a storage gRPC API)
+  -> unifi-core  (subscribes on 127.0.0.1:11052; renders the panel)
+```
 
-Things that were *ruled out* along the way, in case it saves someone else the trip: it is not the `md3`-vs-`md12x` naming (fixed by the wrapper), not the `smartctl` sudo denial (fixed by the sudoers rule), and not the `usd`↔`usdbd` status database (populating it directly had no effect — the panel doesn't read it).
+`usd` cannot run on this VM — it is built for the UNVR's read-only-squashfs + overlay-root boot layout and crashes resolving the root volume on a normal Debian install. With `usd` dead, `ustated` has nothing to translate, `unifi-core`'s storage object stays empty, and the panel spins forever.
 
-### The aim / open work
+The fix bypasses both `usd` and `ustated`:
 
-Disk health *is* on the box and queryable today — by CLI, by script, and by `unifi-core`'s health poll. The remaining goal is the UI/alert path: making a failing disk visibly raise an alert in Protect. The route under exploration is a small daemon that supplies `ucore` the storage data `usd` normally would, without `usd`'s VM-incompatible code. That work is unfinished.
+- **`ustated-shim.js`** — a small Node gRPC server that serves `unifi.firmware.storage.v1.StorageAPI` (the exact API `unifi-core` subscribes to) directly on `127.0.0.1:11052`, built from `unifi-core`'s own generated protobuf modules. It sources live data from `/sys`, `/proc`, and `smartctl`, and supplies the array level, spaces, and storage settings.
+- **`unifi-core-storage-patch.sh`** — `unifi-core`'s bundled `service.js` hardcodes the disk list of its `ustorage` object to empty and only ever calls `ustorage space inspect`. The patch makes its `system.ustorage.inspect` handler also call `ustorage disk inspect` (served by `ustorage-vm.py`), so the per-disk list populates. `service.js` is a vendor bundle that updates overwrite, so the patch is re-applied on every boot by a systemd unit.
+
+### Setup
+
+This is **optional and opt-in**, like the smartctl proxy. Without it the panel spins; the rest of the VM is unaffected. It works best alongside the smartctl proxy — without the proxy the disks render with faked-healthy SMART data; with it they show genuine health.
+
+Inside the VM, as root:
+
+```bash
+# 1. The shim — serves the storage gRPC API on :11052
+install -m 0755 ustated-shim.js      /usr/local/bin/ustated-shim.js
+install -m 0644 ustated-shim.service /etc/systemd/system/ustated-shim.service
+systemctl mask ustated          # frees :11052 permanently
+systemctl daemon-reload
+systemctl enable --now ustated-shim.service
+
+# 2. The service.js patch guard — re-applies the disk-list patch each boot
+install -m 0755 unifi-core-storage-patch.sh      /usr/local/bin/unifi-core-storage-patch.sh
+install -m 0644 unifi-core-storage-patch.service /etc/systemd/system/unifi-core-storage-patch.service
+systemctl enable unifi-core-storage-patch.service
+/usr/local/bin/unifi-core-storage-patch.sh       # apply once now
+systemctl restart unifi-core
+```
+
+`ustated-shim.js` requires `node24` (already present in the VM as `/usr/bin/node24`) and `unifi-core`'s `node_modules` (present on any install). The patch guard is idempotent, never fails the boot, and saves the original `service.js` as `service.js.prepatch`.
+
+### Caveat: firmware updates
+
+The `service.js` patch targets one specific line in a minified vendor bundle. A `unifi-core` update overwrites `service.js`; the patch guard re-applies it on the next boot or `unifi-core` restart. But if an update *restructures* that handler, the anchor string won't match — the guard logs `expected exactly 1 anchor, found 0 — NOT patching` and no-ops, leaving the panel's disk list empty until the patch is updated. Check `journalctl -u unifi-core-storage-patch` after any `unifi-core` update. `ustated-shim.js` is unaffected by `unifi-core` updates.
 
 ## Migrating back to a real UNVR (or ENVR, or other host)
 
@@ -788,7 +822,7 @@ A 16GB host would give substantial headroom for more cameras and heavier smart d
 - **Cameras may need re-adoption** in some cases. The backup-restore approach handles most of this automatically, but if a camera was briefly adopted by another controller during testing, it may need manual re-adoption.
 - **Initial setup is hands-on**. The Debian install step isn't automated. Once Debian is installed, the rest is scripted.
 - **Real disk health needs a kext**. By default Protect sees a faked-healthy virtual disk. The optional [smartctl proxy](#optional-smartctl-proxy-real-disk-health-in-protect) surfaces genuine SMART data, but macOS has no native ATA pass-through for USB disks — it depends on the kasbert `OS-X-SAT-SMART-Driver` kext (bundled with DriveDx), and loading a third-party kext on Apple Silicon requires booting once into recoveryOS to enable **Reduced Security** mode. If you don't set up the proxy, none of this applies.
-- **The Storage Manager panel doesn't render**. The UniFi OS Storage panel sits on a loading spinner — it depends on the `usd` daemon, which can't run on a VM. Real disk health is still available via `smartctl`/`ustorage` and `unifi-core`'s health poll; only the visual panel is affected. See [Storage health and the Storage Manager panel](#storage-health-and-the-storage-manager-panel).
+- **The Storage Manager panel needs the storage shim**. Out of the box the UniFi OS Storage panel sits on a loading spinner — it depends on the `usd` daemon, which can't run on a VM. The optional [storage shim](#storage-health-and-the-storage-manager-panel) (`ustated-shim.js` plus a small `service.js` patch) makes the panel render with real disk health. The patch targets a minified vendor bundle and may need re-checking after `unifi-core` updates.
 
 ## Possible future enhancements
 
@@ -806,6 +840,10 @@ VM-side (live inside the Debian VM):
 - **`smartctl-proxy.conf.example`** — config template for the proxy wrapper. Copy to `/etc/default/smartctl-proxy` in the VM.
 - **`ustorage-vm.py`** — dynamic `ustorage` replacement: reports real per-disk and array health instead of the installer's static fake. See "Storage health".
 - **`mdadm-vm-wrapper.sh`** — redirects `mdadm --detail /dev/md3` to the real array on migrated setups. See "Storage health".
+- **`ustated-shim.js`** — storage-API gRPC shim. Serves `unifi.firmware.storage.v1` on `127.0.0.1:11052` so the Storage Manager panel renders. See "Storage health".
+- **`ustated-shim.service`** — systemd unit that runs `ustated-shim.js` at boot.
+- **`unifi-core-storage-patch.sh`** — idempotent re-apply guard for the `unifi-core` `service.js` disk-list patch. See "Storage health".
+- **`unifi-core-storage-patch.service`** — systemd unit that runs the patch guard before `unifi-core` starts.
 
 Host-side (live on the Mac):
 

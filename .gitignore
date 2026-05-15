@@ -16,3 +16,6 @@ __pycache__/
 # Editor swap files
 *.swp
 *~
+
+# Superseded experiment — the ustated-shim.js approach replaced it
+usd-shim.py

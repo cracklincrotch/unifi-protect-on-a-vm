@@ -324,19 +324,83 @@ def raid_info(dev):
     return {"expected": expected, "had_most": active, "members": members}
 
 
-def space_inspect():
-    """`space inspect` — the primary storage volume, live values."""
-    dev = volume_device(STORAGE_VOLUME)
+def _usage(mountpoint):
+    """(total, used, resv) bytes for a mounted filesystem; zeros on error."""
     try:
-        stat = os.statvfs(STORAGE_VOLUME)
+        stat = os.statvfs(mountpoint)
         total = stat.f_blocks * stat.f_frsize
         free = stat.f_bfree * stat.f_frsize
         avail = stat.f_bavail * stat.f_frsize
-        used = total - free
-        resv = free - avail
+        return total, total - free, free - avail
     except OSError:
-        total = used = resv = 0
-    return [{
+        return 0, 0, 0
+
+
+def _swap_space():
+    """The swap-array space entry, or None.
+
+    The UNVR swap partitions assemble into an md array that the VM never
+    actually uses for swap. unifi-core still expects the entry, so report
+    it as a zero-capacity swap space — exactly how a real UNVR reports it."""
+    primary = os.path.basename(volume_device(STORAGE_VOLUME))
+    try:
+        names = sorted(os.listdir("/sys/block"))
+    except OSError:
+        return None
+    for name in names:
+        if not name.startswith("md") or name == primary:
+            continue
+        try:
+            if not os.listdir("/sys/block/%s/slaves" % name):
+                continue
+        except OSError:
+            continue
+        return {
+            "action": "none",
+            "device": name,
+            "errors_count": -1,
+            "estimate": None,
+            "health": "health",
+            "progress": None,
+            "raid": raid_info("/dev/" + name),
+            "reasons": [],
+            "resv_bytes": 0,
+            "space_type": "swap",
+            "total_bytes": 0,
+            "used_bytes": 0,
+        }
+    return None
+
+
+def _root_space():
+    """The OS/root filesystem space entry. On the VM root is plain ext4 on
+    its own disk, not an md array, so raid is null."""
+    total, used, resv = _usage("/")
+    return {
+        "action": "none",
+        "device": os.path.basename(volume_device("/")) or "root",
+        "errors_count": 0,
+        "estimate": None,
+        "health": "health",
+        "progress": 0.0,
+        "raid": None,
+        "reasons": [],
+        "resv_bytes": resv,
+        "space_type": "root",
+        "total_bytes": total,
+        "used_bytes": used,
+    }
+
+
+def space_inspect():
+    """`space inspect` — primary, swap and root spaces with live values.
+
+    unifi-core builds its storage model from this list; a real UNVR
+    reports all three space types, so the panel won't render if any are
+    missing."""
+    dev = volume_device(STORAGE_VOLUME)
+    total, used, resv = _usage(STORAGE_VOLUME)
+    spaces = [{
         "action": "none",
         "device": os.path.basename(dev),
         "errors_count": 0,
@@ -350,6 +414,11 @@ def space_inspect():
         "total_bytes": total,
         "used_bytes": used,
     }]
+    swap = _swap_space()
+    if swap is not None:
+        spaces.append(swap)
+    spaces.append(_root_space())
+    return spaces
 
 
 def config_show():

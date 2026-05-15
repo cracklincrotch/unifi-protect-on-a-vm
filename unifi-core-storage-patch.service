@@ -1,0 +1,33 @@
+###############################################################################
+# unifi-core-storage-patch.service
+#
+# Re-applies the ustorage.disks patch to unifi-core's service.js before
+# unifi-core starts. A unifi-core update overwrites the bundled service.js
+# and reverts the patch; this restores it on every unifi-core start / boot.
+#
+# INSTALL (inside the VM, as root)
+#
+#   install -m 0755 unifi-core-storage-patch.sh /usr/local/bin/unifi-core-storage-patch.sh
+#   install -m 0644 unifi-core-storage-patch.service /etc/systemd/system/unifi-core-storage-patch.service
+#   systemctl daemon-reload
+#   systemctl enable unifi-core-storage-patch.service
+#
+# The patch is also applied immediately on enable via the line below; or run
+# the script by hand once:  /usr/local/bin/unifi-core-storage-patch.sh
+#
+# Verify:  journalctl -u unifi-core-storage-patch
+###############################################################################
+
+[Unit]
+Description=Re-apply unifi-core ustorage.disks patch
+ConditionPathExists=/usr/share/unifi-core/app/service.js
+# Run before unifi-core so the patched file is in place when it starts.
+Before=unifi-core.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/unifi-core-storage-patch.sh
+
+[Install]
+# Pulled in at boot, and whenever unifi-core.service is (re)started.
+WantedBy=multi-user.target unifi-core.service

@@ -1,0 +1,40 @@
+###############################################################################
+# ustated-shim.service
+#
+# Runs ustated-shim.js at boot — the storage/v1 gRPC server that feeds
+# unifi-core's Storage panel on this VM (replaces ustated on 127.0.0.1:11052).
+#
+# INSTALL (inside the VM, as root)
+#
+#   install -m 0755 ustated-shim.js /usr/local/bin/ustated-shim.js
+#   install -m 0644 ustated-shim.service /etc/systemd/system/ustated-shim.service
+#   systemctl mask ustated            # frees :11052 permanently
+#   systemctl daemon-reload
+#   systemctl enable --now ustated-shim.service
+#
+# Verify:  systemctl status ustated-shim   /   journalctl -u ustated-shim -f
+#
+# REQUIRES node24. If `command -v node24` is not /usr/bin/node24, edit the
+# ExecStart path below (systemd's PATH does not include custom locations).
+###############################################################################
+
+[Unit]
+Description=ustated storage-API shim (unifi.firmware.storage.v1 on 127.0.0.1:11052)
+Documentation=file:/usr/local/bin/ustated-shim.js
+After=network.target
+# Start before unifi-core so :11052 is already serving when it subscribes.
+Before=unifi-core.service
+
+[Service]
+Type=simple
+# ustated must be masked (see INSTALL); stop it defensively in case it is not.
+ExecStartPre=-/usr/bin/systemctl stop ustated
+ExecStart=/usr/bin/env node24 /usr/local/bin/ustated-shim.js
+Restart=always
+RestartSec=2
+# Surface the shim's stderr in the journal.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
