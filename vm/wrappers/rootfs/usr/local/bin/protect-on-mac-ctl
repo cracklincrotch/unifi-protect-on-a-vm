@@ -1,0 +1,71 @@
+#!/bin/bash
+###############################################################################
+# protect-on-mac-ctl — guest client for the virtio-serial control channel.
+#
+# In the repo this file lives at
+# vm/wrappers/rootfs/usr/local/bin/protect-on-mac-ctl — i.e. at the path
+# it installs to. Install it INSIDE the Protect VM as
+# /usr/local/bin/protect-on-mac-ctl.
+#
+# WHAT IT DOES
+#
+# Sends one request to the host-side control listener (control-host-helper.sh)
+# over the virtio-serial port and prints the response. The host listener
+# only implements a fixed verb set, so this client can ask for nothing the
+# host hasn't explicitly allowed.
+#
+# USAGE
+#   protect-on-mac-ctl ping
+#   protect-on-mac-ctl snapshot <label>          # host takes a qcow2 snapshot
+#   protect-on-mac-ctl smartctl <serial> [flags] # used by the smartctl proxy
+#
+# EXIT STATUS
+#   The host verb's exit code is passed through. 69 means the control
+#   channel is not available (no virtio-serial port, or no host listener).
+#   Callers should treat the channel as best-effort and degrade gracefully.
+###############################################################################
+set -o pipefail
+
+PORT="${PROTECT_CTL_PORT:-/dev/virtio-ports/org.protect-on-mac.control}"
+LOCK="/run/protect-on-mac-ctl.lock"
+SENTINEL_PREFIX="__PROTECT_CTL_DONE"
+TIMEOUT="${PROTECT_CTL_TIMEOUT:-120}"
+
+if [ "$#" -lt 1 ]; then
+    echo "usage: protect-on-mac-ctl <verb> [args...]" >&2
+    exit 64
+fi
+
+if [ ! -e "$PORT" ]; then
+    echo "protect-on-mac-ctl: control channel not present:" >&2
+    echo "  $PORT" >&2
+    echo "  the host listener / virtio-serial device is not configured" >&2
+    exit 69
+fi
+
+# The virtio-serial port is a single shared stream — serialise so two
+# callers (e.g. the smartctl proxy and a snapshot trigger) can't interleave.
+exec 9>"$LOCK"
+flock 9
+
+exec 3<>"$PORT" || { echo "protect-on-mac-ctl: cannot open $PORT" >&2; exit 69; }
+
+# Drain any stale bytes left behind by a previous aborted transaction.
+while read -r -t 0.3 _ <&3; do :; done 2>/dev/null
+
+# Send the request — one whitespace-joined line.
+printf '%s\n' "$*" >&3
+
+# Read the response until the sentinel line; everything before it is output.
+rc=1
+while IFS= read -r -t "$TIMEOUT" line <&3; do
+    if [[ "$line" == "$SENTINEL_PREFIX "* ]]; then
+        rc="${line#"$SENTINEL_PREFIX" }"
+        break
+    fi
+    printf '%s\n' "$line"
+done
+
+exec 3<&-
+[[ "$rc" =~ ^[0-9]+$ ]] || rc=1
+exit "$rc"

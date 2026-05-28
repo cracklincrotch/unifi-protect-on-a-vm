@@ -6,6 +6,9 @@ vm-data/
 *.qcow2
 *.fd
 
+# Build artifact — make-scripts-iso.sh output
+*.iso
+
 # macOS noise
 .DS_Store
 

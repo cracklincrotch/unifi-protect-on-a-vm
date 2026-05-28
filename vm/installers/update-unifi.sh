@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-# unifi-update.sh
+# update-unifi.sh
 #
 # Unified update script for the UniFi Protect VM.
 #
@@ -25,7 +25,7 @@
 #   sync-os: Pulls the entire UNVR firmware, extracts and repacks all
 #            Ubiquiti packages, installs them. Use this to follow UniFi
 #            OS major releases (5.0.13 -> 5.0.16 etc).
-#   protect: Just the Protect and AI Feature Console debs.
+#   protect: Just the Protect and AI Feature Controller debs.
 #   access:  Just the Access deb.
 #   all:     Sync OS, then upgrade Protect + Access on top.
 #
@@ -33,21 +33,20 @@
 # would change without doing anything.
 #
 # Usage:
-#   ./unifi-update.sh                # Show what would be updated, no changes
-#   ./unifi-update.sh --check        # Same as default
-#   ./unifi-update.sh --sync-os      # Sync UniFi OS packages to latest firmware
-#   ./unifi-update.sh --protect      # Upgrade Protect to latest stable
-#   ./unifi-update.sh --protect-edge # Upgrade Protect to latest edge
-#   ./unifi-update.sh --access       # Upgrade Access to latest stable
-#   ./unifi-update.sh --access-edge  # Upgrade Access to latest edge
-#   ./unifi-update.sh --all          # Sync OS + Protect + Access to stable
-#   ./unifi-update.sh --all-edge     # Sync OS + Protect + Access to edge
-#   ./unifi-update.sh --yes          # Skip confirmation prompts
+#   ./update-unifi.sh                # Show what would be updated, no changes
+#   ./update-unifi.sh --check        # Same as default
+#   ./update-unifi.sh --sync-os      # Sync UniFi OS packages to latest firmware
+#   ./update-unifi.sh --protect      # Upgrade Protect to latest stable
+#   ./update-unifi.sh --protect-edge # Upgrade Protect to latest edge
+#   ./update-unifi.sh --access       # Upgrade Access to latest stable
+#   ./update-unifi.sh --access-edge  # Upgrade Access to latest edge
+#   ./update-unifi.sh --all          # Sync OS + Protect + Access to stable
+#   ./update-unifi.sh --all-edge     # Sync OS + Protect + Access to edge
+#   ./update-unifi.sh --yes          # Skip confirmation prompts
 #
 # Environment overrides (rarely needed):
 #   FW_URL              - Override UNVR firmware download URL
 #   PROTECT_URL         - Override Protect deb download URL
-#   AIFC_URL            - Override AI Feature Console deb download URL
 #   ACCESS_URL          - Override Access deb download URL
 #   PROTECT_CHANNEL     - 'release' (stable) or 'beta' (edge), default 'release'
 #   KEEP_WORKDIR        - Set to 1 to keep /opt/unifi-update after running
@@ -77,48 +76,23 @@ FW_API="https://fw-update.ubnt.com/api/firmware-latest"
 ACTION="check"
 ASSUME_YES=0
 
-# Packages held by the install script to prevent uncoordinated apt-get
-# upgrades. We unhold these before doing our installs and re-hold them
-# afterward. Keep this list in sync with install-protect-baremetal.sh.
-UBIQUITI_HELD_PACKAGES=(
-    unifi-protect
-    unifi-access
-    unifi-core
-    ds
-    ulp-go
-    uid-agent
-    ai-feature-console
-    unifi-user-assets
-    unifi-face-shared-lib
-    uos-discovery-client
-    ubnt-archive-keyring
-)
+# Ubiquiti packages are held to prevent uncoordinated `apt-get upgrade`
+# runs from upgrading them outside this script. We unhold them before our
+# installs and re-hold afterward. The set is derived at run time by
+# ubiquiti_packages() (see HELPERS) — no static list to keep in sync.
 
-# Unhold Ubiquiti packages so apt can upgrade them. Only operates on
-# packages that are actually installed; skips warnings about missing ones.
+# Unhold Ubiquiti packages so apt can upgrade them.
 unhold_ubiquiti_packages() {
-    local to_unhold=()
-    for pkg in "${UBIQUITI_HELD_PACKAGES[@]}"; do
-        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-            to_unhold+=("$pkg")
-        fi
-    done
-    if [ "${#to_unhold[@]}" -gt 0 ]; then
-        apt-mark unhold "${to_unhold[@]}" >/dev/null
-    fi
+    local pkgs
+    pkgs="$(ubiquiti_packages)"
+    [ -n "$pkgs" ] && apt-mark unhold $pkgs >/dev/null 2>&1 || true
 }
 
-# Re-hold Ubiquiti packages after installation. Inverse of unhold_ubiquiti_packages.
+# Re-hold Ubiquiti packages after installation.
 hold_ubiquiti_packages() {
-    local to_hold=()
-    for pkg in "${UBIQUITI_HELD_PACKAGES[@]}"; do
-        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-            to_hold+=("$pkg")
-        fi
-    done
-    if [ "${#to_hold[@]}" -gt 0 ]; then
-        apt-mark hold "${to_hold[@]}" >/dev/null
-    fi
+    local pkgs
+    pkgs="$(ubiquiti_packages)"
+    [ -n "$pkgs" ] && apt-mark hold $pkgs >/dev/null 2>&1 || true
 }
 
 ###############################################################################
@@ -184,17 +158,34 @@ confirm() {
     esac
 }
 
-# Strongly recommend taking a host-side snapshot before risky operations.
-# Snapshots are instant copy-on-write checkpoints of the VM disks; they're
-# the fast rollback path if an upgrade breaks something. The VM itself
-# can't take the snapshot (the disk has to be idle for qemu-img to work
-# safely), so we just remind the user.
+# Take a host-side snapshot before risky operations. Snapshots are
+# instant copy-on-write checkpoints of the VM disks — the fast rollback
+# path if an upgrade breaks something.
 #
-# Skipped if --yes was passed (assumes automation/scripted use where the
-# operator has already handled rollback strategy).
+# The VM can't snapshot its own disks directly, but it CAN ask the host
+# to over the control channel: protect-on-mac-ctl sends a `snapshot`
+# request, the host pauses the VM briefly, runs qemu-img, and resumes.
+# If the channel isn't available we fall back to advising a manual one.
 recommend_snapshot() {
     local description="$1"
+    local ctl=/usr/local/bin/protect-on-mac-ctl
+    local label="pre-update-$(date +%Y%m%d-%H%M%S)"
+
+    if [ -x "$ctl" ]; then
+        echo ">>> Taking a pre-update snapshot via the control channel:"
+        echo "    $label"
+        if "$ctl" snapshot "$label"; then
+            echo ">>> Snapshot created. Roll back later with:"
+            echo "    snapshot.sh restore $label"
+            return 0
+        fi
+        echo "WARNING: automatic snapshot failed (control channel down or" >&2
+        echo "         snapshot error) — see the message above." >&2
+    fi
+
+    # No control channel, or the snapshot attempt failed.
     if [ "$ASSUME_YES" = "1" ]; then
+        echo "WARNING: proceeding WITHOUT a pre-update snapshot (--yes set)." >&2
         return 0
     fi
     cat <<EOF
@@ -205,12 +196,10 @@ RECOMMENDED: Take a snapshot before proceeding
 
 About to: $description
 
-This operation can fail or leave the system in a broken state. A snapshot
-of the VM disks gives you a one-command rollback path. Snapshots are
-fast (the VM pauses for a few seconds), take no extra space until data
-changes, and can be deleted later.
+No automatic snapshot was taken. This operation can fail or leave the
+system in a broken state — a snapshot gives you a one-command rollback.
 
-To take one — no VM shutdown required:
+To take one manually — no VM shutdown required:
   1. Press Ctrl+C now to abort this script
   2. On the host:  ./snapshot.sh create-auto pre-update
   3. The VM will pause ~2-5 seconds while the snapshot is taken
@@ -283,7 +272,8 @@ download_verified() {
         rm -f "$output"
     fi
 
-    echo "    Downloading: $url"
+    echo "    Downloading:"
+    echo "      $url"
     wget --no-verbose --show-progress --progress=dot:giga -O "$output" "$url"
 
     local actual_sha
@@ -295,6 +285,90 @@ download_verified() {
         return 1
     fi
     echo "    Verified: $(basename "$output")"
+}
+
+# Install binwalk 2.x from the v2.3.4 GitHub tag. Do NOT `pip3 install
+# binwalk` from PyPI: that resolves to binwalk 2.4.x, whose sdist is
+# broken — it omits every submodule, so `binwalk -e` later dies with
+# "ModuleNotFoundError: No module named 'binwalk.core'". The v2.3.4 tag
+# is the last good Python release (the repo default branch is now the
+# unrelated Rust rewrite, binwalk 3).
+install_binwalk() {
+    local tag=v2.3.4 tmp src
+    tmp=$(mktemp -d)
+    wget --no-verbose -O "$tmp/binwalk.tar.gz" \
+        "https://github.com/ReFirmLabs/binwalk/archive/refs/tags/${tag}.tar.gz"
+    tar -xzf "$tmp/binwalk.tar.gz" -C "$tmp"
+    src=$(find "$tmp" -maxdepth 1 -type d -name 'binwalk-*' | head -1)
+    pip3 install "$src" --break-system-packages 2>/dev/null \
+        || pip3 install "$src"
+    rm -rf "$tmp"
+    binwalk --help >/dev/null 2>&1 \
+        || { echo "ERROR: binwalk install failed" >&2; exit 1; }
+}
+
+# Parse EVERY ai-feature-* dependency out of a .deb's Depends field.
+# Args:   path to a .deb (the Protect deb)
+# Output: one "<package> <version>" line per ai-feature-* dependency;
+#         version is the constraint version, or absent if unversioned.
+#
+# Protect declares its AI packages by name in Depends, and the set has
+# changed over versions — Protect 7.x depends on BOTH ai-feature-console
+# AND ai-feature-controller, each pinned to an exact version. Reading
+# them all from the deb (rather than hardcoding names) means an added,
+# removed or renamed AI package is picked up with no code change.
+ai_deps_of_deb() {
+    local deb="$1" depends entry name ver
+    depends="$(dpkg-deb -f "$deb" Depends 2>/dev/null)" || return 0
+    local IFS=','
+    for entry in $depends; do
+        case "$entry" in
+            *ai-feature-*)
+                name="$(echo "$entry" | grep -oE 'ai-feature-[a-z0-9-]+' \
+                    | head -1)"
+                ver="$(echo "$entry" | grep -oE '[0-9][0-9a-zA-Z.+~:-]*' \
+                    | head -1)"
+                [ -n "$name" ] && echo "$name $ver"
+                ;;
+        esac
+    done
+}
+
+# Best-effort pre-flight: warn about any non-ai Protect dependency the
+# running system does not have installed. Pure warning — apt still
+# decides. Catches the common "ran --protect without --sync-os first"
+# case and turns a cryptic apt dependency dump into a plain heads-up.
+preflight_protect_deps() {
+    local deb="$1" depends entry name missing=0
+    depends="$(dpkg-deb -f "$deb" Depends 2>/dev/null)" || return 0
+    local IFS=','
+    for entry in $depends; do
+        name="$(echo "$entry" \
+            | sed -E 's/^[[:space:]]*([a-z0-9][a-z0-9.+-]*).*/\1/')"
+        [ -n "$name" ] || continue
+        case "$name" in ai-feature-*) continue ;; esac
+        if ! dpkg-query -W -f='${Status}' "$name" 2>/dev/null \
+             | grep -q "install ok installed"; then
+            echo "    NOTE: Protect needs '$name' — not installed." >&2
+            missing=1
+        fi
+    done
+    if [ "$missing" -eq 1 ]; then
+        echo "    Run 'update-unifi.sh --sync-os' first (or --all) to" >&2
+        echo "    install the OS packages Protect depends on." >&2
+    fi
+    return 0
+}
+
+# The installed Ubiquiti packages to hold/unhold around our installs.
+# Derived at run time: every installed package whose Maintainer is a
+# Ubiquiti address. Deriving it (rather than hardcoding a list) means a
+# newly introduced Ubiquiti package is held automatically and can't be
+# silently upgraded by a routine `apt-get upgrade`.
+ubiquiti_packages() {
+    dpkg-query -W -f='${Package} ${Maintainer}\n' 2>/dev/null \
+        | grep -E '@ubnt\.com|@ui\.com' \
+        | awk '{print $1}'
 }
 
 ###############################################################################
@@ -310,7 +384,6 @@ echo ">>> Fetching firmware metadata from Ubiquiti..."
 
 FW_INFO=$(get_latest_version "unifi-nvr" "release" "$PLATFORM")
 PROTECT_INFO=$(get_latest_version "unifi-protect" "$PROTECT_CHANNEL" "$DEB_PLATFORM")
-AIFC_INFO=$(get_latest_version "ai-feature-console" "$PROTECT_CHANNEL" "$DEB_PLATFORM")
 ACCESS_INFO=$(get_latest_version "unifi-access" "$PROTECT_CHANNEL" "$DEB_PLATFORM")
 
 FW_VERSION=$(echo "$FW_INFO" | jq -r '.version')
@@ -321,10 +394,6 @@ PROTECT_VERSION=$(echo "$PROTECT_INFO" | jq -r '.version')
 PROTECT_DOWNLOAD_URL=$(echo "$PROTECT_INFO" | jq -r '.url')
 PROTECT_SHA=$(echo "$PROTECT_INFO" | jq -r '.sha256')
 
-AIFC_VERSION=$(echo "$AIFC_INFO" | jq -r '.version')
-AIFC_DOWNLOAD_URL=$(echo "$AIFC_INFO" | jq -r '.url')
-AIFC_SHA=$(echo "$AIFC_INFO" | jq -r '.sha256')
-
 ACCESS_VERSION=$(echo "$ACCESS_INFO" | jq -r '.version')
 ACCESS_DOWNLOAD_URL=$(echo "$ACCESS_INFO" | jq -r '.url')
 ACCESS_SHA=$(echo "$ACCESS_INFO" | jq -r '.sha256')
@@ -332,8 +401,12 @@ ACCESS_SHA=$(echo "$ACCESS_INFO" | jq -r '.sha256')
 # Allow URL overrides
 FW_DOWNLOAD_URL="${FW_URL:-$FW_DOWNLOAD_URL}"
 PROTECT_DOWNLOAD_URL="${PROTECT_URL:-$PROTECT_DOWNLOAD_URL}"
-AIFC_DOWNLOAD_URL="${AIFC_URL:-$AIFC_DOWNLOAD_URL}"
 ACCESS_DOWNLOAD_URL="${ACCESS_URL:-$ACCESS_DOWNLOAD_URL}"
+
+# The AI feature packages (ai-feature-console, ai-feature-controller, and
+# whatever the set becomes) are NOT queried here: their names are
+# whatever the chosen Protect deb declares as dependencies, and
+# upgrade_protect resolves the full set from that deb at install time.
 
 ###############################################################################
 # CURRENT VERSIONS
@@ -341,7 +414,6 @@ ACCESS_DOWNLOAD_URL="${ACCESS_URL:-$ACCESS_DOWNLOAD_URL}"
 
 CURRENT_OS_VERSION=$(cat /usr/lib/version 2>/dev/null | tr -d '\n' || echo "unknown")
 CURRENT_PROTECT=$(dpkg-query -W -f='${Version}' unifi-protect 2>/dev/null || echo "not installed")
-CURRENT_AIFC=$(dpkg-query -W -f='${Version}' ai-feature-console 2>/dev/null || echo "not installed")
 CURRENT_ACCESS=$(dpkg-query -W -f='${Version}' unifi-access 2>/dev/null || echo "not installed")
 CURRENT_DS=$(dpkg-query -W -f='${Version}' ds 2>/dev/null || echo "not installed")
 CURRENT_CORE=$(dpkg-query -W -f='${Version}' unifi-core 2>/dev/null || echo "not installed")
@@ -350,15 +422,16 @@ echo ""
 echo "Current versions:"
 print_version "UniFi OS"          "$CURRENT_OS_VERSION" "$FW_VERSION"
 print_version "unifi-protect"     "$CURRENT_PROTECT"    "$PROTECT_VERSION"
-print_version "ai-feature-console" "$CURRENT_AIFC"      "$AIFC_VERSION"
 print_version "unifi-access"      "$CURRENT_ACCESS"     "$ACCESS_VERSION"
+echo "    ai-feature package         resolved from Protect at install"
 echo "    (Other packages compared during sync)"
 echo ""
 echo "Channel: $PROTECT_CHANNEL"
 echo ""
 
 if [ "$ACTION" = "check" ]; then
-    echo "Run with --sync-os, --protect, --protect-edge, --all, or --all-edge to apply updates."
+    echo "Run with --sync-os, --protect, --protect-edge, --all, or"
+    echo "--all-edge to apply updates."
     exit 0
 fi
 
@@ -377,7 +450,7 @@ sync_os_packages() {
         if ! command -v "$cmd" >/dev/null 2>&1; then
             echo ">>> Installing $cmd..."
             case "$cmd" in
-                binwalk)       pip3 install binwalk --break-system-packages 2>/dev/null || pip3 install binwalk ;;
+                binwalk)       install_binwalk ;;
                 unsquashfs)    apt-get install -y squashfs-tools ;;
                 dpkg-repack)   apt-get install -y dpkg-repack ;;
             esac
@@ -392,7 +465,9 @@ sync_os_packages() {
     echo ">>> Extracting firmware..."
     cd "$WORKDIR"
     rm -rf _fwupdate.bin*extracted
-    binwalk -e fwupdate.bin >/dev/null 2>&1 || true
+    # --run-as=root: binwalk 2.3.x refuses to run its extraction utilities
+    # as root unless told to. The VM runs as root, so the flag is required.
+    binwalk --run-as=root -e fwupdate.bin >/dev/null 2>&1 || true
 
     local sqfs_root
     sqfs_root=$(find "$WORKDIR" -name "squashfs-root" -type d | head -1)
@@ -455,9 +530,21 @@ sync_os_packages() {
     # (MTD flash, eMMC) and break boot on VMs
     rm -f "$WORKDIR/debs/unvr-initramfs"*.deb
 
+    # Don't install the application packages bundled in the firmware. The
+    # firmware carries an OLD Protect (e.g. 6.2.88) whose dependency on a
+    # matching ai-feature-* package can't be satisfied — and apt installs
+    # all-or-nothing, so one broken app package aborts the WHOLE OS sync
+    # (node24, unifi-core, ustd ... all silently skipped). Protect, Access
+    # and the AI feature package are upgraded separately by upgrade_protect
+    # / upgrade_access, always to the latest release.
+    rm -f "$WORKDIR/debs/unifi-protect_"*.deb \
+          "$WORKDIR/debs/ai-feature-console_"*.deb \
+          "$WORKDIR/debs/ai-feature-controller_"*.deb \
+          "$WORKDIR/debs/unifi-access_"*.deb
+
     echo ""
     echo ">>> Stopping services..."
-    systemctl stop unifi-protect ai-feature-console ds unifi-core ulp-go uid-agent 2>/dev/null || true
+    systemctl stop unifi-protect ai-feature-controller ds unifi-core ulp-go uid-agent 2>/dev/null || true
 
     echo ""
     echo ">>> Installing packages..."
@@ -488,7 +575,7 @@ sync_os_packages() {
     echo ""
     echo ">>> Restarting services..."
     systemctl daemon-reload
-    systemctl start uid-agent ulp-go unifi-core ds ai-feature-console unifi-protect 2>/dev/null || true
+    systemctl start uid-agent ulp-go unifi-core ds ai-feature-controller unifi-protect 2>/dev/null || true
 }
 
 ###############################################################################
@@ -499,11 +586,11 @@ upgrade_protect() {
     echo ""
     echo "=============================================="
     echo "Upgrading Protect to $PROTECT_VERSION ($PROTECT_CHANNEL)"
-    echo "AI Feature Console to $AIFC_VERSION"
     echo "=============================================="
 
-    if [ "$CURRENT_PROTECT" = "$PROTECT_VERSION" ] && [ "$CURRENT_AIFC" = "$AIFC_VERSION" ]; then
-        echo "    Already at latest versions. Nothing to do."
+    # dpkg reports "7.1.60"; the API reports "v7.1.60" — strip the v.
+    if [ "$CURRENT_PROTECT" = "${PROTECT_VERSION#v}" ]; then
+        echo "    Already at $PROTECT_VERSION. Nothing to do."
         return 0
     fi
 
@@ -514,15 +601,54 @@ upgrade_protect() {
 
     echo ""
     echo ">>> Downloading Protect..."
-    download_verified "$PROTECT_DOWNLOAD_URL" "$WORKDIR/unifi-protect.deb" "$PROTECT_SHA"
+    download_verified "$PROTECT_DOWNLOAD_URL" "$WORKDIR/unifi-protect.deb" \
+        "$PROTECT_SHA"
 
+    # Resolve EVERY ai-feature-* package from Protect's own metadata
+    # rather than hardcoded product names. Protect 7.x depends on both
+    # ai-feature-console and ai-feature-controller, each pinned exactly;
+    # reading the full set from the deb handles additions/removals/renames
+    # with no code change.
     echo ""
-    echo ">>> Downloading AI Feature Console..."
-    download_verified "$AIFC_DOWNLOAD_URL" "$WORKDIR/ai-feature-console.deb" "$AIFC_SHA"
+    echo ">>> Resolving Protect's AI feature dependencies..."
+    local ai_pkgs=() ai_debs=() ai_pkg ai_pin
+    while read -r ai_pkg ai_pin; do
+        [ -n "$ai_pkg" ] || continue
+        echo "    Protect $PROTECT_VERSION needs:" \
+             "$ai_pkg${ai_pin:+ = $ai_pin}"
+
+        local ai_info ai_url ai_ver ai_sha
+        if ! ai_info="$(get_latest_version "$ai_pkg" "$PROTECT_CHANNEL" \
+                        "$DEB_PLATFORM")"; then
+            echo "ERROR: the firmware API has no product '$ai_pkg'." >&2
+            echo "       Protect $PROTECT_VERSION requires it." >&2
+            return 1
+        fi
+        ai_ver="$(echo "$ai_info" | jq -r '.version')"
+        ai_sha="$(echo "$ai_info" | jq -r '.sha256')"
+        ai_url="$(echo "$ai_info" | jq -r '.url')"
+
+        if [ -n "$ai_pin" ] && [ "${ai_ver#v}" != "$ai_pin" ]; then
+            echo "WARNING: Protect pins $ai_pkg = $ai_pin, but the" >&2
+            echo "         $PROTECT_CHANNEL channel offers ${ai_ver#v}" >&2
+            echo "         — the install may fail on the mismatch." >&2
+        fi
+
+        echo ">>> Downloading $ai_pkg ($ai_ver)..."
+        download_verified "$ai_url" "$WORKDIR/${ai_pkg}.deb" "$ai_sha"
+        ai_pkgs+=("$ai_pkg")
+        ai_debs+=("$WORKDIR/${ai_pkg}.deb")
+    done < <(ai_deps_of_deb "$WORKDIR/unifi-protect.deb")
+    [ "${#ai_pkgs[@]}" -gt 0 ] \
+        || echo "    Protect declares no ai-feature-* dependency."
+
+    # Best-effort heads-up about non-ai deps the system lacks (node24,
+    # unifi-core ...). Those are installed by --sync-os from the firmware.
+    preflight_protect_deps "$WORKDIR/unifi-protect.deb"
 
     echo ""
     echo ">>> Stopping services..."
-    systemctl stop unifi-protect ai-feature-console 2>/dev/null || true
+    systemctl stop unifi-protect "${ai_pkgs[@]}" 2>/dev/null || true
 
     echo ""
     echo ">>> Installing..."
@@ -530,13 +656,13 @@ upgrade_protect() {
     apt-get install -y --allow-downgrades --no-install-recommends \
         -o Dpkg::Options::='--force-confdef' \
         -o Dpkg::Options::='--force-confold' \
-        "$WORKDIR/unifi-protect.deb" "$WORKDIR/ai-feature-console.deb"
+        "$WORKDIR/unifi-protect.deb" "${ai_debs[@]}"
     hold_ubiquiti_packages
 
     echo ""
     echo ">>> Restarting services..."
     systemctl daemon-reload
-    systemctl start ai-feature-console unifi-protect 2>/dev/null || true
+    systemctl start "${ai_pkgs[@]}" unifi-protect 2>/dev/null || true
 }
 
 ###############################################################################
@@ -595,7 +721,7 @@ case "$ACTION" in
         sync_os_packages
         ;;
     protect)
-        recommend_snapshot "upgrade Protect to $PROTECT_VERSION + AI FC to $AIFC_VERSION"
+        recommend_snapshot "upgrade Protect to $PROTECT_VERSION"
         upgrade_protect
         ;;
     access)
@@ -622,17 +748,25 @@ echo ""
 
 NEW_OS=$(cat /usr/lib/version 2>/dev/null | tr -d '\n' || echo "unknown")
 NEW_PROTECT=$(dpkg-query -W -f='${Version}' unifi-protect 2>/dev/null || echo "not installed")
-NEW_AIFC=$(dpkg-query -W -f='${Version}' ai-feature-console 2>/dev/null || echo "not installed")
 NEW_ACCESS=$(dpkg-query -W -f='${Version}' unifi-access 2>/dev/null || echo "not installed")
+# Every installed ai-feature-* package (Protect 7.x has two; names not
+# assumed).
+NEW_AI_PKGS=()
+while read -r p; do
+    [ -n "$p" ] && NEW_AI_PKGS+=("$p")
+done < <(dpkg-query -W -f='${Package}\n' 'ai-feature-*' 2>/dev/null)
 
 echo "Installed versions:"
 echo "    UniFi OS:           $NEW_OS"
 echo "    unifi-protect:      $NEW_PROTECT"
-echo "    ai-feature-console: $NEW_AIFC"
+for p in "${NEW_AI_PKGS[@]}"; do
+    printf "    %-19s %s\n" "$p:" \
+        "$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null || echo '?')"
+done
 echo "    unifi-access:       $NEW_ACCESS"
 echo ""
 echo "Service status:"
-for svc in unifi-core unifi-protect ds ai-feature-console ulp-go uid-agent unifi-access; do
+for svc in unifi-core unifi-protect ds "${NEW_AI_PKGS[@]}" ulp-go uid-agent unifi-access; do
     if systemctl list-unit-files "$svc.service" >/dev/null 2>&1; then
         local_status=$(systemctl is-active "$svc" 2>/dev/null || echo "not-found")
         printf "    %-25s %s\n" "$svc" "$local_status"
@@ -649,7 +783,7 @@ if [ "${KEEP_WORKDIR:-0}" != "1" ]; then
            "$WORKDIR/debs" \
            "$WORKDIR/fwupdate.bin" \
            "$WORKDIR/unifi-protect.deb" \
-           "$WORKDIR/ai-feature-console.deb" \
+           "$WORKDIR/"ai-feature-*.deb \
            "$WORKDIR/unifi-access.deb" \
            "$WORKDIR/packages.txt"
 fi

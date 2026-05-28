@@ -1,0 +1,16 @@
+###############################################################################
+# provision-on-setup.service — build the array on first-time operator setup.
+#
+# Triggered by provision-on-setup.path when /etc/ustd/storage.conf changes.
+# Runs provision-on-setup.sh, which provisions the array exactly once, when
+# the operator has completed the storage wizard. See that script and
+# provision-on-setup.path for the full rationale.
+###############################################################################
+[Unit]
+Description=Provision the storage array on first-time operator setup
+# provision-storage.service has assembled any pre-existing array by now.
+After=provision-storage.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/provision-on-setup.sh

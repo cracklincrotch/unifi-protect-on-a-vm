@@ -1,0 +1,18 @@
+[Unit]
+Description=Protect/Access postgres working copy on vda
+Documentation=file:/usr/local/sbin/postgres-vda.sh
+# Run after the array is assembled/mounted (provision-storage), and before
+# postgres or the apps come up. Ordered Before postgresql so that at
+# shutdown this unit stops AFTER it — ExecStop then runs with postgres
+# already down and /volume1 still mounted.
+After=provision-storage.service
+Before=postgresql.service unifi-core.service unifi-protect.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/postgres-vda.sh start
+ExecStop=/usr/local/sbin/postgres-vda.sh stop
+
+[Install]
+WantedBy=multi-user.target

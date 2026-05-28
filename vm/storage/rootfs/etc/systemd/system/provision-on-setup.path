@@ -1,0 +1,22 @@
+###############################################################################
+# provision-on-setup.path — watch for the operator finishing storage setup.
+#
+# unifi-core writes /etc/ustd/storage.conf when the OOBE storage wizard's
+# step is completed (setting "setup": true). On a real UNVR `usd` watches
+# that file; usd is masked on the VM, so this path unit triggers
+# provision-on-setup.service in its place.
+#
+# PathChanged fires once, after the write is closed, so the service reads a
+# complete file. provision-on-setup.sh is idempotent — it provisions only
+# when setup is true and /etc/ustd/has_setup_storage does not yet exist —
+# so a spurious trigger is harmless.
+###############################################################################
+[Unit]
+Description=Watch for completion of the storage setup wizard
+
+[Path]
+PathChanged=/etc/ustd/storage.conf
+Unit=provision-on-setup.service
+
+[Install]
+WantedBy=multi-user.target

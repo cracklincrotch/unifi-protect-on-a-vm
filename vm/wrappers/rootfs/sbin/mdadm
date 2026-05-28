@@ -1,8 +1,10 @@
 #!/bin/bash
 ###############################################################################
-# mdadm-vm-wrapper.sh
+# mdadm  (VM-side mdadm wrapper)
 #
-# VM-side mdadm wrapper. Install INSIDE the Protect VM as /sbin/mdadm.
+# VM-side mdadm wrapper. In the repo this file lives at
+# vm/wrappers/rootfs/sbin/mdadm — i.e. at the path it installs to.
+# Install it INSIDE the Protect VM as /sbin/mdadm.
 #
 # WHY
 #
@@ -32,7 +34,7 @@
 # INSTALL (inside the VM, as root)
 #
 #   [ -e /sbin/mdadm.real ] || cp /sbin/mdadm /sbin/mdadm.real
-#   install -m 0755 mdadm-vm-wrapper.sh /sbin/mdadm
+#   install -m 0755 vm/wrappers/rootfs/sbin/mdadm /sbin/mdadm
 #
 # Boot-time RAID assembly uses the mdadm bundled in the initramfs, not
 # /sbin/mdadm, so this wrapper does not affect how arrays are assembled.
@@ -42,7 +44,8 @@ REAL=/sbin/mdadm.real
 
 # Without the real binary there is nothing useful we can do.
 if [ ! -x "$REAL" ]; then
-    echo "mdadm wrapper: $REAL not found — see mdadm-vm-wrapper.sh header" >&2
+    echo "mdadm wrapper: $REAL not found" >&2
+    echo "  see vm/wrappers/rootfs/sbin/mdadm header for setup" >&2
     exit 1
 fi
 

@@ -1,0 +1,35 @@
+###############################################################################
+# provision-storage.service — usd-role storage provisioner for the Protect VM.
+#
+# Runs provision-storage.sh once at boot, before anything that needs the
+# recording volume. It assembles an existing array and mounts /volume1, or
+# provisions blank disks from scratch (see provision-storage.sh header).
+#
+# Ordered before the storage shim and unifi-core so /volume1 and the md
+# devices exist before they are consumed. This is the VM's equivalent of
+# usd.service on a real UNVR.
+#
+# INSTALL (inside the VM, as root)
+#   install -m 0755 provision-storage.sh /usr/local/sbin/provision-storage.sh
+#   install -m 0644 provision-storage.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable provision-storage.service
+###############################################################################
+[Unit]
+Description=UniFi Protect VM storage provisioner (usd-role)
+DefaultDependencies=yes
+After=local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=ustated-shim.service unifi-core.service
+# Recordings live on /volume1; make sure nothing storage-dependent races us.
+Before=unifi-protect.service postgresql.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/provision-storage.sh boot
+# Provisioning a fresh array (mkfs on a large volume) can take a while.
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

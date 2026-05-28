@@ -17,8 +17,22 @@ This script is a dynamic replacement. It produces the same JSON `usd`'s
   - `disk inspect`  — one entry per physical disk backing /volume1, with
                       real health derived from two independent signals.
   - `space inspect` — the primary storage volume, real capacity/usage.
-  - `config show`   — RAID level read from the live array.
+  - `config show`   — RAID level + hotspare (the operator's pick if set,
+                      else read from the live array).
+  - `config prefer` / `config hotspare` — the operator's storage choice.
+                      See STORAGE PROVISIONING below.
+  - `space nuke`    — erase + reprovision (the Storage UI "Erase" button).
   - `rwfs check`    — static (migration state, not health data).
+
+STORAGE PROVISIONING
+
+On a real UNVR, when the operator picks a RAID level, unifi-core runs
+`ustorage config prefer <level>` (and `config hotspare <bool>`); `usd`
+sees the config change and builds the array. `usd` cannot run here, so
+those verbs instead write the choice into /etc/ustd/storage.conf. The
+provision-on-setup.path unit watches that file and runs the provisioner
+in usd's place — so picking a RAID level in the UI builds the array,
+exactly as on hardware.
 
 DISK FAILURE DETECTION — TWO MODES
 
@@ -73,8 +87,10 @@ SMARTCTL = "/usr/sbin/smartctl"
 # The primary storage volume — the UNVR mounts recordings storage here.
 STORAGE_VOLUME = "/volume1"
 
-# Fallback source for the storage disk if /volume1 can't be resolved.
-STORAGE_DEFAULT = "/etc/default/storage_disk"
+# The operator's storage choice. `ustorage config prefer/hotspare` write
+# here; provision-storage.sh reads it as authoritative; provision-on-setup
+# watches it. This is the file `usd` consumes on real hardware.
+STORAGE_CONF = "/etc/ustd/storage.conf"
 
 # Cache for SMART data only. SMART data is the expensive part of a
 # `disk inspect` (one smartctl/proxy round-trip per disk); md array
@@ -162,31 +178,30 @@ def md_member_states(md_name):
 
 
 def physical_disks():
-    """List of (disk_basename, raid_member_state) backing /volume1.
+    """List of (disk_basename, raid_member_state) for EVERY data disk.
 
-    raid_member_state is the kernel md state for that disk's array
-    member ('in_sync', 'faulty', ...), or '' when there is no md array."""
+    Every physically-present data disk is reported — whether or not it
+    backs /volume1 — so Protect sees every populated bay and can offer
+    array creation on a box that has no array yet. A disk is a data disk
+    if it is a SCSI disk (sd*); the OS disk is virtio (vda) and so is
+    naturally excluded. md arrays (md*) are excluded too — they are
+    reported separately as spaces.
+
+    raid_member_state is the kernel md state of the disk's /volume1 array
+    member ('in_sync', 'faulty', ...) when it IS in the array, or '' for
+    a disk that is not in any array — an available bay."""
     name, members = storage_array()
     states = md_member_states(name)
-    result = []
-    seen = set()
-    if members:
-        for member in members:
-            disk = parent_disk(member)
-            if disk in seen:
-                continue
-            seen.add(disk)
-            result.append((disk, states.get(member, "")))
-    elif name:
-        result.append((parent_disk(name), ""))
-    if not result:
-        # /volume1 unresolved — fall back to STORAGE_DISK from the config.
-        for line in _read(STORAGE_DEFAULT).splitlines():
-            if line.startswith("STORAGE_DISK="):
-                disk = os.path.basename(line.split("=", 1)[1].strip())
-                if disk:
-                    result.append((parent_disk(disk), ""))
-    return result
+    # Parent whole-disk of each /volume1 array member -> its md state.
+    member_state = {}
+    for member in members:
+        member_state[parent_disk(member)] = states.get(member, "")
+    try:
+        nodes = sorted(os.listdir("/sys/block"))
+    except OSError:
+        nodes = []
+    return [(node, member_state.get(node, ""))
+            for node in nodes if node.startswith("sd")]
 
 
 def smart(node):
@@ -421,21 +436,97 @@ def space_inspect():
     return spaces
 
 
+def _read_storage_conf():
+    """Parsed /etc/ustd/storage.conf, or {} if absent/unreadable."""
+    try:
+        with open(STORAGE_CONF) as fh:
+            blob = json.load(fh)
+        return blob if isinstance(blob, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _update_storage_conf(updates):
+    """Merge `updates` into /etc/ustd/storage.conf, written atomically.
+
+    This is the VM's stand-in for usd consuming the operator's storage
+    choice: provision-on-setup.path watches this file and builds the array
+    when it changes, and provision-storage.sh reads prefer_raid/hotspare
+    from it as authoritative."""
+    conf = _read_storage_conf()
+    conf.update(updates)
+    try:
+        os.makedirs(os.path.dirname(STORAGE_CONF), exist_ok=True)
+        tmp = STORAGE_CONF + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(conf, fh)
+        os.replace(tmp, STORAGE_CONF)
+    except OSError:
+        pass
+
+
+def config_prefer(level):
+    """`config prefer <level>` — record the operator's RAID choice and
+    build the array.
+
+    Writes prefer_raid plus setup=true into storage.conf, then starts
+    provision-on-setup.service to build the array — standing in for usd,
+    which on real hardware provisions when it sees this config change.
+    That service is oneshot, marker-gated and idempotent: on an already-
+    provisioned box it no-ops, so a RAID change there is harmless here and
+    goes through `space nuke` instead. Starting it explicitly (rather than
+    relying only on the provision-on-setup.path watch) makes the trigger
+    robust regardless of how the file write lands."""
+    if not level:
+        return
+    _update_storage_conf({"prefer_raid": level, "setup": True})
+    try:
+        subprocess.run(
+            ["systemctl", "start", "--no-block", "provision-on-setup.service"],
+            capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def config_hotspare(value):
+    """`config hotspare <bool>` — record the operator's hot-spare choice."""
+    _update_storage_conf({"hotspare": str(value).lower() in ("true", "1")})
+
+
 def config_show():
-    """`config show` — RAID level read from the live array."""
-    name = os.path.basename(volume_device(STORAGE_VOLUME))
-    raid = "raid1"
-    if name.startswith("md"):
-        level = _read("/sys/block/%s/md/level" % name)
-        if level:
-            raid = level
-    return {"hotspare": False, "raid": raid}
+    """`config show` — the operator's pick if set, else the live array."""
+    conf = _read_storage_conf()
+    raid = conf.get("prefer_raid") or ""
+    if not raid:
+        name = os.path.basename(volume_device(STORAGE_VOLUME))
+        if name.startswith("md"):
+            raid = _read("/sys/block/%s/md/level" % name)
+    return {"hotspare": bool(conf.get("hotspare", False)),
+            "raid": raid or "raid1"}
 
 
 def rwfs_check():
     """`rwfs check` — static; migration state, not health data."""
     return {"isMigrated": False,
             "migratable": {"canMigrate": False, "reason": "not-support"}}
+
+
+def space_nuke():
+    """`space nuke` — erase the storage volume and re-provision it.
+
+    This is the verb behind the Storage UI's "Erase" button; unifi-core
+    invokes `ustorage space nuke` (confirmed in the real-UNVR strace). On a
+    real UNVR the CLI is a thin trigger and `usd` does the work; we mirror
+    that — the destructive teardown + reprovision runs in
+    storage-nuke.service, started detached so it survives this short-lived
+    process and runs outside unifi-core's cgroup. Prints nothing; the caller
+    only checks the exit code."""
+    try:
+        subprocess.run(
+            ["systemctl", "start", "--no-block", "storage-nuke.service"],
+            capture_output=True, timeout=10)
+    except Exception:
+        pass
 
 
 def main():
@@ -448,8 +539,16 @@ def main():
             print(json.dumps(space_inspect()))
         elif cmd == "config show":
             print(json.dumps(config_show()))
+        elif cmd == "config prefer":
+            # `config prefer <level> [--enclosure N]` — argv[2] is the level.
+            config_prefer(argv[2] if len(argv) > 2 else "")
+        elif cmd == "config hotspare":
+            # `config hotspare <bool> [--enclosure N]` — argv[2] is the flag.
+            config_hotspare(argv[2] if len(argv) > 2 else "false")
         elif cmd == "rwfs check":
             print(json.dumps(rwfs_check()))
+        elif cmd == "space nuke":
+            space_nuke()
         # Unknown subcommands: print nothing, exit 0 — matches the old
         # fake's behaviour so we don't surprise any caller.
     except Exception:

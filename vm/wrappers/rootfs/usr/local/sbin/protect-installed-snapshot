@@ -1,0 +1,64 @@
+#!/bin/bash
+###############################################################################
+# protect-installed-snapshot — one-shot: snapshot the VM the first time
+# UniFi Protect comes up healthy, then disable itself.
+#
+# In the repo this file lives at
+# vm/wrappers/rootfs/usr/local/sbin/protect-installed-snapshot — i.e. at
+# the path it installs to. install-protect-baremetal.sh installs it as
+# /usr/local/sbin/protect-installed-snapshot and enables the matching
+# systemd unit, protect-installed-snapshot.service.
+#
+# WHY
+#
+# `fresh-debian` is checkpointed before the install (Phase 0 of the
+# bare-metal installer). This is its bookend: a `protect-installed`
+# checkpoint of a known-good, freshly-installed Protect stack — roll back
+# to it to retry configuration without reinstalling everything.
+#
+# The unit is enabled and runs on every boot until Protect is healthy and
+# the snapshot is in place — then this script disables the unit, so the
+# checkpoint is taken exactly once. (The `snapshot` verb is idempotent
+# anyway, so a stray extra run is a harmless no-op.)
+#
+# It always exits 0: the snapshot is best-effort safety, never a reason to
+# mark a boot-time unit failed.
+###############################################################################
+set -o pipefail
+
+CTL=/usr/local/bin/protect-on-mac-ctl
+UNIT=protect-installed-snapshot.service
+LABEL=protect-installed
+
+log() { echo "[protect-installed-snapshot] $*"; }
+
+[ -x "$CTL" ] || { log "protect-on-mac-ctl not installed — nothing to do"; exit 0; }
+
+healthy() {
+    systemctl is-active --quiet unifi-core 2>/dev/null \
+        && systemctl is-active --quiet unifi-protect 2>/dev/null
+}
+
+# After= ordering only guarantees the services were *started*, not that
+# they're ready — so poll, bounded, for the stack to come up.
+for _ in $(seq 1 20); do
+    healthy && break
+    sleep 3
+done
+
+if ! healthy; then
+    log "Protect not yet healthy — will retry next boot."
+    exit 0
+fi
+
+log "Protect is up — requesting snapshot:"
+log "  label: $LABEL"
+if "$CTL" snapshot "$LABEL"; then
+    log "Checkpoint in place. Disabling unit:"
+    log "  $UNIT"
+    systemctl disable "$UNIT" 2>/dev/null || true
+else
+    log "Snapshot request failed (control channel down?)"
+    log "  will retry next boot."
+fi
+exit 0

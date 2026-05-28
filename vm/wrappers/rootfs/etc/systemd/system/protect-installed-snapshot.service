@@ -1,0 +1,20 @@
+###############################################################################
+# protect-installed-snapshot.service
+#
+# One-shot: the first time UniFi Protect comes up healthy, ask the host
+# (over the control channel) to take a `protect-installed` snapshot, then
+# disable this unit so it never runs again.
+#
+# Installed + enabled by install-protect-baremetal.sh. See the script
+# /usr/local/sbin/protect-installed-snapshot for the full rationale.
+###############################################################################
+[Unit]
+Description=Snapshot the VM once UniFi Protect is first healthy (one-shot)
+After=unifi-protect.service unifi-core.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/protect-installed-snapshot
+
+[Install]
+WantedBy=multi-user.target

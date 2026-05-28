@@ -15,6 +15,19 @@ The 10-minute version. For the full reference, see [README.md](README.md).
 - Storage for VM and recordings (internal NVMe for the VM and postgres; HDDs/SSDs in a DAS for bulk recordings)
 - 30-60 minutes for a fresh install; +30 minutes if migrating from a real UNVR
 
+## Repository layout
+
+After cloning, the project is split by where things run:
+
+```
+host/      runs on the macOS host  — start-protect-vm.sh, stand-up.sh, ...
+vm/        copied into the VM      — installers/ + the storage subsystem
+capture/   diagnostic capture tools
+```
+
+Run all the commands below from inside the cloned directory. Host-side
+commands live in `host/`; VM-side files live in `vm/`.
+
 ## Install (fresh)
 
 ### 1. Host prerequisites (macOS)
@@ -33,76 +46,60 @@ sudo visudo -f /etc/sudoers.d/qemu-vm
 ```bash
 git clone https://github.com/cracklincrotch/unifi-protect-on-a-vm.git
 cd unifi-protect-on-a-vm
-cp protect-on-mac.conf.example protect-on-mac.conf
-$EDITOR protect-on-mac.conf
+cp host/protect-on-mac.conf.example host/protect-on-mac.conf
+$EDITOR host/protect-on-mac.conf
 ```
 
-At minimum, set `NIC_MAC` to the MAC of your wired ethernet adapter (find with `networksetup -listallhardwareports`). Disk serials can be added later.
+At minimum, set `VM_DATA_DIR` and `STORAGE_IMAGES` (the data disks to
+create). Set `NIC_MAC` to the MAC of your wired ethernet adapter (find
+with `networksetup -listallhardwareports`) before the bridged boot —
+disk serials can be added later.
 
-### 3. Create VM disk and boot Debian installer
+### 3. Create the VM and install Debian
+
+`stand-up.sh` downloads + verifies the Debian netinst ISO, creates the
+OS disk, the UEFI varstore, and the blank data disks, then boots the
+Debian installer on the serial console:
 
 ```bash
-source ./protect-on-mac.conf
-mkdir -p "$VM_DATA_DIR"
-qemu-img create -f qcow2 "$VM_DISK" 32G
-dd if=/dev/zero of="$EFI_VARS" bs=1M count=64
-
-# Download Debian 11 ARM64 netinst ISO to $VM_DATA_DIR first, then:
-DEBIAN_ISO="$VM_DATA_DIR/debian-11.x.0-arm64-netinst.iso"
-
-qemu-system-aarch64 \
-    -machine virt,accel=hvf \
-    -cpu host -smp "$VM_CPUS" -m "$VM_RAM" \
-    -drive if=pflash,format=raw,unit=0,file="$EFI_CODE",readonly=on \
-    -drive if=pflash,unit=1,file="$EFI_VARS" \
-    -drive if=virtio,file="$VM_DISK",format=qcow2 \
-    -drive if=none,id=cd,file="$DEBIAN_ISO",format=raw,media=cdrom \
-    -device virtio-scsi-pci,id=scsi0 \
-    -device scsi-cd,bus=scsi0.0,drive=cd \
-    -netdev user,id=net0 \
-    -device virtio-net-pci,netdev=net0 \
-    -nographic
+cd host
+./stand-up.sh
 ```
 
-At the GRUB menu, press `<Tab>` and add `console=ttyAMA0` so the installer shows on the serial console.
+**At the Debian boot menu** (the very first screen — "Install / Graphical
+install / ..."), before installing: highlight **Install**, press **`e`**,
+append ` grub-installer/force-efi-extra-removable=true` to the end of the
+`linux` line, then **`Ctrl-X`** to boot. This forces GRUB to install the
+removable-media boot file (`\EFI\BOOT\BOOTAA64.EFI`) so the VM boots on
+its own — the matching installer question is hidden at standard priority,
+so this preseed is the only reliable way to set it. Skip it and the VM
+drops to a UEFI shell on every boot.
 
-Install **minimal Debian** — SSH server only, no desktop. Either let it use the whole disk for `/`, or partition with 2GB swap + rest for `/`.
+Install a minimal Debian (SSH server only, no desktop). When the install
+finishes and the VM reboots into the installer again, quit QEMU with
+`Ctrl-A` then `X`.
 
-### 4. Create the scripts ISO and boot the VM with it
+### 4. Build the scripts ISO and boot the VM
 
 ```bash
-./make-scripts-iso.sh
-
-# Boot with the scripts ISO attached
-qemu-system-aarch64 \
-    -machine virt,accel=hvf \
-    -cpu host -smp "$VM_CPUS" -m "$VM_RAM" \
-    -drive if=pflash,format=raw,unit=0,file="$EFI_CODE",readonly=on \
-    -drive if=pflash,unit=1,file="$EFI_VARS" \
-    -drive if=virtio,file="$VM_DISK",format=qcow2 \
-    -device virtio-scsi-pci,id=scsi0 \
-    -drive if=none,id=scripts,file="$SCRIPTS_ISO",format=raw,media=cdrom \
-    -device scsi-cd,bus=scsi0.0,drive=scripts \
-    -netdev user,id=net0 \
-    -device virtio-net-pci,netdev=net0 \
-    -nographic
+./make-scripts-iso.sh        # bundles the vm/ tree into an ISO
+./start-protect-vm.sh        # boots the VM, attaching the ISO as /dev/sr0
 ```
 
 ### 5. Inside the VM, install UniFi
 
-Login as root, then:
+Log in as root (a fresh Debian has no `sudo` — run everything bare), mount
+the scripts ISO, and run `start-here.sh` — it unpacks the project and runs
+the installer (`install-protect-baremetal.sh`, ~30 min; its final phase
+installs the storage subsystem too):
 
 ```bash
 mkdir -p /mnt/protect-on-mac
 mount /dev/sr0 /mnt/protect-on-mac
-cp /mnt/protect-on-mac/*.sh /root/
-chmod +x /root/*.sh
-umount /mnt/protect-on-mac
-
-bash /root/install-protect-baremetal.sh
+bash /mnt/protect-on-mac/start-here.sh
 ```
 
-This takes ~30 minutes. When done, shut down the VM: `systemctl poweroff`.
+When done, shut down the VM: `systemctl poweroff`.
 
 ### 6. Boot with bridged networking from the host
 
@@ -116,25 +113,28 @@ Visit `https://<VM-IP>` and go through the initial UniFi setup.
 
 After step 5 above (UniFi installed, VM shut down):
 
-1. **On the UNVR web UI**: back up Protect and Access. Download the backup files.
+1. **On the UNVR web UI**: back up Protect and Access. Either download the backup files locally, or use your Ubiquiti (UI) account's cloud backup — cloud backups appear automatically in the new VM's restore list when it's signed into the same account.
 2. **Do NOT remove cameras from the UNVR** before backing up — the backup includes camera identity.
-3. **Cleanly shut down the UNVR** via its web UI.
-4. **Boot the new VM** with `./start-protect-vm.sh`.
-5. **In the VM web UI**: restore both backups. Cameras will re-adopt over the next few minutes.
-6. **Move the UNVR disks** to your DAS. Inside the VM: `/root/mount-storage.sh import` to attach existing recordings.
-7. **(Optional but recommended)** Migrate postgres to SSD for big speed gains:
+3. **Boot the new VM** with `./start-protect-vm.sh` and sign it into the same Ubiquiti account.
+4. **Confirm the backup is reachable from the new VM** — visible in its restore list for a cloud backup, or the downloaded file in hand. Do not proceed until you've seen it.
+5. **Cleanly shut down the UNVR** via its web UI, then **remove it from the network** — if it powers back on while connected it will fight the VM for the cameras.
+6. **In the VM web UI**: restore both backups. Cameras will re-adopt over the next few minutes.
+7. **Move the UNVR disks** to your DAS. Inside the VM: `/root/vm/installers/mount-storage.sh import` to attach existing recordings.
+8. **(Optional but recommended)** Migrate postgres to SSD for big speed gains:
    ```bash
-   /root/mount-storage.sh postgres-migrate /dev/sdX
+   /root/vm/installers/mount-storage.sh postgres-migrate /dev/sdX
    ```
 
 ## Common operations
+
+All host-side commands run from the `host/` directory:
 
 ```bash
 # Snapshot before risky changes (VM keeps running, pauses briefly)
 ./snapshot.sh create-auto pre-update
 
 # Update UniFi software
-ssh root@<VM-IP> /root/unifi-update.sh --all
+ssh root@<VM-IP> /root/vm/installers/update-unifi.sh --all
 
 # Roll back if something broke
 ./install-launchd.sh stop    # or: ssh root@<VM-IP> systemctl poweroff
@@ -142,22 +142,26 @@ ssh root@<VM-IP> /root/unifi-update.sh --all
 ./install-launchd.sh start
 
 # Auto-start VM at host boot
-./install-launchd.sh install /path/to/start-protect-vm.sh
+./install-launchd.sh install /path/to/host/start-protect-vm.sh
 ```
 
 ## When something goes wrong
 
 - **VM won't boot**: attach the serial console with `./attach-console.sh` and see what's happening.
-- **Cameras don't reconnect**: give them 5-10 minutes. If still missing, re-adopt in the Protect UI.
+- **VM drops to the UEFI shell**: the varstore has a stale boot order — recreate `$EFI_VARS` (delete it, `dd` a fresh 64 MiB file) while the VM is off. `stand-up.sh` does this automatically when it recreates the OS disk.
+- **Cameras don't reconnect**: give them 5-10 minutes. If still missing, re-adopt them. If the Protect web UI won't handle the re-adoption (it sometimes won't), use the Protect mobile app instead — it can adopt cameras the web UI can't.
 - **Search/UI is slow**: migrate postgres to a dedicated SSD (step 7 of migration above).
 - **An update broke things**: `./snapshot.sh rollback` to the pre-update snapshot.
+- **macOS host claims it's out of space but Disk Utility shows free room**: APFS local Time Machine snapshots silently pin space that the GUI counts as "free" (it's actually "purgeable"). Check actual headroom with `df -h /`. If much smaller than the GUI claims, thin the snapshots: `sudo tmutil thinlocalsnapshots / 200000000000 4`. See README "Recovery from common failures" for detail.
+- **Protect won't start after the host was forcibly stopped**: postgres@14-protect left a stale `postmaster.pid`. Inside the VM, `journalctl -u postgresql@14-protect` shows `pid file is invalid`. Fix: `rm -f /srv/postgresql/14/protect/data/postmaster.pid && systemctl start postgresql@14-protect && systemctl start unifi-protect`. Prefer `systemctl poweroff` inside the VM over killing the QEMU process.
+- **First-boot log says "PostgreSQL running with /data/ but /srv/ has the real DB"**: that's expected. On a fresh install the DB initializes on `/data/` before the array exists; on the next boot after you create the array in the web UI, it migrates to `/srv/`. Runs once.
+- **One disk shows as "QEMU HARDDISK" in the Storage pane on first render**: a race in the smartctl shim during initial discovery. Reload the page; all four disks will normalize to `UniFi Protect VM Disk`.
 - **Something not covered here**: see [README.md](README.md) for the full reference.
 
 ## Limitations to know about
 
 - This is **not officially supported by Ubiquiti**. Use at your own risk.
 - A UniFi OS update could introduce new services that need to be masked. Snapshot before every update.
-- Initial Debian install is hands-on (not yet automated).
 - Intel Macs will not work — ARM64 host required.
 
 For the complete reference, including architecture details, hardware spoofing, troubleshooting, and the reverse-migration path back to a real UNVR, see [README.md](README.md).

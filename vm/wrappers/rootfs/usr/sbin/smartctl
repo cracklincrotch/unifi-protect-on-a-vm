@@ -1,0 +1,305 @@
+#!/bin/bash
+###############################################################################
+# smartctl  (VM-side smartctl proxy wrapper)
+#
+# VM side of the smartctl proxy. In the repo this file lives at
+# vm/wrappers/rootfs/usr/sbin/smartctl — i.e. at the path it installs to.
+# Install it INSIDE the Protect VM as /usr/sbin/smartctl.
+#
+# WHAT IT DOES
+#
+# Inside the VM, disks are virtio-scsi devices with no real SMART data, so
+# Protect can never see genuine disk health. This wrapper intercepts
+# smartctl calls, resolves the target disk to its serial, and asks the
+# QEMU host — over the host<->guest control channel — for the real SMART
+# of the medium underneath that VM disk:
+#
+#   - a raw-passthrough disk -> the physical disk itself;
+#   - a qcow2 image disk     -> the host disk the image file lives on.
+#
+# The host returns smartctl JSON (NVMe or ATA). This wrapper normalizes it
+# into a synthetic smartctl ATA report carrying THIS VM disk's identity
+# (its own serial and capacity, presented as an HDD) populated with the
+# real health signals — overall health, temperature, power-on hours,
+# power cycles, reallocated/error counts. Protect's `ustorage` consumes
+# `smartctl --json`; a human runs `smartctl -a`. Both are served: JSON
+# when the caller passed --json/-j, human text otherwise.
+#
+# Any failure (channel down, proxy disabled, unknown disk, no python)
+# falls through to the local real smartctl. The proxy is best-effort and
+# cannot break the VM.
+#
+# An optional /etc/default/smartctl-proxy can set SMARTCTL_PROXY_ENABLED=0
+# to disable the proxy without removing the wrapper.
+#
+# NOTE: a reinstall/upgrade of the smartmontools package overwrites
+# /usr/sbin/smartctl with the real binary again. Re-run install-shims.sh
+# (or re-copy this wrapper) if that happens.
+###############################################################################
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+REAL=/usr/sbin/smartctl.real
+CONF=/etc/default/smartctl-proxy
+CTL=/usr/local/bin/protect-on-mac-ctl
+
+fallback() { exec "$REAL" "$@"; }
+
+[ -x "$REAL" ] || { echo "smartctl proxy: $REAL missing" >&2; exit 1; }
+[ -r "$CONF" ] && . "$CONF"
+# Optional kill switch; the proxy is on by default.
+[ "${SMARTCTL_PROXY_ENABLED:-1}" = "1" ] || fallback "$@"
+# No control-channel client or no python -> nothing to proxy/normalize.
+[ -x "$CTL" ] || fallback "$@"
+command -v python3 >/dev/null 2>&1 || fallback "$@"
+
+# Find the device argument (last token that looks like a device path).
+dev=""
+for a in "$@"; do
+    case "$a" in /dev/*) dev="$a" ;; esac
+done
+[ -n "$dev" ] || fallback "$@"
+
+# Resolve the device to its whole disk. unifi-core/ustorage query the
+# parent disk, but a caller may pass a partition (e.g. /dev/sda5); SMART
+# is a whole-disk property, so resolve a partition to its parent first.
+lookup="$dev"
+parent=$(lsblk -ndo PKNAME "$dev" 2>/dev/null | head -n1)
+[ -n "$parent" ] && lookup="/dev/$parent"
+
+# Serial is the map key the host uses to find the backing device.
+serial=$(lsblk -ndo SERIAL "$lookup" 2>/dev/null | head -n1 | tr -d '[:space:]')
+[ -n "$serial" ] || fallback "$@"
+
+# The VM disk's own capacity — used as the synthesized disk's identity.
+capacity=$(blockdev --getsize64 "$lookup" 2>/dev/null || echo 0)
+
+# Guest-visible discard capability. >0 means QEMU attached this disk with
+# discard=unmap (start-protect-vm.sh does that for SSD/NVMe-backed
+# images), so the synthesized report can honestly advertise TRIM.
+disk_base="${lookup##*/}"
+discard_max=$(cat "/sys/block/$disk_base/queue/discard_max_bytes" 2>/dev/null || echo 0)
+
+# Did the caller ask for JSON output?
+want_json=0
+for a in "$@"; do
+    case "$a" in -j|--json|--json=*) want_json=1 ;; esac
+done
+
+# Ask the host for structured SMART data. We always request --json -x
+# regardless of what the caller asked — the normalizer below renders the
+# caller's chosen format itself.
+host_json=$("$CTL" smartctl "$serial" --json -x 2>/dev/null)
+rc=$?
+[ "$rc" -eq 0 ] && [ -n "$host_json" ] || fallback "$@"
+
+# Normalize the host's backing-disk SMART into a synthetic ATA report
+# that carries this VM disk's identity.
+out=$(SMARTCTL_HOST_JSON="$host_json" \
+      SMARTCTL_DEV="$dev" \
+      SMARTCTL_SERIAL="$serial" \
+      SMARTCTL_CAP="$capacity" \
+      SMARTCTL_DISCARD_MAX="$discard_max" \
+      SMARTCTL_WANT_JSON="$want_json" \
+      python3 - <<'PYEOF'
+import json, os
+
+host = {}
+try:
+    host = json.loads(os.environ.get("SMARTCTL_HOST_JSON") or "{}")
+except ValueError:
+    host = {}
+if not isinstance(host, dict):
+    host = {}
+
+dev    = os.environ.get("SMARTCTL_DEV", "/dev/sda")
+serial = os.environ.get("SMARTCTL_SERIAL", "VM-DISK")
+try:
+    cap = int(os.environ.get("SMARTCTL_CAP") or 0)
+except ValueError:
+    cap = 0
+want_json = os.environ.get("SMARTCTL_WANT_JSON") == "1"
+
+
+def dig(d, *path):
+    for k in path:
+        if not isinstance(d, dict):
+            return None
+        d = d.get(k)
+        if d is None:
+            return None
+    return d
+
+
+def attr_raw(table, aid):
+    for a in table or []:
+        if a.get("id") == aid:
+            return (a.get("raw", {}) or {}).get("value", 0) or 0
+    return 0
+
+
+def as_int(v, default=0):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+# --- real signals from the host's backing-disk SMART (NVMe or ATA) -------
+passed = dig(host, "smart_status", "passed")
+if passed is None:
+    passed = True
+passed = bool(passed)
+
+nvme = dig(host, "nvme_smart_health_information_log") or {}
+ata  = dig(host, "ata_smart_attributes", "table") or []
+
+hours = dig(host, "power_on_time", "hours")
+if hours is None:
+    hours = nvme.get("power_on_hours")
+hours = as_int(hours, 0)
+
+cycles = nvme.get("power_cycles")
+if cycles is None:
+    cycles = attr_raw(ata, 12)
+cycles = as_int(cycles, 0)
+
+temp = dig(host, "temperature", "current")
+if temp is None:
+    temp = nvme.get("temperature")
+if temp is None:
+    temp = attr_raw(ata, 194) or None
+temp = as_int(temp, 30)
+
+reallocated = as_int(attr_raw(ata, 5) or nvme.get("media_errors", 0), 0)
+
+errlog = dig(host, "ata_smart_error_log", "summary", "count")
+if errlog is None:
+    errlog = nvme.get("num_err_log_entries", 0)
+errlog = as_int(errlog, 0)
+
+# Rotation rate from the backing disk: a real HDD reports its rpm; an SSD
+# or NVMe reports 0. Carry it through so Protect (which treats rpm 0 as
+# "SSD") classifies the VM disk to match the medium it actually lives on.
+rotation = dig(host, "rotation_rate")
+if rotation is None:
+    rotation = 0            # NVMe / solid-state backing has no rotation
+rotation = as_int(rotation, 0)
+is_ssd = rotation == 0
+
+# TRIM is advertised only when the disk genuinely supports discard in the
+# guest (QEMU attached it discard=unmap) — honest, never claimed for a
+# plain HDD-backed image.
+trim = as_int(os.environ.get("SMARTCTL_DISCARD_MAX"), 0) > 0
+
+
+# --- synthesize an ATA-schema smartctl document --------------------------
+def mkattr(aid, name, raw, prefail=False, failing=False):
+    thresh = 10 if prefail else 0
+    value = max(thresh - 1, 1) if failing else 100
+    return {
+        "id": aid, "name": name,
+        "value": value, "worst": value, "thresh": thresh,
+        "when_failed": "now" if failing else "",
+        "flags": {"prefailure": prefail, "value": 0x0000,
+                  "string": "------", "updated_online": True},
+        "raw": {"value": as_int(raw, 0), "string": str(as_int(raw, 0))},
+    }
+
+
+bad = not passed
+table = [
+    mkattr(1,   "Raw_Read_Error_Rate",    0,           prefail=True),
+    mkattr(5,   "Reallocated_Sector_Ct",  reallocated, prefail=True,
+           failing=(bad and reallocated > 0)),
+    mkattr(9,   "Power_On_Hours",         hours),
+    mkattr(12,  "Power_Cycle_Count",      cycles),
+    mkattr(194, "Temperature_Celsius",    temp),
+    mkattr(197, "Current_Pending_Sector", 0, prefail=True),
+    mkattr(198, "Offline_Uncorrectable",  0),
+    mkattr(199, "UDMA_CRC_Error_Count",   0),
+]
+
+MODEL = "UniFi Protect VM Disk"
+FIRMWARE = "PM-1.0"
+
+doc = {
+    "json_format_version": [1, 0],
+    "smartctl": {
+        "version": [7, 2], "svn_revision": "5155",
+        "platform_info": "aarch64-linux", "build_info": "(local build)",
+        "argv": ["smartctl", "--json", "-x", dev], "exit_status": 0,
+    },
+    "device": {"name": dev, "info_name": dev,
+               "type": "sat", "protocol": "ATA"},
+    "model_family": MODEL,
+    "model_name": MODEL,
+    "serial_number": serial,
+    "firmware_version": FIRMWARE,
+    "user_capacity": {"blocks": cap // 512 if cap else 0, "bytes": cap},
+    "logical_block_size": 512,
+    "physical_block_size": 4096,
+    "rotation_rate": rotation,
+    "form_factor": ({"ata_value": 2, "name": "2.5 inches"} if is_ssd
+                    else {"ata_value": 3, "name": "3.5 inches"}),
+    "trim": ({"supported": True, "deterministic": True, "zeroed": True}
+             if trim else {"supported": False}),
+    "ata_version": {"string": "ATA8-ACS T13/1699-D revision 4"},
+    "sata_version": {"string": "SATA 3.0, 6.0 Gb/s"},
+    "interface_speed": {"current": {"string": "6.0 Gb/s"}},
+    "smart_support": {"available": True, "enabled": True},
+    "smart_status": {"passed": passed},
+    "temperature": {"current": temp},
+    "power_on_time": {"hours": hours},
+    "power_cycle_count": cycles,
+    "ata_smart_error_log": {"summary": {"count": errlog}},
+    "ata_smart_attributes": {"revision": 16, "table": table},
+}
+
+if want_json:
+    print(json.dumps(doc, indent=2))
+else:
+    L = []
+    L.append("smartctl 7.2 2020-12-30 r5155 [aarch64-linux] (local build)")
+    L.append("Copyright (C) 2002-20, Bruce Allen, Christian Franke, "
+             "www.smartmontools.org")
+    L.append("")
+    L.append("=== START OF INFORMATION SECTION ===")
+    L.append("Device Model:     %s" % MODEL)
+    L.append("Serial Number:    %s" % serial)
+    L.append("Firmware Version: %s" % FIRMWARE)
+    L.append("User Capacity:    %d bytes" % cap)
+    L.append("Sector Sizes:     512 bytes logical, 4096 bytes physical")
+    if is_ssd:
+        L.append("Rotation Rate:    Solid State Device")
+        L.append("Form Factor:      2.5 inches")
+    else:
+        L.append("Rotation Rate:    %d rpm" % rotation)
+        L.append("Form Factor:      3.5 inches")
+    if trim:
+        L.append("TRIM Command:     Available, deterministic, zeroed")
+    L.append("SMART support is: Available - device has SMART capability.")
+    L.append("SMART support is: Enabled")
+    L.append("")
+    L.append("=== START OF READ SMART DATA SECTION ===")
+    L.append("SMART overall-health self-assessment test result: %s"
+             % ("PASSED" if passed else "FAILED!"))
+    L.append("")
+    L.append("Vendor Specific SMART Attributes with Thresholds:")
+    L.append("ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH "
+             "TYPE      UPDATED  WHEN_FAILED RAW_VALUE")
+    for a in table:
+        L.append("%3d %-23s %-8s %5d %5d %6d %-9s %-8s %-11s %d" % (
+            a["id"], a["name"], "0x0000",
+            a["value"], a["worst"], a["thresh"],
+            "Pre-fail" if a["flags"]["prefailure"] else "Old_age",
+            "Always", a["when_failed"] or "-", a["raw"]["value"]))
+    print("\n".join(L))
+PYEOF
+)
+nrc=$?
+
+if [ "$nrc" -eq 0 ] && [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    exit 0
+fi
+fallback "$@"

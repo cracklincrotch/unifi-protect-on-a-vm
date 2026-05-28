@@ -1,0 +1,20 @@
+# smartctl-proxy.conf.example
+#
+# Optional configuration for the smartctl proxy wrapper
+# (vm/wrappers/rootfs/usr/sbin/smartctl).
+#
+# The proxy now rides the host<->guest control channel (protect-on-mac-ctl
+# + the virtio-serial port), so there is nothing to configure to make it
+# work — no SSH host, user, or key. This file exists only to provide a
+# kill switch.
+#
+# Install INSIDE the Protect VM as /etc/default/smartctl-proxy (optional —
+# the wrapper works fine without it):
+#
+#   install -m 0644 smartctl-proxy.conf.example /etc/default/smartctl-proxy
+#
+# This is sourced as a shell file — keep it to plain VAR=value lines.
+
+# Set to 0 to disable the proxy without removing the wrapper. The wrapper
+# then behaves as a plain pass-through to the real smartctl. Default: 1.
+SMARTCTL_PROXY_ENABLED=1

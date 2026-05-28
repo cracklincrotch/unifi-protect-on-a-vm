@@ -13,43 +13,47 @@
 #
 # THE PROXY
 #
-# The VM-side wrapper (/usr/sbin/smartctl, installed by
-# install-protect-baremetal.sh with SMARTCTL_PROXY=1) resolves the disk it
-# was asked about to its serial number, then SSHes to this host. This
-# script is the forced command on the receiving end: it translates the
-# serial back into the /dev/diskN the disk currently maps to and runs the
-# real smartctl against it. The Mac CAN read SMART over USB, provided the
-# kasbert OS-X-SAT-SMART kext (or DriveDx, which bundles it) is installed.
+# The VM-side wrapper (/usr/sbin/smartctl) resolves the disk it was asked
+# about to its serial number and sends it over the host<->guest control
+# channel. control-host-helper.sh — the channel dispatcher — invokes this
+# script for the `smartctl` verb. This script looks the serial up in the
+# disk map and runs the real smartctl against the right host device:
+#
+#   - a raw-passthrough disk maps straight to its /dev/diskN;
+#   - a qcow2 image maps to the physical disk the image file lives on
+#     (resolved via df + diskutil), so an image-backed VM disk reports the
+#     health of the real medium underneath it.
+#
+# The Mac CAN read SMART over USB, provided the kasbert OS-X-SAT-SMART
+# kext (or DriveDx, which bundles it) is installed.
 #
 # HOW IT IS INVOKED
 #
-# Via SSH with a forced command. The VM's authorized_keys entry on this
-# host looks like:
+# By control-host-helper.sh, with the request as positional arguments:
 #
-#   command="/usr/local/bin/smartctl-host-helper.sh",no-pty,\
-#   no-port-forwarding,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA...
+#   smartctl-host-helper.sh <serial> <flag> <flag> ...
 #
-# The VM passes "<serial> <flag> <flag> ..." which SSH delivers here in
-# SSH_ORIGINAL_COMMAND. For manual testing you can also run this script
-# directly with the same arguments on the command line.
+# (Earlier versions were an SSH forced command; the channel is now
+# virtio-serial — see control-host-helper.sh. You can still run this
+# script directly with the same arguments for manual testing.)
 #
 # SECURITY
 #
-#   - The forced command means a holder of the VM's key can ONLY run this
-#     script, nothing else.
+#   - The control channel only ever calls this script for the `smartctl`
+#     verb — the dispatcher has no code path to run anything else.
 #   - The serial and every forwarded flag are validated against a strict
 #     character set, and state-changing smartctl flags (self-tests,
 #     --set, SMART enable/disable) are rejected outright. This script only
 #     ever performs read-only SMART queries.
 #   - The target device is looked up from the serial map written by
 #     start-protect-vm.sh — the caller cannot specify an arbitrary device.
-#   - smartctl is run via `sudo -n`; see the sudoers rule in the README.
+#   - smartctl runs unprivileged: on macOS it reads SMART through IOKit,
+#     which needs no root, so no sudo and no sudoers rule are involved.
 #
 # SETUP
 #
 # See the README "smartctl proxy" section for the full walkthrough
-# (installing this script, the sudoers rule, enabling Remote Login, and
-# adding the VM's public key).
+# (installing this script and the sudoers rule).
 ###############################################################################
 
 # No `set -u`: macOS ships bash 3.2, where expanding an empty array under
@@ -79,13 +83,8 @@ MAX_SERIAL_LEN=64
 # Input
 ###############################################################################
 
-# Input arrives via SSH_ORIGINAL_COMMAND under the forced command. When
-# run directly (manual testing) fall back to positional arguments.
-if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
-    read -r -a args <<< "$SSH_ORIGINAL_COMMAND"
-else
-    args=("$@")
-fi
+# The request arrives as positional arguments: "<serial> [flags...]".
+args=("$@")
 
 if [ "${#args[@]}" -lt 1 ]; then
     echo "smartctl-host-helper: no input (expected '<serial> [flags...]')" >&2
@@ -142,15 +141,63 @@ if [ ! -r "$DISK_MAP" ]; then
     exit 69
 fi
 
-dev="$(awk -F'\t' -v s="$serial" '$1 == s { print $2; exit }' "$DISK_MAP")"
-
-if [ -z "$dev" ]; then
+# Map line for this serial: "serial<TAB>kind<TAB>target".
+map_line="$(awk -F'\t' -v s="$serial" '$1 == s { print; exit }' "$DISK_MAP")"
+if [ -z "$map_line" ]; then
     echo "smartctl-host-helper: serial '$serial' not in $DISK_MAP" >&2
     exit 69
 fi
+kind="$(printf '%s' "$map_line" | cut -f2)"
+target="$(printf '%s' "$map_line" | cut -f3)"
 
-# Defense in depth: the device comes from our own map, but confirm it
-# looks like a macOS whole-disk node before handing it to sudo.
+# Tolerate an older 2-column map ("serial<TAB>/dev/diskN"): if column 2
+# is a device path, treat the line as a passthrough disk.
+case "$kind" in
+    /dev/*) target="$kind"; kind="disk" ;;
+esac
+
+# Resolve a qcow2 image path to the physical disk it physically lives on.
+# An APFS volume sits on a synthesized container whose "APFS Physical
+# Store" is the real hardware; a non-APFS volume's "Part of Whole" is.
+resolve_image_to_disk() {
+    local img="$1" vol store whole
+    if [ ! -e "$img" ]; then
+        echo "smartctl-host-helper: image not found: $img" >&2
+        return 1
+    fi
+    vol="$(df "$img" 2>/dev/null | awk 'NR==2 {print $1}')"
+    if [ -z "$vol" ]; then
+        echo "smartctl-host-helper: cannot resolve a volume for $img" >&2
+        return 1
+    fi
+    store="$(diskutil info "$vol" 2>/dev/null \
+             | awk -F':' '/APFS Physical Store/ {print $2; exit}' \
+             | tr -d '[:space:]')"
+    if [ -z "$store" ]; then
+        store="$(diskutil info "$vol" 2>/dev/null \
+                 | awk -F':' '/Part of Whole/ {print $2; exit}' \
+                 | tr -d '[:space:]')"
+    fi
+    if [ -z "$store" ]; then
+        echo "smartctl-host-helper: no physical disk for $img" >&2
+        return 1
+    fi
+    whole="${store%%s[0-9]*}"          # disk0s2 -> disk0
+    printf '/dev/%s\n' "$whole"
+}
+
+case "$kind" in
+    disk)
+        dev="$target" ;;
+    image)
+        dev="$(resolve_image_to_disk "$target")" || exit 69 ;;
+    *)
+        echo "smartctl-host-helper: unknown disk kind '$kind' for '$serial'" >&2
+        exit 69 ;;
+esac
+
+# Defense in depth: confirm it looks like a macOS whole-disk node before
+# handing it to sudo.
 case "$dev" in
     /dev/disk[0-9]*) ;;
     *)
@@ -168,8 +215,8 @@ if [ ! -x "$SMARTCTL" ]; then
     exit 69
 fi
 
-# Raw device access on macOS requires root, hence sudo. The sudoers rule
-# (see README) grants passwordless access to exactly this binary.
+# smartctl reads SMART through IOKit on macOS — no root required, so no
+# sudo here.
 #
 # smartctl's exit status is a bitmask: bit 0 = command-line error,
 # bit 1 = device open failed. Either means the proxy itself failed and
@@ -177,7 +224,7 @@ fi
 # Higher bits mean smartctl reached the disk and the disk reported
 # something (bad health, prefail attributes, etc.) — that output is
 # exactly what we want Protect to see, so we pass it through and exit 0.
-if out="$(sudo -n "$SMARTCTL" "${flags[@]}" "$dev" 2>&1)"; then
+if out="$("$SMARTCTL" "${flags[@]}" "$dev" 2>&1)"; then
     status=0
 else
     status=$?

@@ -39,9 +39,53 @@ A Mac or Pi running a VM gives you:
 This repo provides scripts to:
 
 1. **Build the VM** from the latest UNVR firmware. The base Debian 11 install plus a few patches makes the UNVR's Ubiquiti packages run on a virtual machine. (`install-protect-baremetal.sh`)
-2. **Update the VM** in place. Query Ubiquiti's firmware API, download the latest releases of UniFi OS, Protect, Access, and AI Feature Console, install them. (`unifi-update.sh`)
+2. **Update the VM** in place. Query Ubiquiti's firmware API, download the latest releases of UniFi OS, Protect, Access, and AI Feature Console, install them. (`update-unifi.sh`)
 3. **Manage storage**. Import existing UNVR data disks, migrate the database to a dedicated SSD. (`mount-storage.sh`)
 4. **Start the VM** with stable hardware references on macOS. Identify physical disks by ATA serial and the ethernet adapter by MAC, so the VM works regardless of how macOS enumerates them this boot. (`start-protect-vm.sh`)
+
+## Repository layout
+
+The project is organised by *where each file runs*:
+
+```
+host/                       Runs on the macOS host
+  stand-up.sh               Create a fresh VM (download ISO, disks, Debian install)
+  start-protect-vm.sh       Boot the VM with stable disk/NIC references
+  attach-console.sh         Attach to the VM's serial console
+  snapshot.sh               Live qcow2 snapshots
+  install-launchd.sh        Install the VM as a launchd daemon
+  make-scripts-iso.sh       Bundle the vm/ tree into a CD-ROM ISO
+  control-host-helper.sh    Host side of the virtio-serial control channel
+  smartctl-host-helper.sh   Runs real SMART queries for the control channel
+  protect-on-mac.conf.example   Config template (copy to protect-on-mac.conf)
+  com.protect-on-mac.vm.plist   launchd plist template
+
+vm/                         Copied into the VM and run there
+  installers/               Run once, from /root, to set the VM up
+    install-protect-baremetal.sh   Build the Protect stack on Debian
+    install-storage.sh             Install the storage subsystem
+    update-unifi.sh / uninstall.sh / mount-storage.sh
+  storage/rootfs/           The storage subsystem, laid out at install paths.
+                            install-storage.sh installs this tree verbatim:
+    usr/bin/ustorage
+    usr/local/sbin/provision-storage.sh
+    usr/local/bin/ustated-shim.js
+    usr/local/bin/unifi-core-storage-patch.sh
+    etc/systemd/system/*.service
+  wrappers/                 Control-channel guest pieces + binary interceptors
+    rootfs/usr/local/bin/protect-on-mac-ctl   control channel guest client
+    rootfs/usr/local/sbin/protect-installed-snapshot   one-shot checkpoint
+    rootfs/etc/systemd/system/protect-installed-snapshot.service
+    rootfs/usr/sbin/smartctl     SMART proxy wrapper
+    rootfs/sbin/mdadm            /dev/md3 resolution fix
+    smartctl-proxy.conf.example
+
+capture/                    Diagnostic gRPC/storage capture tools
+```
+
+Host-side commands in this document are run from the `host/` directory.
+The `vm/` tree is delivered into the VM as a CD-ROM ISO built by
+`make-scripts-iso.sh` — see the "Fresh install workflow" section below.
 
 ## A note on UTM
 
@@ -62,7 +106,7 @@ In short: UTM if disk images, plain QEMU if raw disks.
 |  |  - QEMU process                  |                     |
 |  |  - Bridges VM to physical NIC    |                     |
 |  +-----------------+----------------+                     |
-|                    | virtio                                |
+|                    | virtio                               |
 |  +-----------------v----------------+                     |
 |  | VM (Debian 11 ARM64)             |                     |
 |  |  - Ubiquiti UniFi OS packages    |                     |
@@ -72,7 +116,7 @@ In short: UTM if disk images, plain QEMU if raw disks.
 +-----------------------|-----------|-----------------------+
                         |           |
                   Thunderbolt    USB 3.2 Gen 2 (10Gbps)
-                  /USB-C dock        |
+                  /USB-C dock       |
                         |           |
               +---------v---+    +--v----------+
               | USB ethernet|    | DAS         |
@@ -302,7 +346,7 @@ The QEMU commands in this workflow source values from `protect-on-mac.conf` so p
        -machine virt,accel=hvf \
        -cpu host -smp "$VM_CPUS" -m "$VM_RAM" \
        -drive if=pflash,format=raw,unit=0,file="$EFI_CODE",readonly=on \
-       -drive if=pflash,unit=1,file="$EFI_VARS" \
+       -drive if=pflash,format=raw,unit=1,file="$EFI_VARS" \
        -drive if=virtio,file="$VM_DISK",format=qcow2 \
        -drive if=none,id=cd,file="$DEBIAN_ISO",format=raw,media=cdrom \
        -device virtio-scsi-pci,id=scsi0 \
@@ -331,7 +375,7 @@ The QEMU commands in this workflow source values from `protect-on-mac.conf` so p
        -machine virt,accel=hvf \
        -cpu host -smp "$VM_CPUS" -m "$VM_RAM" \
        -drive if=pflash,format=raw,unit=0,file="$EFI_CODE",readonly=on \
-       -drive if=pflash,unit=1,file="$EFI_VARS" \
+       -drive if=pflash,format=raw,unit=1,file="$EFI_VARS" \
        -drive if=virtio,file="$VM_DISK",format=qcow2 \
        -device virtio-scsi-pci,id=scsi0 \
        -drive if=none,id=scripts,file="$SCRIPTS_ISO",format=raw,media=cdrom \
@@ -341,23 +385,23 @@ The QEMU commands in this workflow source values from `protect-on-mac.conf` so p
        -nographic
    ```
 
-9. **Inside the VM, mount the ISO and copy the scripts**:
+9. **Inside the VM, mount the ISO and run `start-here.sh`**. A fresh
+   Debian install has no `sudo` — log in as root and run everything bare:
    ```bash
-   sudo mkdir -p /mnt/protect-on-mac
-   sudo mount /dev/sr0 /mnt/protect-on-mac
-   sudo cp /mnt/protect-on-mac/*.sh /root/
-   sudo chmod +x /root/*.sh
-   sudo umount /mnt/protect-on-mac
+   mkdir -p /mnt/protect-on-mac
+   mount /dev/sr0 /mnt/protect-on-mac
+   bash /mnt/protect-on-mac/start-here.sh
    ```
-   We mount at `/mnt/protect-on-mac` rather than `/mnt` directly so we don't shadow anything Protect or related software might want to use there in the future. The scripts get copied to `/root/` so they're available even when the ISO isn't mounted.
+   We mount at `/mnt/protect-on-mac` rather than `/mnt` directly so we don't shadow anything Protect or related software might want to use there in the future. The ISO carries the project as a single tarball (`protect-on-mac.tgz`) — a tar preserves full filenames and execute bits, which a raw ISO 9660 filesystem does not. `start-here.sh` unpacks it to `/root/vm`, `/root/host`, `/root/capture` and then runs the installers.
 
-10. **Run the install script**:
+10. **`start-here.sh` runs the installer** from `vm/installers/` — or you can run it yourself:
     ```bash
-    sudo bash /root/install-protect-baremetal.sh
+    cd /root/vm/installers
+    ./install-protect-baremetal.sh
     ```
-    This downloads the UNVR firmware, extracts the Ubiquiti packages, adds `apt.artifacts.ui.com` as an apt repository at `/etc/apt/sources.list.d/ubiquiti.list`, and installs everything.
+    `install-protect-baremetal.sh` downloads the UNVR firmware, extracts the Ubiquiti packages, adds `apt.artifacts.ui.com` as an apt repository at `/etc/apt/sources.list.d/ubiquiti.list`, and installs everything — including, as its final phase, the UNVR-faithful storage subsystem (the `vm/storage/rootfs/` tree). So one run produces a complete system. `install-storage.sh` installs that same storage layer on its own; it is kept as a standalone script for re-applying just the storage layer by hand, and a full install does not need it.
 
-11. **Reboot the VM**, this time using `start-protect-vm.sh` from the host (which switches to bridged networking and attaches your DAS disks). The scripts ISO is no longer needed; the scripts are now in `/root/`.
+11. **Reboot the VM**, this time using `start-protect-vm.sh` from the host (which switches to bridged networking and attaches your DAS disks). The scripts ISO is no longer needed; the `vm/` tree is now in `/root/vm`.
 
 12. **Access `https://<VM-IP>`** for initial UniFi setup. Once the VM is on bridged networking, other LAN hosts can also reach it — useful for future script updates via `scp` from a non-host machine, or just rebuild the ISO with `make-scripts-iso.sh` and re-attach.
 
@@ -367,7 +411,7 @@ When the scripts on the host change (you pulled an update from the repo, edited 
 
 1. Run `start-protect-vm.sh` interactively. It'll see the existing ISO and ask if you want to regenerate it. Answer yes.
 2. Reboot the VM (or just attach the ISO via QMP, but reboot is simpler).
-3. Inside the VM: `sudo mount /dev/sr0 /mnt/protect-on-mac && sudo cp /mnt/protect-on-mac/*.sh /root/`
+3. Inside the VM: `mount /dev/sr0 /mnt/protect-on-mac && tar --warning=no-unknown-keyword -xzf /mnt/protect-on-mac/protect-on-mac.tgz -C /root && umount /mnt/protect-on-mac`
 
 The ISO is also fine to leave attached permanently — the VM ignores it in normal operation. You can `mount /dev/sr0` any time you want to refresh scripts from whatever the latest ISO contains.
 
@@ -375,13 +419,13 @@ The ISO is also fine to leave attached permanently — the VM ignores it in norm
 
 This is the recommended workflow if you have a working UNVR you want to replace:
 
-1. **Backup the UNVR** via the web UI. Download the backup file.
+1. **Back up the UNVR** via the web UI. The backup can be downloaded as a local file, or stored in your Ubiquiti (UI) account's cloud backup. Cloud is the simplest path for migration — when the new VM is signed into the same UI account, the backup appears in its restore list automatically, with no file to move around.
 
 2. **Build the test VM** following the fresh install workflow above (install script, no production data yet).
 
 3. **Important: Do NOT remove cameras from the original UNVR's Protect**. The backup includes camera adoption state and certificates. If you remove cameras from Protect first, the backup won't bring them back automatically.
 
-4. **Shut down the original UNVR cleanly** via its web UI. This is critical — clean shutdown ensures the disks are in a consistent state and lets cameras gracefully drop their connection.
+4. **Confirm the backup is reachable from the new VM, then shut down the original UNVR cleanly** via its web UI. Do not shut it down until the backup is verified available: if you used cloud backup, sign the new VM into the same UI account and check the backup shows up in its restore list; if you downloaded a local file, make sure you have it. Only once you've seen the backup is restorable on the VM should you power the UNVR down. This ordering is critical — and clean shutdown ensures the disks are in a consistent state and lets cameras gracefully drop their connection. **Keep it off the network afterwards.** If the old NVR is replacing the VM (or vice versa), it must be removed from the network — not just shut down. If it ever powers back on while still connected, it will attempt to reconnect to the cameras and fight the VM for them. Unplug it, or keep it on an isolated segment.
 
 5. **Restore the UNVR backup onto the VM** via the VM's Protect web UI. This includes camera configurations, Access doors, users, face data, and certificates.
 
@@ -389,7 +433,11 @@ This is the recommended workflow if you have a working UNVR you want to replace:
 
 7. **Once you're confident**, move the UNVR's disks to the DAS, connect to the host, and run `mount-storage.sh import` inside the VM. This attaches the existing video storage.
 
-8. **If some cameras don't come back automatically**, give them a few minutes for the controller to make contact and the cameras to reconcile. If they still don't connect after that, they may need to be re-adopted in the Protect UI.
+8. **If some cameras don't come back automatically**, give them a few minutes for the controller to make contact and the cameras to reconcile. If they still don't connect after that, they need to be re-adopted manually. A few things that work, roughly in order of least to most effort:
+
+   - **Remove the device from Protect.** Once removed, the camera reappears in the device list as adoptable — adopt it again and it comes back.
+   - **Use the Protect mobile app.** Under some circumstances the Protect *web UI* won't drive the re-adoption and will tell you to use the *mobile app* instead. The app can adopt cameras the web UI can't, so keep it handy for this step.
+   - **Log into the device directly.** Browse to the camera's own IP and log in with username `ubnt` and the device's recovery password (shown in the UniFi UI / device settings). If the recovery password doesn't work, try the default password `ubnt`. From the device portal you can point it at the new controller.
 
 9. **Optionally migrate the database to SSD** for the UI speedup:
    ```bash
@@ -457,7 +505,7 @@ Snapshots happen **while the VM is running**. The script briefly pauses the VM v
 ./snapshot.sh create-auto pre-update
 
 # Do whatever risky thing you wanted
-ssh root@<VM-IP> /root/unifi-update.sh --all
+ssh root@<VM-IP> /root/vm/installers/update-unifi.sh --all
 
 # If it broke, shut the VM down and roll back:
 ./install-launchd.sh stop          # or systemctl poweroff from inside
@@ -545,16 +593,16 @@ The recordings on the RAID don't need a separate backup — they're already on a
 
 ## Updates
 
-Once running, updates are handled by `unifi-update.sh`:
+Once running, updates are handled by `update-unifi.sh`:
 
 ```bash
-./unifi-update.sh              # Show what's available
-./unifi-update.sh --check      # Same as default
-./unifi-update.sh --sync-os    # Update UniFi OS packages from latest UNVR firmware
-./unifi-update.sh --protect    # Update Protect to latest stable
-./unifi-update.sh --access     # Update Access to latest stable
-./unifi-update.sh --all        # Sync OS + upgrade Protect + Access
-./unifi-update.sh --all-edge   # Same but use beta channels
+./update-unifi.sh              # Show what's available
+./update-unifi.sh --check      # Same as default
+./update-unifi.sh --sync-os    # Update UniFi OS packages from latest UNVR firmware
+./update-unifi.sh --protect    # Update Protect to latest stable
+./update-unifi.sh --access     # Update Access to latest stable
+./update-unifi.sh --all        # Sync OS + upgrade Protect + Access
+./update-unifi.sh --all-edge   # Same but use beta channels
 ```
 
 The script queries Ubiquiti's firmware API (the same one the UNVR uses to find updates) and downloads the latest debs directly. Checksum verification on every download.
@@ -570,7 +618,7 @@ The following packages have been kept back:
   ds  unifi-access  unifi-core  unifi-protect  ulp-go  ...
 ```
 
-That's intentional and correct — those packages are managed by `unifi-update.sh`, not by apt. Held packages get skipped during `apt-get upgrade` so a routine system update can't break your Protect install.
+That's intentional and correct — those packages are managed by `update-unifi.sh`, not by apt. Held packages get skipped during `apt-get upgrade` so a routine system update can't break your Protect install.
 
 **What's safe to upgrade via apt**:
 
@@ -580,13 +628,41 @@ That's intentional and correct — those packages are managed by `unifi-update.s
 
 **What you should NOT do**:
 
-- **Don't `apt-mark unhold` the Ubiquiti packages unless you know what you're doing.** Use `unifi-update.sh` instead — it coordinates the version handling and unholds/re-holds the packages around its operations.
+- **Don't `apt-mark unhold` the Ubiquiti packages unless you know what you're doing.** Use `update-unifi.sh` instead — it coordinates the version handling and unholds/re-holds the packages around its operations.
 - **Avoid `apt-get dist-upgrade`** unless you understand exactly what it's doing. Unlike plain `upgrade`, `dist-upgrade` can install new packages and remove existing ones to satisfy dependencies. This could reintroduce `unvr-initramfs` (which we deliberately removed because it breaks VM boot) or install other UNVR-only packages.
 - **PostgreSQL major versions (14 → 15)** would require a full migration with `pg_upgradecluster`. Not normally pushed by Debian stable, but worth being aware of as bullseye approaches end-of-life.
 
-**Service masks survive upgrades**. The `usd`, `usdbd`, `rpsd`, `uhwd`, `sfp`/`sfpd` masks installed during setup are at the systemd level, not the package level. Package upgrades won't undo them. New services introduced by a UniFi OS update might need to be masked too — `unifi-update.sh --sync-os` handles the known ones automatically.
+**Service masks survive upgrades**. The `usd`, `usdbd`, `rpsd`, `uhwd`, `sfp`/`sfpd` masks installed during setup are at the systemd level, not the package level. Package upgrades won't undo them. New services introduced by a UniFi OS update might need to be masked too — `update-unifi.sh --sync-os` handles the known ones automatically.
 
 **Unattended upgrades**: if you want automatic security patches, install `unattended-upgrades` and configure it for security-only updates. Since the Ubiquiti packages are already held, unattended-upgrades will leave them alone automatically.
+
+## The host↔guest control channel
+
+A couple of features need the VM to ask the *host* to do something — take a qcow2 snapshot, or run a real SMART query against a USB disk the VM itself can't see. The VM and host talk over a dedicated **virtio-serial control channel**.
+
+Why not just SSH from the VM to the host? Because the VM's only network is the bridged LAN, and a host usually can't reach its own bridged VM cleanly (the switch won't hairpin a frame back out the port it came in on). A virtio-serial port sidesteps that entirely:
+
+- **No network.** It's a serial port, not a NIC — no IP at all, so it can't collide with any LAN subnet and bridged-networking flakiness is irrelevant.
+- **Invisible to UniFi OS.** It's a character device, not a NIC or disk — the Ubiquiti software never sees it.
+- **Locked down by design.** The host side (`control-host-helper.sh`) is not a shell and never `eval`s anything. It's a dispatcher with a fixed verb vocabulary — `ping`, `snapshot`, `smartctl`. A request for anything else has no code path; every argument is validated against a strict character set. This is the same guarantee an SSH forced command gives, achieved structurally.
+
+`start-protect-vm.sh` starts the listener automatically (it owns the socket, unprivileged; QEMU connects as a client). The guest side is `/usr/local/bin/protect-on-mac-ctl`. If the channel is present it's used; if not, callers fall back gracefully.
+
+What rides it today:
+
+- **Snapshots** — automatic checkpoints bracket the install: `install-protect-baremetal.sh` takes a `fresh-debian` snapshot before it installs anything (Phase 0), and a one-shot systemd unit takes a `protect-installed` snapshot the first time Protect comes up healthy, then disables itself. `update-unifi.sh` takes a `pre-update-<timestamp>` snapshot before every update. And any script in the VM can run `protect-on-mac-ctl snapshot <label>` to checkpoint the VM disks from inside the guest. The `snapshot` verb is idempotent — re-requesting an existing named checkpoint leaves it as-is.
+- **The smartctl proxy** — see the next section.
+
+**Host requirements** — `stand-up.sh` sets all of this up for you (it installs `socat` and offers to add the sudoers rule). The following is for a host configured by hand, or an existing VM:
+
+- `socat` — carries the channel: `brew install socat`.
+- For the `snapshot` verb, the listener runs `snapshot.sh` via `sudo -n` (it needs root for the QMP socket and `qemu-img`). Add a NOPASSWD sudoers rule:
+  ```bash
+  sudo visudo -f /etc/sudoers.d/protect-on-mac
+  # Add (replace `donnie` with your username, and the path with yours):
+  #   donnie ALL=(root) NOPASSWD: /Users/donnie/.../host/snapshot.sh
+  ```
+  Without it, snapshot requests fail and callers fall back (e.g. `update-unifi.sh` warns and continues). The `smartctl` verb needs no rule here — `smartctl-host-helper.sh` has its own (see the smartctl proxy section).
 
 ## Optional: smartctl proxy (real disk health in Protect)
 
@@ -600,17 +676,19 @@ This is **optional and opt-in**. If you don't set it up, nothing changes — the
 
 1. Protect runs `smartctl <flags> /dev/sdX` inside the VM.
 2. The VM-side wrapper resolves `/dev/sdX` to its disk serial (via `lsblk`).
-3. It SSHes to the Mac with a key locked to a single forced command, passing the serial and flags.
+3. It sends `smartctl <serial> <flags>` over the [control channel](#the-hostguest-control-channel).
 4. The host helper validates the input, looks the serial up in a serial-to-device map (`disk-serial.map`, rewritten by `start-protect-vm.sh` on every VM start — macOS renumbers `/dev/diskN` constantly), and runs the real `smartctl` against the matching `/dev/diskN`.
 5. The output travels back and the wrapper hands it to Protect.
 
-If anything fails — proxy not configured, Mac unreachable, unknown disk, SSH error — the wrapper falls through to the local real `smartctl`. The proxy is strictly best-effort; it can't break the VM.
+If anything fails — proxy disabled, control channel unavailable, unknown disk — the wrapper falls through to the local real `smartctl`. The proxy is strictly best-effort; it can't break the VM.
 
 Only **raw-passthrough disks** (`DISK_SERIALS` in `protect-on-mac.conf`) are proxied. qcow2 disk images have no underlying physical disk, so they keep returning local data.
 
 ### Prerequisite: SAT SMART pass-through on the Mac
 
-macOS does **not** expose ATA/SMART pass-through for USB-attached disks natively. You need the kasbert `OS-X-SAT-SMART-Driver` kext — most easily obtained by installing [DriveDx](https://binaryfruit.com/drivedx), which bundles and installs it. On Apple Silicon, loading a third-party kext requires **Reduced Security** mode (set in the recoveryOS Startup Security Utility). See "Limitations and known issues" below — this is a real dependency, not a footnote.
+macOS does **not** expose ATA/SMART pass-through for USB-attached disks natively. You need the kasbert `OS-X-SAT-SMART-Driver` kext. The easiest source is the **signed** `SATSMARTDriver` package from [binaryfruit.com](https://binaryfruit.com) — the vendor of [DriveDx](https://binaryfruit.com/drivedx), a well-known commercial Mac disk-health app, so it's a recognized source rather than a random download. `stand-up.sh` offers to fetch that package for you and extracts it under `$VM_DATA_DIR/SATSMARTDriver/`; installing DriveDx itself also bundles and installs the kext. Either way, on Apple Silicon loading a third-party kext requires **Reduced Security** mode (set in the recoveryOS Startup Security Utility) — `stand-up.sh` can't do that step for you. See "Limitations and known issues" below — this is a real dependency, not a footnote.
+
+**If the binaryfruit download ever disappears:** the same driver can be built from source — [`github.com/kasbert/OS-X-SAT-SMART-Driver`](https://github.com/kasbert/OS-X-SAT-SMART-Driver) — which needs the Xcode command-line tools (`xcode-select --install`). A self-built kext is **unsigned**, and an unsigned kext is *harder* to load on Apple Silicon than the signed binaryfruit build (more Reduced Security friction, and newer macOS resists unsigned kexts further). Prefer the signed download while it exists; treat the source build as a last resort.
 
 Verify pass-through works for your enclosure before bothering with the rest. With the kext loaded:
 
@@ -628,68 +706,41 @@ If `SATSMARTCapable = Yes` shows up and `smartctl -a` returns real attributes, y
 
 ### Setup
 
+Because the proxy rides the [control channel](#the-hostguest-control-channel), there is **no SSH key, no `PROXY_HOST`, no Remote Login, and no `authorized_keys` entry** to manage. Three steps:
+
 **1. Install the VM with the proxy enabled.** Run the bare-metal installer with `SMARTCTL_PROXY=1`:
 
 ```bash
-SMARTCTL_PROXY=1 sudo bash /root/install-protect-baremetal.sh
+cd /root/vm/installers
+SMARTCTL_PROXY=1 bash install-protect-baremetal.sh
 ```
 
-This installs real `smartmontools` (as `/usr/sbin/smartctl.real`), the wrapper at `/usr/sbin/smartctl`, a config file at `/etc/default/smartctl-proxy`, and generates an SSH keypair under `/etc/protect-smartctl-proxy/`. The installer prints the VM's public key at the end — keep it.
+This installs real `smartmontools` (the real binary kept as `/usr/sbin/smartctl.real`), the proxy wrapper at `/usr/sbin/smartctl`, and the control-channel client `/usr/local/bin/protect-on-mac-ctl`. (Already installed without the proxy? Re-run the installer with the flag.)
 
-(Already installed without the proxy? Re-run Phase 7's logic by re-running the installer with the flag, or set it up by hand following the same file layout.)
-
-**2. Point the VM at the Mac.** Edit `/etc/default/smartctl-proxy` in the VM:
-
-```sh
-PROXY_HOST=192.168.1.50        # the Mac's LAN IP
-PROXY_USER=donnie              # your macOS username
-PROXY_KEY=/etc/protect-smartctl-proxy/id_ed25519
-```
-
-**3. On the Mac — install smartmontools and enable Remote Login:**
+**2. On the Mac — install smartmontools and socat:**
 
 ```bash
-brew install smartmontools
-# System Settings → General → Sharing → Remote Login (on)
+brew install smartmontools socat
 ```
 
-**4. On the Mac — install the host helper:**
+If you ran `stand-up.sh` and answered yes to the smartctl-proxy prompt, `smartmontools` is already installed and the SAT SMART kext installer already downloaded — this step is just for hand-configured hosts. `socat` carries the control channel; `smartmontools` is the real `smartctl` the host helper runs. `smartctl-host-helper.sh` is invoked in place from the `host/` directory by `control-host-helper.sh` — nothing to copy. Its `DISK_MAP` path must match `DISK_MAP` in `protect-on-mac.conf`; both default to `$VM_DATA_DIR/disk-serial.map`, so unless you changed `VM_DATA_DIR` there's nothing to do.
 
-```bash
-sudo cp smartctl-host-helper.sh /usr/local/bin/
-sudo chmod +x /usr/local/bin/smartctl-host-helper.sh
-```
+No sudoers rule is needed for the proxy — on macOS `smartctl` reads SMART through IOKit, which works unprivileged, so `smartctl-host-helper.sh` runs it directly.
 
-The helper's `DISK_MAP` path must match `DISK_MAP` in `protect-on-mac.conf`. Both default to `$VM_DATA_DIR/disk-serial.map`, so if you didn't change `VM_DATA_DIR` there's nothing to do.
-
-**5. On the Mac — add the sudoers rule.** The helper needs root to read raw disks:
-
-```bash
-sudo visudo -f /etc/sudoers.d/smartctl-proxy
-# Add this line (replace `donnie` with your username):
-#   donnie ALL=(root) NOPASSWD: /opt/homebrew/bin/smartctl
-```
-
-**6. On the Mac — authorize the VM's key with a forced command.** Add the public key the installer printed to `~/.ssh/authorized_keys`, prefixed so the key can *only* run the helper:
-
-```
-command="/usr/local/bin/smartctl-host-helper.sh",no-pty,no-port-forwarding,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA...the VM's public key... protect-smartctl-proxy
-```
-
-Optionally tighten further with `from="<VM-IP>"` at the front of that line.
+That's the whole setup. Restart the VM with `start-protect-vm.sh` so the control channel is attached and the disk map is regenerated.
 
 ### Verify
 
 From inside the VM:
 
 ```bash
-# Pick a raw-passthrough disk, e.g. /dev/sda
-smartctl -a /dev/sda
+protect-on-mac-ctl ping            # should print: pong
+smartctl -a /dev/sda               # a raw-passthrough disk
 ```
 
-If the proxy is working you'll see the real disk's model, serial, temperature, and SMART attributes — not the fake "Virtual Storage Device". A failing disk shows `SMART overall-health self-assessment test result: FAILED` to anything that runs `smartctl`. For that health to surface in Protect's *Storage Manager panel*, see [Storage health and the Storage Manager panel](#storage-health-and-the-storage-manager-panel) below.
+If the channel is up, `ping` returns `pong`. If the proxy is working, `smartctl -a` shows the real disk's model, serial, temperature, and SMART attributes — not the fake "Virtual Storage Device". A failing disk shows `SMART overall-health self-assessment test result: FAILED`. For that health to surface in Protect's *Storage Manager panel*, see [Storage health and the Storage Manager panel](#storage-health-and-the-storage-manager-panel) below.
 
-To watch what the proxy is doing, the host helper writes diagnostics to stderr (visible in the VM via SSH stderr) and `start-protect-vm.sh` prints the disk-map path and count on every start.
+The control-channel listener writes diagnostics to its stderr (the terminal running `start-protect-vm.sh`, or `LAUNCHD_ERROR_LOG` in background mode), and `start-protect-vm.sh` prints the disk-map path and count on every start.
 
 ### Caveats
 
@@ -710,7 +761,7 @@ On a real UNVR, the Storage panel lists every disk with its health, and a failin
 - **`smartctl` returns real data** — with the optional [smartctl proxy](#optional-smartctl-proxy-real-disk-health-in-protect), any `smartctl` call in the VM is forwarded to the Mac and answered with genuine SMART data for the real USB-attached disks.
 - **`ustorage` returns real data** — `ustorage-vm.py` replaces the installer's static fake `/usr/bin/ustorage` with a dynamic one that reports real per-disk health, array state, and all three space types (primary, swap, root). Failure detection covers both SMART self-assessment *and* md-array member state — a dropped disk shows as `faulty`.
 - **`mdadm --detail /dev/md3` works on migrated arrays** — `mdadm-vm-wrapper.sh` redirects that hardcoded call (UniFi software always asks for `/dev/md3`) to whatever device the imported array actually assembled as (`/dev/md12x` on a migration).
-- **`unifi-core`'s background storage health poll runs on real data** — once the `unifi-core` → `smartctl` sudoers rule is in place, the every-60-seconds storage check succeeds with genuine SMART instead of failing.
+- **`unifi-core`'s background storage health poll runs on real data** — with the smartctl proxy in place, the every-60-seconds storage check succeeds with genuine SMART instead of failing.
 - **The Storage Manager panel renders** — with the storage shim below installed, Settings → System → Storage shows the array, every disk with model / serial / temperature / health, and capacity. A failing disk surfaces the same red state a real UNVR shows.
 
 ### Why the panel needs a shim
@@ -824,37 +875,155 @@ A 16GB host would give substantial headroom for more cameras and heavier smart d
 - **Real disk health needs a kext**. By default Protect sees a faked-healthy virtual disk. The optional [smartctl proxy](#optional-smartctl-proxy-real-disk-health-in-protect) surfaces genuine SMART data, but macOS has no native ATA pass-through for USB disks — it depends on the kasbert `OS-X-SAT-SMART-Driver` kext (bundled with DriveDx), and loading a third-party kext on Apple Silicon requires booting once into recoveryOS to enable **Reduced Security** mode. If you don't set up the proxy, none of this applies.
 - **The Storage Manager panel needs the storage shim**. Out of the box the UniFi OS Storage panel sits on a loading spinner — it depends on the `usd` daemon, which can't run on a VM. The optional [storage shim](#storage-health-and-the-storage-manager-panel) (`ustated-shim.js` plus a small `service.js` patch) makes the panel render with real disk health. The patch targets a minified vendor bundle and may need re-checking after `unifi-core` updates.
 
+## Recovery from common failures
+
+A handful of failure modes are well understood and have one-line fixes. Knowing the symptoms saves time when something goes wrong.
+
+### Host disk pressure (macOS, APFS snapshots)
+
+macOS APFS takes local Time Machine snapshots automatically — every hour, even without a backup drive attached. They silently pin space that Disk Utility happily reports as "free" (it counts purgeable space). The first sign is usually a VM operation failing with ENOSPC or the qcow2 storage images mysteriously refusing to grow, even though the GUI says you have plenty of room.
+
+Check the truth:
+
+```
+df -h /                          # what the kernel actually sees
+tmutil listlocalsnapshots /      # what Time Machine is holding onto
+```
+
+If `df` is much smaller than the GUI claims, thin the snapshots:
+
+```
+sudo tmutil thinlocalsnapshots / 200000000000 4
+df -h /                          # confirm recovery
+```
+
+That asks macOS to free up to ~200 GB at urgency 4 (max) and lets APFS coordinate the deletes — more reliable than iterating `tmutil deletelocalsnapshots`, which can hit stale-handle errors (`POSIXError Code=70`) when macOS is auto-purging in parallel. macOS keeps the most recent snapshot for short-term undo; that's normal and worth leaving alone.
+
+A reboot can also help: it lets APFS finish background pruning that was queued behind locked snapshot references. If `df` still looks tight afterward, hunt for the actual hog with:
+
+```
+sudo du -sh ~/Library/Containers/* 2>/dev/null | sort -h | tail
+```
+
+UTM, Docker, Messages, and Mail are the usual offenders.
+
+### Stale `postmaster.pid` after ungraceful VM shutdown
+
+If the QEMU process is killed (host reboot, `kill -9`, power loss) without giving the guest a clean shutdown, `postgres@14-protect`'s lockfile survives into the next boot. `unifi-protect`'s pre-start sees the cluster as "running" but unreachable, and Protect refuses to start.
+
+**Symptoms**:
+
+- `systemctl status unifi-protect` shows `Failed to connect to service 'postgres'` / `connect ENOENT /var/run/postgresql/.s.PGSQL.5433`.
+- `journalctl -u postgresql@14-protect` shows `Error: pid file is invalid, please manually kill the stale server process.`
+- `pg_lsclusters` shows the protect cluster as `down`.
+
+**Fix** (inside the VM as root):
+
+```
+rm -f /srv/postgresql/14/protect/data/postmaster.pid
+systemctl start postgresql@14-protect
+pg_lsclusters                    # confirm: status 'online'
+systemctl start unifi-protect
+```
+
+**Prevention**: prefer `systemctl poweroff` inside the VM, or send `system_powerdown` via the QMP socket. Both give postgres a chance to release the lockfile before QEMU exits.
+
+The `postgresql@14-protect.service` unit ships with a `clean-postmaster-pid.conf` drop-in that is supposed to clean a stale pid before start, but the migrate-script's direct `pg_ctlcluster stop` call bypasses the systemd ExecStartPre chain in this case. Manual `rm` is the reliable recovery.
+
+### First-boot DB-cluster migration runs on every fresh install
+
+On a real UNVR, the storage array is present at first Protect start, so the DB initializes directly on `/srv/`. In this VM, the array is user-driven through the web UI — meaning the first Protect start happens *before* `/srv/` is real, the DB initializes on `/data/`, and only on the next start (after the array exists) does the cluster migrate to `/srv/`.
+
+This migrate path is normal. You'll see this in the journal:
+
+```
+pre-start: PostgreSQL running with /data/ but /srv/ has the real DB, running migrate script
+```
+
+The migrate script (`/usr/bin/unifi-protect-db-cluster-migrate`) rsyncs the cluster directory, updates `data_directory` in the postgres config, and triggers a restart through systemd. It runs exactly once per cluster and writes `/srv/.db-cluster-migrated.ctl` when done.
+
+If it fails mid-way (most commonly because of the stale `postmaster.pid` trap above), the recovery is the same: clear the pid, start the cluster manually, then start `unifi-protect`. Leftover bytes in `/data/postgres-active/` and `/data/postgresql/14/protect/` after a successful migrate are harmless and can be cleaned up later.
+
+### Storage pane transient render race
+
+Right after Protect starts, the Storage Manager pane sometimes shows three disks as `UniFi Protect VM Disk` and one as `QEMU HARDDISK`. This is a race during first disk-model discovery: `unifi-core` queries one disk before the smartctl shim has answered for it, and caches the kernel's raw response. A single reload of the storage pane refreshes through the warmed-up shim and all four disks show consistently.
+
+If a disk stays as `QEMU HARDDISK` across multiple reloads, the smartctl shim isn't intercepting that disk:
+
+```
+systemctl status ustated-shim
+journalctl -u ustated-shim
+```
+
+Worth noting: the kernel-level identity (`lsblk -o NAME,MODEL,SERIAL`) always says `QEMU_HARDDISK` for qcow2-backed disks regardless of the shim. The shim only rewrites the smartctl layer. That's intentional defense — anything that bypasses smartctl will see the QEMU identity and behave accordingly. If you pass real disks through to the VM, their real model strings (e.g. HGST) pass through unchanged because the shim's matching is keyed on the QEMU vendor string.
+
+### Generic fallback — what to check first
+
+For anything not covered here, attach the serial console (`./host/attach-console.sh`) and inspect:
+
+```
+systemctl --failed               # any unit not happy
+journalctl -p err -b              # errors since this boot
+df -h                             # disk space inside the VM
+pg_lsclusters                     # postgres clusters
+cat /proc/mdstat                  # RAID state
+```
+
+That's usually enough to tell whether a service is wedged, a disk is failing, the array is degraded, or you're out of space — the four most common root causes.
+
 ## Possible future enhancements
 
 - **Fully automated VM creation**: A script that creates the qcow2, boots the Debian installer with a preseed file, runs the install script, and produces a ready-to-go VM image. Doable, just not done yet.
 
 ## Files
 
-VM-side (live inside the Debian VM):
+See "Repository layout" near the top for the directory tree. The detail:
 
-- **`install-protect-baremetal.sh`** — full UniFi software install. Run once during initial setup.
-- **`unifi-update.sh`** — query API, download, install latest UniFi packages.
-- **`mount-storage.sh`** — import existing RAID, migrate postgres to SSD, show status.
-- **`uninstall.sh`** — migrate postgres back to the RAID to prep disks for moving to other hardware.
-- **`smartctl-vm-wrapper.sh`** — VM side of the optional smartctl proxy. Installs as `/usr/sbin/smartctl`; forwards SMART queries to the Mac host. See the "smartctl proxy" section.
-- **`smartctl-proxy.conf.example`** — config template for the proxy wrapper. Copy to `/etc/default/smartctl-proxy` in the VM.
-- **`ustorage-vm.py`** — dynamic `ustorage` replacement: reports real per-disk and array health instead of the installer's static fake. See "Storage health".
-- **`mdadm-vm-wrapper.sh`** — redirects `mdadm --detail /dev/md3` to the real array on migrated setups. See "Storage health".
-- **`ustated-shim.js`** — storage-API gRPC shim. Serves `unifi.firmware.storage.v1` on `127.0.0.1:11052` so the Storage Manager panel renders. See "Storage health".
-- **`ustated-shim.service`** — systemd unit that runs `ustated-shim.js` at boot.
-- **`unifi-core-storage-patch.sh`** — idempotent re-apply guard for the `unifi-core` `service.js` disk-list patch. See "Storage health".
-- **`unifi-core-storage-patch.service`** — systemd unit that runs the patch guard before `unifi-core` starts.
+### `host/` — live on the Mac
 
-Host-side (live on the Mac):
-
-- **`protect-on-mac.conf.example`** — configuration template. Copy to `protect-on-mac.conf` and edit.
+- **`stand-up.sh`** — create a fresh VM: download + verify the Debian netinst ISO, create the OS disk / UEFI varstore / blank data disks, run the Debian installer.
 - **`start-protect-vm.sh`** — start the VM with stable hardware references. Sources the config.
-- **`make-scripts-iso.sh`** — bundle the VM-side scripts into an ISO for initial bootstrap (when scp from host can't reach the VM).
 - **`attach-console.sh`** — attach to the VM's serial console for emergency access when running as a daemon.
 - **`snapshot.sh`** — create/restore/list/delete qcow2 snapshots before risky operations.
 - **`install-launchd.sh`** — install/manage the launchd daemon that auto-starts the VM at boot.
+- **`make-scripts-iso.sh`** — bundle the `vm/` tree into an ISO for initial bootstrap (when scp from host can't reach the VM).
+- **`control-host-helper.sh`** — host side of the virtio-serial control channel. A locked-down dispatcher (`ping`/`snapshot`/`smartctl`); `start-protect-vm.sh` launches it. See "The host↔guest control channel".
+- **`smartctl-host-helper.sh`** — runs real disk SMART queries for the `smartctl` verb of the control channel. See the "smartctl proxy" section.
+- **`protect-on-mac.conf.example`** — configuration template. Copy to `protect-on-mac.conf` and edit.
 - **`com.protect-on-mac.vm.plist`** — launchd configuration template used by `install-launchd.sh`.
-- **`smartctl-host-helper.sh`** — host side of the optional smartctl proxy. Forced-command target that returns real disk SMART data to the VM. See the "smartctl proxy" section.
+
+### `vm/installers/` — run once inside the VM, from `/root`
+
+- **`install-protect-baremetal.sh`** — full UniFi software install. Run once during initial setup.
+- **`install-storage.sh`** — install the storage subsystem: walks `vm/storage/rootfs/` and installs every file at its mirrored path, then wires up the systemd units. See "Storage health".
+- **`update-unifi.sh`** — query API, download, install latest UniFi packages.
+- **`mount-storage.sh`** — import existing RAID, migrate postgres to SSD, show status.
+- **`uninstall.sh`** — migrate postgres back to the RAID to prep disks for moving to other hardware.
+
+### `vm/storage/rootfs/` — the storage subsystem, laid out at install paths
+
+`install-storage.sh` installs this tree verbatim. See "Storage health".
+
+- **`usr/bin/ustorage`** — dynamic `ustorage` replacement: reports real per-disk and array health instead of the installer's static fake.
+- **`usr/local/sbin/provision-storage.sh`** — boot-time disk provisioner + `space nuke` teardown/reprovision worker.
+- **`usr/local/bin/ustated-shim.js`** — storage-API gRPC shim. Serves `unifi.firmware.storage.v1` on `127.0.0.1:11052` so the Storage Manager panel renders.
+- **`usr/local/bin/unifi-core-storage-patch.sh`** — idempotent re-apply guard for the `unifi-core` `service.js` disk-list patch.
+- **`etc/systemd/system/provision-storage.service`** — runs the provisioner at boot, before `ustated-shim` and `unifi-core`.
+- **`etc/systemd/system/ustated-shim.service`** — runs `ustated-shim.js` at boot.
+- **`etc/systemd/system/unifi-core-storage-patch.service`** — runs the patch guard before `unifi-core` starts.
+- **`etc/systemd/system/storage-nuke.service`** — on-demand teardown worker, triggered by `ustorage space nuke` (not enabled at boot).
+
+### `vm/wrappers/` — control-channel client and binary interceptors
+
+- **`rootfs/usr/local/bin/protect-on-mac-ctl`** — guest client for the host↔guest control channel. Installed by `install-protect-baremetal.sh`; used for snapshot triggers and by the smartctl wrapper.
+- **`rootfs/usr/local/sbin/protect-installed-snapshot`** + **`rootfs/etc/systemd/system/protect-installed-snapshot.service`** — a one-shot that takes a `protect-installed` snapshot the first time Protect is healthy, then disables itself. Installed + enabled by `install-protect-baremetal.sh`.
+- **`rootfs/usr/sbin/smartctl`** — VM side of the optional smartctl proxy. Installs as `/usr/sbin/smartctl`; forwards SMART queries to the host over the control channel. See the "smartctl proxy" section.
+- **`rootfs/sbin/mdadm`** — redirects `mdadm --detail /dev/md3` to the real array on migrated setups. See "Storage health".
+- **`smartctl-proxy.conf.example`** — optional config (a kill switch) for the proxy wrapper. Copy to `/etc/default/smartctl-proxy` in the VM.
+
+### `capture/` — diagnostics
+
+- **`capture-storage-flow.sh`** / **`capture-disk-event.sh`** — capture the gRPC/storage daemon traffic used to reverse-engineer the storage wire protocol.
 
 ## Credits
 

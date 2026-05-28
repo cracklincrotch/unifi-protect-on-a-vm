@@ -19,10 +19,15 @@
     headless server you want LaunchDaemon — the VM should start whether
     or not anyone has logged in to the Mac console.
 
-  WHY KeepAlive:
-    If the VM exits for any reason (clean shutdown from inside, crash,
-    out-of-memory, etc.), launchd restarts it. The 30-second throttle
-    prevents tight restart loops if something is consistently failing.
+  WHY KeepAlive = SuccessfulExit false:
+    start-protect-vm.sh translates the VM's fate into its own exit code.
+    A guest reboot is handled inside the script — it cold-restarts QEMU
+    itself and never exits. A deliberate power-off (e.g. "Power Off" from
+    the Protect web UI) exits 0; SuccessfulExit=false tells launchd NOT
+    to restart on a clean exit, so the VM stays down until someone starts
+    it again. A crash or QEMU fault exits non-zero, and launchd does
+    relaunch. The 30-second throttle prevents tight restart loops if
+    something is consistently failing.
 -->
 <plist version="1.0">
 <dict>
@@ -43,12 +48,17 @@
         <string>SCRIPT_PATH</string>
     </array>
 
-    <!-- Start at boot, restart if it exits -->
+    <!-- Start at boot. -->
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Restart only on an abnormal (non-zero) exit. A clean exit 0 means
+         the VM was deliberately powered off — leave it down. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <!-- Don't restart faster than every 30 seconds. Prevents busy-loops
          if QEMU is consistently failing (e.g. DAS not connected). -->
@@ -72,12 +82,16 @@
     <key>StandardErrorPath</key>
     <string>/var/log/protect-vm.error.log</string>
 
-    <!-- Inherit a sane PATH so the script can find qemu-system-aarch64,
-         networksetup, smartctl, etc. without absolute paths. -->
+    <!-- A sane PATH (launchd does not inherit a shell's), plus the path to
+         THIS VM's protect-on-mac.conf. The conf lives in the VM's data
+         directory, so start-protect-vm.sh — started here by launchd, with
+         no shell environment — is told explicitly where to find it. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PROTECT_ON_MAC_CONF</key>
+        <string>CONF_PATH</string>
     </dict>
 </dict>
 </plist>

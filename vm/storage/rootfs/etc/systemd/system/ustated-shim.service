@@ -1,7 +1,7 @@
 ###############################################################################
 # ustated-shim.service
 #
-# Runs ustated-shim.js at boot — the storage/v1 gRPC server that feeds
+# Runs ustated-shim.js at boot — the storage/v2 gRPC server that feeds
 # unifi-core's Storage panel on this VM (replaces ustated on 127.0.0.1:11052).
 #
 # INSTALL (inside the VM, as root)
@@ -19,7 +19,7 @@
 ###############################################################################
 
 [Unit]
-Description=ustated storage-API shim (unifi.firmware.storage.v1 on 127.0.0.1:11052)
+Description=ustated storage-API shim (unifi.firmware.storage.v2 on 127.0.0.1:11052)
 Documentation=file:/usr/local/bin/ustated-shim.js
 After=network.target
 # Start before unifi-core so :11052 is already serving when it subscribes.

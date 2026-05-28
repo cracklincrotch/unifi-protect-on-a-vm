@@ -38,6 +38,13 @@ EFI_VARS="${VM_DATA_DIR}/efi_vars.fd"
 # QEMU's UEFI firmware. Comes with Homebrew's qemu package.
 EFI_CODE="/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
 
+# Where ISO files are cached — the Debian netinst ISO and the scripts ISO.
+# Kept OUTSIDE VM_DATA_DIR (a sibling 'isos' directory by default) so you
+# can wipe a VM's data directory to rebuild it WITHOUT nuking the large
+# Debian ISO download. Point several VMs at the same ISO_DIR to share one
+# cached Debian ISO across them.
+ISO_DIR="${VM_DATA_DIR%/*}/isos"
+
 ###############################################################################
 # VM resources
 ###############################################################################
@@ -47,6 +54,10 @@ EFI_CODE="/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
 # means more of the postgres working set stays in memory.
 VM_CPUS=4
 VM_RAM=4096
+
+# The VM's root password is NOT set here. stand-up.sh prompts for it
+# interactively (twice, hidden) and hashes it into the preseed at build
+# time, so the plaintext never lands in this file.
 
 ###############################################################################
 # Storage
@@ -102,11 +113,34 @@ DISK_MAP="${VM_DATA_DIR}/disk-serial.map"
 # Network
 ###############################################################################
 
-# MAC address of the network adapter to bridge to. Works with any wired
-# adapter (built-in, USB, Thunderbolt). The VM will appear on your network
-# using this MAC.
-# Find adapters with: networksetup -listallhardwareports
-NIC_MAC="aa:bb:cc:dd:ee:ff"
+# Which host interface to bridge through. Two forms:
+#
+#   "auto" (default) — bridge through whichever adapter currently holds
+#       the primary (flagless) IPv4 default route. This is what macOS
+#       itself uses for un-bound outbound traffic, so it roams with the
+#       host: a laptop docked to Ethernet at work bridges through the
+#       dock, undocked at home bridges through Wi-Fi, no edits needed.
+#
+#   "<MAC>" — pin a specific adapter. Matched against networksetup's
+#       hardware MAC and ifconfig's live MAC, so a randomized Wi-Fi
+#       address works. Use this when you want a fixed adapter regardless
+#       of the Service Order, e.g. on a stationary server.
+#       Find adapters with: networksetup -listallhardwareports
+NIC_MAC="auto"
+
+# MAC the VM itself presents on the network. LEAVE THIS UNSET for the
+# normal case: on first start, start-protect-vm.sh generates a random
+# locally-administered MAC (52:54:00:xx:xx:xx) and saves it to vm.mac in
+# VM_DATA_DIR. Every later boot reuses it, so the address is unique per VM
+# and stable across reboots.
+#
+# It MUST differ from the bridged adapter's live MAC. With vmnet-bridged,
+# a VM presenting the host adapter's own MAC collides on the wire and
+# QEMU aborts at launch. start-protect-vm.sh checks for this against the
+# resolved interface's live MAC at every start, so the same VM_MAC stays
+# safe even as NIC_MAC="auto" picks different adapters in different
+# locations.
+# VM_MAC="52:54:00:12:34:57"
 
 ###############################################################################
 # QEMU tuning
@@ -127,6 +161,12 @@ DISK_AIO="threads"
 # When the VM is started via launchd or otherwise in the background, the
 # console becomes available as a unix socket. attach-console.sh reads
 # these paths to find and attach to it.
+#
+# Unlike CONTROL_SOCKET, these two CAN live in root-owned /var/run and
+# /var/log: QEMU creates them, and start-protect-vm.sh always runs QEMU
+# as root (sudo). attach-console.sh connects with `sudo socat`. (The
+# control channel differs — its listener runs unprivileged, so its
+# socket has to live under VM_DATA_DIR instead.)
 
 # Path to the console socket. /var/run is cleared on reboot, so we don't
 # leave stale sockets behind.
@@ -148,7 +188,7 @@ CONSOLE_LOG="/var/log/protect-vm.console.log"
 #
 # Set to empty string to disable ISO handling entirely.
 
-SCRIPTS_ISO="${VM_DATA_DIR}/protect-on-mac-scripts.iso"
+SCRIPTS_ISO="${ISO_DIR}/protect-on-mac-scripts.iso"
 
 ###############################################################################
 # QMP (QEMU Machine Protocol)
@@ -158,6 +198,24 @@ SCRIPTS_ISO="${VM_DATA_DIR}/protect-on-mac-scripts.iso"
 # so you don't need a full shutdown to take one. Always exposed.
 
 QMP_SOCKET="/var/run/protect-vm.qmp.sock"
+
+###############################################################################
+# Control channel (host<->guest)
+###############################################################################
+#
+# A virtio-serial port the VM uses to ask the host for a small fixed set
+# of actions — take a qcow2 snapshot, run a real SMART query. It has no
+# IP (cannot collide with any LAN subnet) and UniFi OS never sees it.
+#
+# start-protect-vm.sh launches control-host-helper.sh, which listens on
+# this socket (as your normal user); QEMU connects to it as a client. The
+# guest side is /usr/local/bin/protect-on-mac-ctl.
+#
+# It lives under VM_DATA_DIR, NOT /var/run: the listener runs unprivileged
+# and cannot create a socket in root-owned /var/run. The listener removes
+# any stale socket on startup.
+
+CONTROL_SOCKET="${VM_DATA_DIR}/protect-vm.control.sock"
 
 ###############################################################################
 # Launchd (used by install-launchd.sh)

@@ -36,7 +36,21 @@ set -e
 # Source the config so we know where the socket is. The config also
 # defines other things we don't use here.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONF_FILE="${PROTECT_ON_MAC_CONF:-$SCRIPT_DIR/protect-on-mac.conf}"
+# Config resolution: $PROTECT_ON_MAC_CONF, else a VM data dir / .conf
+# given as the first argument, else ./protect-on-mac.conf, else alongside
+# this script. Each VM's conf lives in its own data directory.
+CONF_FILE="${PROTECT_ON_MAC_CONF:-}"
+if [ -z "$CONF_FILE" ] && [ -n "${1:-}" ]; then
+    if [ -d "$1" ] && [ -f "$1/protect-on-mac.conf" ]; then
+        CONF_FILE="$1/protect-on-mac.conf"; shift
+    elif [ -f "$1" ] && [ "${1##*.}" = "conf" ]; then
+        CONF_FILE="$1"; shift
+    fi
+fi
+[ -z "$CONF_FILE" ] && [ -f "$PWD/protect-on-mac.conf" ] \
+    && CONF_FILE="$PWD/protect-on-mac.conf"
+CONF_FILE="${CONF_FILE:-$SCRIPT_DIR/protect-on-mac.conf}"
+export PROTECT_ON_MAC_CONF="$CONF_FILE"
 
 if [ -f "$CONF_FILE" ]; then
     # shellcheck source=/dev/null

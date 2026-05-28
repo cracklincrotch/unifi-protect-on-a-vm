@@ -48,7 +48,23 @@ set -euo pipefail
 # if the config isn't present, but a user with a customized config wants
 # their values respected).
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONF_FILE="${PROTECT_ON_MAC_CONF:-$SCRIPT_DIR/protect-on-mac.conf}"
+# Config resolution: $PROTECT_ON_MAC_CONF, else a VM data dir / .conf as
+# the first argument, else ./protect-on-mac.conf, else alongside this
+# script. The launchd plist this generates bakes in the resolved conf
+# path, so a boot-time VM start finds the right per-VM config.
+# Invoke as:  ./install-launchd.sh <vmdir> install <start-protect-vm.sh>
+CONF_FILE="${PROTECT_ON_MAC_CONF:-}"
+if [ -z "$CONF_FILE" ] && [ -n "${1:-}" ]; then
+    if [ -d "$1" ] && [ -f "$1/protect-on-mac.conf" ]; then
+        CONF_FILE="$1/protect-on-mac.conf"; shift
+    elif [ -f "$1" ] && [ "${1##*.}" = "conf" ]; then
+        CONF_FILE="$1"; shift
+    fi
+fi
+[ -z "$CONF_FILE" ] && [ -f "$PWD/protect-on-mac.conf" ] \
+    && CONF_FILE="$PWD/protect-on-mac.conf"
+CONF_FILE="${CONF_FILE:-$SCRIPT_DIR/protect-on-mac.conf}"
+export PROTECT_ON_MAC_CONF="$CONF_FILE"
 
 if [ -f "$CONF_FILE" ]; then
     # shellcheck source=/dev/null
@@ -98,7 +114,8 @@ install_daemon() {
     script_path=$(cd "$(dirname "$script_path")" && pwd)/$(basename "$script_path")
 
     if [ ! -x "$script_path" ]; then
-        echo "Making $script_path executable..."
+        echo "Making executable:"
+        echo "  $script_path"
         chmod +x "$script_path"
     fi
 
@@ -112,6 +129,15 @@ install_daemon() {
     current_user=$(whoami)
 
     echo ">>> Generating launchd plist..."
+    # The plist bakes in PROTECT_ON_MAC_CONF so the boot-time VM start
+    # finds its per-VM config — launchd does not inherit a user shell's
+    # environment. The conf must exist now, to bake a valid path.
+    if [ ! -f "$CONF_FILE" ]; then
+        echo "ERROR: config not found: $CONF_FILE" >&2
+        echo "Run install-launchd.sh with the VM's data directory first:" >&2
+        echo "  ./install-launchd.sh /path/to/<vm>/vm-data install <start-protect-vm.sh>" >&2
+        exit 1
+    fi
     # Substitute the template placeholders. Write to a temp file first,
     # then sudo cp it into place. This avoids the user needing to write
     # directly under /Library/LaunchDaemons/.
@@ -120,6 +146,7 @@ install_daemon() {
     sed \
         -e "s|YOUR_USERNAME|$current_user|g" \
         -e "s|SCRIPT_PATH|$script_path|g" \
+        -e "s|CONF_PATH|$CONF_FILE|g" \
         "$PLIST_TEMPLATE" > "$tmp_plist"
 
     echo ">>> Installing to $PLIST_PATH (sudo)..."
@@ -148,7 +175,8 @@ install_daemon() {
     echo "VM console log:       /var/log/protect-vm.console.log"
     echo ""
     echo "Attach to live VM console:  ./attach-console.sh"
-    echo "Manage daemon:              $0 {status|start|stop|restart|logs|uninstall}"
+    echo "Manage daemon:"
+    echo "  $0 {status|start|stop|restart|logs|uninstall}"
 }
 
 uninstall_daemon() {
@@ -244,7 +272,8 @@ case "$ACTION" in
         show_logs
         ;;
     *)
-        echo "Usage: $0 {install <script-path>|uninstall|status|start|stop|restart|logs}"
+        echo "Usage: $0 {install <script-path>|uninstall|status|"
+        echo "            start|stop|restart|logs}"
         exit 1
         ;;
 esac

@@ -1,0 +1,29 @@
+###############################################################################
+# storage-nuke.service — the worker behind `ustorage space nuke`.
+#
+# `ustorage space nuke` (the Storage UI "Erase" button, invoked by
+# unifi-core) starts this unit detached with `systemctl start --no-block`.
+# It runs provision-storage.sh's `nuke` action: stop the services using
+# /volume1, tear down + wipe the arrays, reprovision a fresh array, restart
+# the services.
+#
+# It is started on demand only — NOT enabled, no [Install] section. Running
+# it as its own unit keeps the destructive work out of unifi-core's cgroup
+# (so it survives the short-lived `ustorage` CLI process) and gives it its
+# own journal log.
+#
+# *** Starting this unit ERASES /volume1 and every recording on it. ***
+#
+# INSTALL (inside the VM, as root)
+#   install -m 0755 provision-storage.sh /usr/local/sbin/provision-storage.sh
+#   install -m 0644 storage-nuke.service /etc/systemd/system/
+#   systemctl daemon-reload
+###############################################################################
+[Unit]
+Description=UniFi Protect VM storage erase + reprovision (ustorage space nuke)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/provision-storage.sh nuke
+# Teardown + wipe + mkfs on a large array can take several minutes.
+TimeoutStartSec=900
