@@ -22,7 +22,7 @@
 # - Maps physical ATA serials to QEMU device serials. Inside the VM,
 #   `lsblk -o NAME,SERIAL` shows the real ATA serials of the underlying
 #   disks. This helps when correlating SMART data, mdadm output, etc.
-# - Optionally attaches a dedicated postgres SSD qcow2.
+# - Optionally attaches extra qcow2 disk images listed in STORAGE_IMAGES.
 # - Sanity-checks that EFI firmware, EFI vars, and the VM disk all exist
 #   before launching. QEMU errors are cryptic if you mistype a path.
 # - Uses Apple's HVF accelerator (accel=hvf) which is essentially

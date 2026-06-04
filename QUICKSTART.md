@@ -12,7 +12,7 @@ The 10-minute version. For the full reference, see [README.md](README.md).
 ## What you'll need
 
 - ARM64 host with at least 8GB RAM
-- Storage for VM and recordings (internal NVMe for the VM and postgres; HDDs/SSDs in a DAS for bulk recordings)
+- Storage for VM and recordings (internal NVMe for the VM's `vda`, which also serves postgres at runtime; HDDs in a DAS for bulk recordings)
 - 30-60 minutes for a fresh install; +30 minutes if migrating from a real UNVR
 
 ## Repository layout
@@ -120,10 +120,7 @@ After step 5 above (UniFi installed, VM shut down):
 5. **Cleanly shut down the UNVR** via its web UI, then **remove it from the network** — if it powers back on while connected it will fight the VM for the cameras.
 6. **In the VM web UI**: restore both backups. Cameras will re-adopt over the next few minutes.
 7. **Move the UNVR disks** to your DAS. Inside the VM: `/root/vm/installers/mount-storage.sh import` to attach existing recordings.
-8. **(Optional but recommended)** Migrate postgres to SSD for big speed gains:
-   ```bash
-   /root/vm/installers/mount-storage.sh postgres-migrate /dev/sdX
-   ```
+8. **Postgres performance is automatic** — nothing to run. As long as the VM's `vda` qcow2 is on solid-state storage (host NVMe), `postgres-vda` serves the database from `vda` at runtime and syncs it back to the array at clean shutdown.
 
 ## Common operations
 
@@ -150,7 +147,7 @@ ssh root@<VM-IP> /root/vm/installers/update-unifi.sh --all
 - **VM won't boot**: attach the serial console with `./attach-console.sh` and see what's happening.
 - **VM drops to the UEFI shell**: the varstore has a stale boot order — recreate `$EFI_VARS` (delete it, `dd` a fresh 64 MiB file) while the VM is off. `stand-up.sh` does this automatically when it recreates the OS disk.
 - **Cameras don't reconnect**: give them 5-10 minutes. If still missing, re-adopt them. If the Protect web UI won't handle the re-adoption (it sometimes won't), use the Protect mobile app instead — it can adopt cameras the web UI can't.
-- **Search/UI is slow**: migrate postgres to a dedicated SSD (step 7 of migration above).
+- **Search/UI is slow**: make sure the VM's `vda` qcow2 is on solid-state storage (host NVMe) — `postgres-vda` serves the database from `vda`, so a slow `vda` means a slow UI.
 - **An update broke things**: `./snapshot.sh rollback` to the pre-update snapshot.
 - **macOS host claims it's out of space but Disk Utility shows free room**: APFS local Time Machine snapshots silently pin space that the GUI counts as "free" (it's actually "purgeable"). Check actual headroom with `df -h /`. If much smaller than the GUI claims, thin the snapshots: `sudo tmutil thinlocalsnapshots / 200000000000 4`. See README "Recovery from common failures" for detail.
 - **Protect won't start after the host was forcibly stopped**: postgres@14-protect left a stale `postmaster.pid`. Inside the VM, `journalctl -u postgresql@14-protect` shows `pid file is invalid`. Fix: `rm -f /srv/postgresql/14/protect/data/postmaster.pid && systemctl start postgresql@14-protect && systemctl start unifi-protect`. Prefer `systemctl poweroff` inside the VM over killing the QEMU process.

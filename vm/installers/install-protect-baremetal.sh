@@ -98,8 +98,7 @@ STORAGE_DISK="${STORAGE_DISK:-/dev/sda}"
 # Postgres storage is no longer a config knob. The protect/access database
 # clusters run from vda (the OS disk — fast, NVMe-backed on the host) and
 # are kept on the recording array at rest by postgres-vda.service (see the
-# storage subsystem). mount-storage.sh postgres-migrate remains for anyone
-# who wants the database on a specific dedicated disk instead.
+# storage subsystem). There is no separate-disk migration step.
 
 # Network interface name. Cloud remote access expects enp0s2 specifically.
 # If your VM's primary NIC is named differently, the script will create a
@@ -961,8 +960,9 @@ echo ">>> Phase 10: Preparing storage directories..."
 # Importing disks from another UNVR is a separate path: mount-storage.sh.
 #
 # A dedicated postgres disk (the old POSTGRES_DISK install option) is no
-# longer set up here — it belongs on the array, which does not exist yet.
-# Use `mount-storage.sh postgres-migrate <device>` after storage exists.
+# longer set up here. Postgres lives on the array at rest and is served
+# from a vda working copy while running, via postgres-vda.service — no
+# separate disk, and no migration step.
 
 # Per-service data directories under /srv. Pre-created with the right
 # ownership so a service does not end up with a root-owned data dir; the
