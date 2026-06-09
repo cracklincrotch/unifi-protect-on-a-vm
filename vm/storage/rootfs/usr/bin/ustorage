@@ -177,31 +177,76 @@ def md_member_states(md_name):
     return states
 
 
+def _in_use_disks():
+    """Set of whole-disk basenames that are in use for something other than
+    being an available bay — a disk (whole or any partition) that is
+    mounted, or that is a member of any md array. Used to keep a disk doing
+    other work (e.g. one mounted for the Protect database) from being
+    offered to Protect as an empty bay for array creation."""
+    used = set()
+    try:
+        with open("/proc/self/mounts") as fh:
+            for line in fh:
+                dev = line.split()[0]
+                if dev.startswith("/dev/sd"):
+                    used.add(parent_disk(os.path.basename(dev)))
+    except OSError:
+        pass
+    try:
+        blocks = os.listdir("/sys/block")
+    except OSError:
+        blocks = []
+    for md in blocks:
+        if not md.startswith("md"):
+            continue
+        try:
+            slaves = os.listdir("/sys/block/%s/slaves" % md)
+        except OSError:
+            slaves = []
+        for slave in slaves:
+            used.add(parent_disk(slave))
+    return used
+
+
 def physical_disks():
-    """List of (disk_basename, raid_member_state) for EVERY data disk.
+    """List of (disk_basename, raid_member_state) — array members plus any
+    genuinely-available data bays.
 
-    Every physically-present data disk is reported — whether or not it
-    backs /volume1 — so Protect sees every populated bay and can offer
-    array creation on a box that has no array yet. A disk is a data disk
-    if it is a SCSI disk (sd*); the OS disk is virtio (vda) and so is
-    naturally excluded. md arrays (md*) are excluded too — they are
-    reported separately as spaces.
-
-    raid_member_state is the kernel md state of the disk's /volume1 array
-    member ('in_sync', 'faulty', ...) when it IS in the array, or '' for
-    a disk that is not in any array — an available bay."""
+    Reports every /volume1 array member with its kernel md state
+    ('in_sync', 'faulty', ...), plus every other SCSI data disk (sd*) that
+    is genuinely free — not in any md array and not mounted — so Protect
+    can offer array creation on a box that has empty bays (the v2 / fresh-
+    install case). A disk that is in use for something else (e.g. one
+    mounted for the database) is neither a member nor free, so it is
+    excluded and never offered as a spare bay (the v1 / migrated-array case
+    — this is what keeps an in-use non-array disk from showing up). The OS
+    disk is virtio (vda) and is naturally excluded; md devices are reported
+    separately as spaces."""
     name, members = storage_array()
     states = md_member_states(name)
     # Parent whole-disk of each /volume1 array member -> its md state.
     member_state = {}
     for member in members:
         member_state[parent_disk(member)] = states.get(member, "")
+    # Plain-disk /volume1 (no md array): the backing disk is the primary —
+    # report it even though it carries no md member state.
+    if name.startswith("sd"):
+        member_state.setdefault(parent_disk(name), "")
     try:
         nodes = sorted(os.listdir("/sys/block"))
     except OSError:
         nodes = []
-    return [(node, member_state.get(node, ""))
-            for node in nodes if node.startswith("sd")]
+    in_use = _in_use_disks()
+    result = []
+    for node in nodes:
+        if not node.startswith("sd"):
+            continue
+        if node in member_state:
+            result.append((node, member_state[node]))   # array member
+        elif node not in in_use:
+            result.append((node, ""))                    # available empty bay
+        # else: in use for another purpose -> not an available bay
+    return result
 
 
 def smart(node):
