@@ -392,11 +392,17 @@ function buildV1() {
     const allInSync = members.every(function (m) {
       return (states[m] || 'in_sync').indexOf('in_sync') !== -1;
     });
+    // mdadm 'recover' rebuilds a missing member onto a degraded array —
+    // that is a REPAIR (restoring redundancy), not a benign 'resync'. The
+    // console renders SYNCING as "fully operational" but REPAIRING as an
+    // active repair, which is what a degraded rebuild should read as.
+    const rebuilding = sync.action === 'recover';
     let state = S.SpaceState.SPACE_STATE_NONE;
-    if (sync.action === 'resync' || sync.action === 'recover') {
-      state = S.SpaceState.SPACE_STATE_SYNCING;
-    } else if (sync.action === 'check' || sync.action === 'repair') {
+    if (sync.action === 'recover' || sync.action === 'check' ||
+        sync.action === 'repair') {
       state = S.SpaceState.SPACE_STATE_REPAIRING;
+    } else if (sync.action === 'resync') {
+      state = S.SpaceState.SPACE_STATE_SYNCING;
     } else if (sync.action === 'reshape') {
       state = S.SpaceState.SPACE_STATE_EXPANDING;
     }
@@ -404,14 +410,14 @@ function buildV1() {
     const health = degraded
       ? S.SpaceHealthState.SPACE_HEALTH_STATE_AT_RISK
       : S.SpaceHealthState.SPACE_HEALTH_STATE_HEALTHY;
-    // A degraded array needs an explicit health PROBLEM, not just the
-    // AT_RISK flag: the console Storage UI renders the problem (the reason)
-    // and derives the "degraded" banner from it. With an empty problem list
-    // it shows only the benign "syncing"/"fully operational" state. Report
-    // SPACE_DEGRADED at AT_RISK — the array-lost-redundancy reason a real
-    // UNVR surfaces while a member is missing/rebuilding.
+    // Surface the SPACE_DEGRADED problem (which the console renders as
+    // "please reinstall this hard drive") ONLY when the array is degraded
+    // and NOT actively rebuilding. While a member rebuilds, the drive is
+    // present and resyncing — the REPAIRING state + progress convey that, and
+    // a "reinstall the drive" prompt would be wrong. When degraded with no
+    // rebuild running (a member is truly gone), the reinstall prompt is right.
     const problems = [];
-    if (degraded) {
+    if (degraded && !rebuilding) {
       const p = new S.SpaceHealthProblem();
       p.setType(S.SpaceHealthProblemType.SPACE_HEALTH_PROBLEM_TYPE_SPACE_DEGRADED);
       p.setLevel(S.SpaceHealthProblemLevel.SPACE_HEALTH_PROBLEM_LEVEL_AT_RISK);
@@ -794,7 +800,7 @@ function buildV2() {
       // Degraded array -> attach the SPACE_DEGRADED issue (the reason) so
       // the console Storage UI surfaces a degraded/at-risk warning, not just
       // the benign syncing state. Mirrors the v1 SpaceHealthProblem.
-      if (sync.degraded) {
+      if (sync.degraded && sync.action !== 'recover') {
         const issue = new S.SpaceIssue();
         issue.setType(S.SpaceIssueType.SPACE_ISSUE_TYPE_SPACE_DEGRADED);
         issue.setSeverity(S.SpaceIssueSeverity.SPACE_ISSUE_SEVERITY_AT_RISK);
