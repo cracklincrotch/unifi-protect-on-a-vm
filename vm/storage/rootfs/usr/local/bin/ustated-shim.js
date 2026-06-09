@@ -400,10 +400,24 @@ function buildV1() {
     } else if (sync.action === 'reshape') {
       state = S.SpaceState.SPACE_STATE_EXPANDING;
     }
-    const health = (sync.degraded || !allInSync)
+    const degraded = sync.degraded || !allInSync;
+    const health = degraded
       ? S.SpaceHealthState.SPACE_HEALTH_STATE_AT_RISK
       : S.SpaceHealthState.SPACE_HEALTH_STATE_HEALTHY;
-    return { state: state, health: health, pct: sync.pct };
+    // A degraded array needs an explicit health PROBLEM, not just the
+    // AT_RISK flag: the console Storage UI renders the problem (the reason)
+    // and derives the "degraded" banner from it. With an empty problem list
+    // it shows only the benign "syncing"/"fully operational" state. Report
+    // SPACE_DEGRADED at AT_RISK — the array-lost-redundancy reason a real
+    // UNVR surfaces while a member is missing/rebuilding.
+    const problems = [];
+    if (degraded) {
+      const p = new S.SpaceHealthProblem();
+      p.setType(S.SpaceHealthProblemType.SPACE_HEALTH_PROBLEM_TYPE_SPACE_DEGRADED);
+      p.setLevel(S.SpaceHealthProblemLevel.SPACE_HEALTH_PROBLEM_LEVEL_AT_RISK);
+      problems.push(p);
+    }
+    return { state: state, health: health, pct: sync.pct, problems: problems };
   }
 
   function buildSpaces() {
@@ -423,6 +437,7 @@ function buildV1() {
         const st = mdSpaceState(primary, r.members);
         info.setState(st.state);
         info.setHealthState(st.health);
+        if (st.problems.length) info.setHealthProblemsList(st.problems);
         if (st.pct > 0 && st.pct < 100) info.setActionProgressPercent(st.pct);
         info.setRaidMemberInfo(r.raidInfo);
       } else {
@@ -776,6 +791,15 @@ function buildV2() {
       info.setFilesystem(buildFilesystem(primary, STORAGE_VOLUME,
                                          F.FilesystemType.FILESYSTEM_TYPE_EXT4));
       info.setRaidList([buildRaid(primary)]);
+      // Degraded array -> attach the SPACE_DEGRADED issue (the reason) so
+      // the console Storage UI surfaces a degraded/at-risk warning, not just
+      // the benign syncing state. Mirrors the v1 SpaceHealthProblem.
+      if (sync.degraded) {
+        const issue = new S.SpaceIssue();
+        issue.setType(S.SpaceIssueType.SPACE_ISSUE_TYPE_SPACE_DEGRADED);
+        issue.setSeverity(S.SpaceIssueSeverity.SPACE_ISSUE_SEVERITY_AT_RISK);
+        info.setIssuesList([issue]);
+      }
       const sp = new S.Space();
       sp.setDevice(primary);
       sp.setType(S.SpaceType.SPACE_TYPE_DATA);
