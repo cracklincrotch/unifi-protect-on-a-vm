@@ -371,7 +371,15 @@ function buildV1() {
     const ri = new space_pb.SpaceRaidInfo();
     ri.setMemberNamesList(members);
     ri.setExpectedMemberCount(expected);
-    ri.setMaxConfiguredMemberCount(expected);
+    // had_most = members actively in sync. A faulty/rebuilding member drops
+    // this below expected; unifi-core derives had_most from
+    // (maxConfigured vs expected) and surfaces a degraded array + the storage
+    // notification when had_most < expected. Reporting expected here (the old
+    // value) made every array look complete, so degradation never alerted.
+    const inSyncCount = members.filter(function (m) {
+      return (mdMemberStates(md)[m] || 'in_sync').indexOf('in_sync') !== -1;
+    }).length;
+    ri.setMaxConfiguredMemberCount(inSyncCount);
     ri.setMemberSize(members.length ? deviceSizeBytes(members[0]) : 0);
     return { raidInfo: ri, members: members };
   }
