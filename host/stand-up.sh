@@ -846,9 +846,17 @@ verify_iso() {
     [ "$want" = "$got" ]
 }
 
-say "fetching SHA256SUMS"
-curl -fSL --connect-timeout 15 -o "$ISO_DIR/SHA256SUMS" "$ISO_BASE/SHA256SUMS" \
-    || die "could not fetch SHA256SUMS — check DEBIAN_VERSION ($DEBIAN_VERSION)"
+# A locally-supplied ISO + SHA256SUMS pair verifies entirely offline: the
+# sums are fetched only when the cached pair doesn't verify (file absent,
+# partial download, or mismatch). The fetch goes to a temp file first so an
+# unreachable mirror can't clobber a usable cached SHA256SUMS.
+if ! verify_iso; then
+    say "fetching SHA256SUMS"
+    curl -fSL --connect-timeout 15 -o "$ISO_DIR/SHA256SUMS.tmp" \
+        "$ISO_BASE/SHA256SUMS" \
+        || die "could not fetch SHA256SUMS — check DEBIAN_VERSION ($DEBIAN_VERSION)"
+    mv -f "$ISO_DIR/SHA256SUMS.tmp" "$ISO_DIR/SHA256SUMS"
+fi
 
 if verify_iso; then
     say "ISO already present and verified:"
