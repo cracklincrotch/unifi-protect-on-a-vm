@@ -44,6 +44,17 @@ VOLUME=/volume1
 
 log() { echo "[postgres-vda] $*"; }
 
+# A directory counts as holding a database copy only if it has VISIBLE
+# entries. UniFi drops marker dotfiles (e.g. .uid_gid_checked) into these
+# directories; `ls -A` counts those, which once made an effectively-empty
+# vda look populated — the seed was skipped, the junk copy was bound over
+# the real cluster, and a later stop would have rsync-deleted the array's
+# copy to match.
+has_cluster() {
+    [ -n "$(find "$1" -mindepth 1 -maxdepth 1 -not -name '.*' -print -quit \
+        2>/dev/null)" ]
+}
+
 # Nothing to do until the recording array exists. Pre-array, /srv is a plain
 # directory on vda and postgres already runs on vda directly — no bind
 # needed, and nowhere on the array to sync to.
@@ -57,8 +68,8 @@ case "${1:-}" in
         mkdir -p "$VDA_PG" "$ARRAY_PG"
         # Seed vda from the array ONLY when vda has no copy yet. A populated
         # vda copy is authoritative and is never overwritten here.
-        if [ -z "$(ls -A "$VDA_PG" 2>/dev/null)" ]; then
-            if [ -n "$(ls -A "$ARRAY_PG" 2>/dev/null)" ]; then
+        if ! has_cluster "$VDA_PG"; then
+            if has_cluster "$ARRAY_PG"; then
                 log "vda working copy empty — seeding from the array"
                 rsync -aHAX --delete "$ARRAY_PG"/ "$VDA_PG"/ \
                     || { log "ERROR: seed from array failed"; exit 1; }
@@ -90,7 +101,7 @@ case "${1:-}" in
         fi
         # Sync the vda working copy onto the array's real directory, so the
         # disks carry a current cluster when powered off.
-        if [ -n "$(ls -A "$VDA_PG" 2>/dev/null)" ]; then
+        if has_cluster "$VDA_PG"; then
             log "syncing database onto the array..."
             if rsync -aHAX --delete "$VDA_PG"/ "$ARRAY_PG"/; then
                 log "database synced to $ARRAY_PG"

@@ -64,6 +64,12 @@ fi
 [ -z "$CONF_FILE" ] && [ -f "$PWD/protect-on-mac.conf" ] \
     && CONF_FILE="$PWD/protect-on-mac.conf"
 CONF_FILE="${CONF_FILE:-$SCRIPT_DIR/protect-on-mac.conf}"
+# The plist bakes this path in, and launchd starts the daemon from a fixed
+# working directory — a relative path here means the VM fails at every boot
+# with "Config file not found" while working fine when started by hand.
+if [ -f "$CONF_FILE" ]; then
+    CONF_FILE="$(cd "$(dirname "$CONF_FILE")" && pwd)/$(basename "$CONF_FILE")"
+fi
 export PROTECT_ON_MAC_CONF="$CONF_FILE"
 
 if [ -f "$CONF_FILE" ]; then
@@ -177,6 +183,15 @@ install_daemon() {
     echo "Attach to live VM console:  ./attach-console.sh"
     echo "Manage daemon:"
     echo "  $0 {status|start|stop|restart|logs|uninstall}"
+    echo ""
+    echo "IF THE VM PASSES THROUGH RAW DISKS (/dev/diskN) it will fail under"
+    echo "launchd with \"Operation not permitted\" until /bin/bash is granted"
+    echo "Full Disk Access. A Terminal session inherits Terminal's grant, but"
+    echo "a launchd daemon has its own TCC identity — and macOS attributes"
+    echo "the disk access to the daemon's interpreter, not to QEMU. Grant it:"
+    echo "  System Settings > Privacy & Security > Full Disk Access"
+    echo "  \"+\" then Cmd-Shift-G and add: /bin/bash"
+    echo "Watch $ERROR_LOG_PATH if the VM does not come up."
 }
 
 uninstall_daemon() {
