@@ -839,9 +839,19 @@ function buildV2() {
       const sp = new S.Space();
       sp.setDevice(primary);
       sp.setType(S.SpaceType.SPACE_TYPE_DATA);
+      // An actively-recovering array reports SCANNING even though it is
+      // degraded: unifi-core maps AT_RISK to health "atrisk", and the
+      // Protect dashboard renders ANY atrisk primary space as "Please
+      // reinstall this hard drive" — wrong while the drive is present and
+      // rebuilding. SCANNING makes no health claim, so the dashboard stays
+      // quiet while the raid DEGRADED state, the member's REPAIRING state
+      // and the progress percentage carry the truth on the storage page.
+      // The moment recovery stops with the array still degraded (a member
+      // really is gone), AT_RISK — and the reinstall prompt — return.
       sp.setState(
+        sync.action === 'recover'                          ? S.SpaceState.SPACE_STATE_SCANNING :
         sync.degraded                                      ? S.SpaceState.SPACE_STATE_AT_RISK :
-        (sync.action === 'resync' || sync.action === 'recover' ||
+        (sync.action === 'resync' ||
          sync.action === 'check'  || sync.action === 'repair') ? S.SpaceState.SPACE_STATE_SCANNING :
                                                               S.SpaceState.SPACE_STATE_HEALTHY);
       sp.setInfo(info);
