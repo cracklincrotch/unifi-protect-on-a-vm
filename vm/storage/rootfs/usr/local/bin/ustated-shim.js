@@ -839,19 +839,19 @@ function buildV2() {
       const sp = new S.Space();
       sp.setDevice(primary);
       sp.setType(S.SpaceType.SPACE_TYPE_DATA);
-      // An actively-recovering array reports SCANNING even though it is
-      // degraded: unifi-core maps AT_RISK to health "atrisk", and the
-      // Protect dashboard renders ANY atrisk primary space as "Please
-      // reinstall this hard drive" — wrong while the drive is present and
-      // rebuilding. SCANNING makes no health claim, so the dashboard stays
-      // quiet while the raid DEGRADED state, the member's REPAIRING state
-      // and the progress percentage carry the truth on the storage page.
-      // The moment recovery stops with the array still degraded (a member
-      // really is gone), AT_RISK — and the reinstall prompt — return.
+      // A degraded array reports AT_RISK even while a member is actively
+      // rebuilding. Protect 7.1's dashboard knows exactly three storage
+      // presentations, all keyed off the blob health unifi-core derives
+      // from this state: "health" renders the normal usage tile, "atrisk"
+      // renders an accurate "At Risk" label (with a sloppy "reinstall this
+      // hard drive" HOVER tooltip — its chooser has no repairing branch),
+      // and NO health (what SCANNING maps to) renders a blank tile, hiding
+      // the rebuild entirely. AT_RISK is the least-wrong of the three; the
+      // honest repairing view lives on the storage details page, fed by
+      // the raid DEGRADED/REPAIRING state and the member's REPAIRING state.
       sp.setState(
-        sync.action === 'recover'                          ? S.SpaceState.SPACE_STATE_SCANNING :
         sync.degraded                                      ? S.SpaceState.SPACE_STATE_AT_RISK :
-        (sync.action === 'resync' ||
+        (sync.action === 'resync' || sync.action === 'recover' ||
          sync.action === 'check'  || sync.action === 'repair') ? S.SpaceState.SPACE_STATE_SCANNING :
                                                               S.SpaceState.SPACE_STATE_HEALTHY);
       sp.setInfo(info);
