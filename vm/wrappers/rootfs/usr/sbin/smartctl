@@ -219,8 +219,13 @@ table = [
     mkattr(199, "UDMA_CRC_Error_Count",   0),
 ]
 
-MODEL = "UniFi Protect VM Disk"
-FIRMWARE = "PM-1.0"
+# Pass the backing disk's real model/firmware through when the host SMART
+# reports them (raw-passthrough disks ARE the real drive, so its model is
+# meaningful and wanted in the Protect UI). Fall back to a generic label only
+# when the host gives no model — e.g. a qcow2-image-backed disk, where the
+# host device is the image's filesystem volume, not a meaningful drive.
+MODEL = dig(host, "model_name") or dig(host, "model_family") or "UniFi Protect VM Disk"
+FIRMWARE = dig(host, "firmware_version") or "PM-1.0"
 
 doc = {
     "json_format_version": [1, 0],
