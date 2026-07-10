@@ -1148,6 +1148,7 @@ systemctl enable provision-storage.service \
                  postgres-vda.service \
                  ustated-shim.service \
                  unifi-core-storage-patch.service \
+                 seed-anonid.service \
                  provision-on-setup.path >/dev/null
 systemctl restart ustated-shim.service \
     || echo "    WARNING: ustated-shim did not start — check it"

@@ -1,0 +1,37 @@
+###############################################################################
+# seed-anonid.service — faithful hardware-anonid emulation for the Protect VM.
+#
+# Seeds /var/run/anonymous_device_id from a persistent UUID on /data before
+# unifi-core reads it, standing in for the ubnthal kernel module a real
+# UNVR uses to supply device.anonid. Runs at boot and on every unifi-core
+# (re)start; /var/run is tmpfs so the seed must be re-applied each boot.
+# The stock /sbin/ubnt-systool is never modified — it simply finds a valid
+# /var/run/anonymous_device_id and short-circuits.
+#
+# INSTALL (inside the VM, as root)
+#
+#   install -m 0755 seed-anonid.sh /usr/local/sbin/seed-anonid.sh
+#   install -m 0644 seed-anonid.service /etc/systemd/system/seed-anonid.service
+#   systemctl daemon-reload
+#   systemctl enable --now seed-anonid.service
+#
+# Verify:  journalctl -u seed-anonid ; /sbin/ubnt-systool anonid
+###############################################################################
+
+[Unit]
+Description=Seed anonymous_device_id (hardware anonid emulation)
+# The persistent store lives on /data (the ext4 rootfs); need it mounted.
+After=local-fs.target
+# unifi-core reads anonymous_device_id at setup (service.js runtime), so the
+# seed must finish before unifi-core starts.
+Before=unifi-core.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/seed-anonid.sh
+# Do NOT set RemainAfterExit: the unit must return to inactive so it re-runs
+# on the next boot to repopulate tmpfs /var/run/anonymous_device_id.
+
+[Install]
+# Pulled in at boot, and whenever unifi-core.service is started.
+WantedBy=multi-user.target unifi-core.service

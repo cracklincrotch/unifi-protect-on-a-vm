@@ -120,9 +120,10 @@ systemctl enable provision-storage.service \
                  postgres-vda.service \
                  ustated-shim.service \
                  unifi-core-storage-patch.service \
+                 seed-anonid.service \
                  provision-on-setup.path >/dev/null
 say "enabled provision-storage, postgres-vda, ustated-shim,"
-say "        unifi-core-storage-patch, provision-on-setup.path"
+say "        unifi-core-storage-patch, seed-anonid, provision-on-setup.path"
 
 # The shim is safe to (re)start now; provisioning + the patch apply at boot.
 systemctl restart ustated-shim.service
