@@ -624,13 +624,13 @@ That's intentional and correct — those packages are managed by `update-unifi.s
 
 **What you should NOT do**:
 
-- **Don't `apt-mark unhold` the Ubiquiti packages unless you know what you're doing.** Use `update-unifi.sh` instead — it coordinates the version handling and unholds/re-holds the packages around its operations.
+- **Don't remove the Ubiquiti APT pin (`/etc/apt/preferences.d/50-ubiquiti-pin`) unless you know what you're doing.** Use `update-unifi.sh` instead — it coordinates the version handling and drops/rewrites the pin around its operations. (The packages are *pinned*, not `apt-mark hold`-ed: a dpkg hold makes `uos runnable current-version` report them "not installed", which silently breaks Protect's whole-system backup — only Access, the un-held app, would back up.)
 - **Avoid `apt-get dist-upgrade`** unless you understand exactly what it's doing. Unlike plain `upgrade`, `dist-upgrade` can install new packages and remove existing ones to satisfy dependencies. This could reintroduce `unvr-initramfs` (which we deliberately removed because it breaks VM boot) or install other UNVR-only packages.
 - **PostgreSQL major versions (14 → 15)** would require a full migration with `pg_upgradecluster`. Not normally pushed by Debian stable, but worth being aware of as bullseye approaches end-of-life.
 
 **Service masks survive upgrades**. The `usd`, `usdbd`, `rpsd`, `uhwd`, `sfp`/`sfpd` masks installed during setup are at the systemd level, not the package level. Package upgrades won't undo them. New services introduced by a UniFi OS update might need to be masked too — `update-unifi.sh --sync-os` handles the known ones automatically.
 
-**Unattended upgrades**: if you want automatic security patches, install `unattended-upgrades` and configure it for security-only updates. Since the Ubiquiti packages are already held, unattended-upgrades will leave them alone automatically.
+**Unattended upgrades**: if you want automatic security patches, install `unattended-upgrades` and configure it for security-only updates. Since the Ubiquiti packages are already pinned (Pin-Priority -1), unattended-upgrades will leave them alone automatically.
 
 ## The host↔guest control channel
 

@@ -76,23 +76,44 @@ FW_API="https://fw-update.ubnt.com/api/firmware-latest"
 ACTION="check"
 ASSUME_YES=0
 
-# Ubiquiti packages are held to prevent uncoordinated `apt-get upgrade`
-# runs from upgrading them outside this script. We unhold them before our
-# installs and re-hold afterward. The set is derived at run time by
-# ubiquiti_packages() (see HELPERS) — no static list to keep in sync.
+# Ubiquiti packages are version-PINNED (APT preferences, not dpkg-hold) to stop
+# uncoordinated `apt-get upgrade` runs from upgrading them outside this script.
+# dpkg-hold is avoided because `uos runnable current-version` reports a HELD
+# package as "not installed", which makes Protect's whole-system backup abort
+# ("Invalid version"); a pin keeps the dpkg status "install ok installed". We
+# drop the pin before our installs and rewrite it afterward. The set is derived
+# at run time by ubiquiti_packages() (see HELPERS) — no static list to sync.
+UBNT_PIN_FILE=/etc/apt/preferences.d/50-ubiquiti-pin
 
-# Unhold Ubiquiti packages so apt can upgrade them.
+# Write the APT pin for the current Ubiquiti package set.
+write_ubiquiti_pin() {
+    local pkgs
+    pkgs="$(ubiquiti_packages | tr '\n' ' ')"
+    [ -n "$pkgs" ] || return 0
+    {
+        echo "# Ubiquiti packages pinned so 'apt-get upgrade' won't bump them,"
+        echo "# while dpkg status stays 'install ok installed'. dpkg-hold would"
+        echo "# break 'uos runnable current-version' => Protect backup fails."
+        echo "# Managed by update-unifi.sh; regenerated on each run."
+        echo "Package: $pkgs"
+        echo "Pin: version *"
+        echo "Pin-Priority: -1"
+    } > "$UBNT_PIN_FILE"
+}
+
+# Unlock Ubiquiti packages so apt can (re)install them: drop the pin, and clear
+# any legacy dpkg-holds left by older installs. (Name kept for call sites.)
 unhold_ubiquiti_packages() {
     local pkgs
     pkgs="$(ubiquiti_packages)"
+    rm -f "$UBNT_PIN_FILE"
     [ -n "$pkgs" ] && apt-mark unhold $pkgs >/dev/null 2>&1 || true
 }
 
-# Re-hold Ubiquiti packages after installation.
+# Re-lock Ubiquiti packages after installation: rewrite the pin for the current
+# set. Does NOT dpkg-hold (that breaks the Protect backup via uos).
 hold_ubiquiti_packages() {
-    local pkgs
-    pkgs="$(ubiquiti_packages)"
-    [ -n "$pkgs" ] && apt-mark hold $pkgs >/dev/null 2>&1 || true
+    write_ubiquiti_pin
 }
 
 ###############################################################################
@@ -360,10 +381,10 @@ preflight_protect_deps() {
     return 0
 }
 
-# The installed Ubiquiti packages to hold/unhold around our installs.
+# The installed Ubiquiti packages to pin/unpin around our installs.
 # Derived at run time: every installed package whose Maintainer is a
 # Ubiquiti address. Deriving it (rather than hardcoding a list) means a
-# newly introduced Ubiquiti package is held automatically and can't be
+# newly introduced Ubiquiti package is pinned automatically and can't be
 # silently upgraded by a routine `apt-get upgrade`.
 ubiquiti_packages() {
     dpkg-query -W -f='${Package} ${Maintainer}\n' 2>/dev/null \

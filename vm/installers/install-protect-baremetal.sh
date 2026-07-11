@@ -1030,7 +1030,7 @@ fi
 echo ">>> Phase 11 complete."
 
 ###############################################################################
-# PHASE 12: Hold Ubiquiti packages
+# PHASE 12: Pin Ubiquiti packages
 ###############################################################################
 #
 # WHY WE DO THIS:
@@ -1042,39 +1042,51 @@ echo ">>> Phase 11 complete."
 # what `unifi-protect` expects, or vice versa — and Protect refuses to
 # start.
 #
-# Holding the packages tells apt "don't touch these, even if updates are
-# available." This makes `apt-get upgrade` safe by default for Debian-side
-# updates (kernel, openssl, etc.) while leaving Ubiquiti package management
-# to update-unifi.sh.
+# We PIN the packages via APT preferences (NOT dpkg-hold). A pin tells apt
+# "don't upgrade these" while leaving their dpkg status as "install ok
+# installed", so `apt-get upgrade` stays safe for Debian-side updates (kernel,
+# openssl, etc.) while Ubiquiti package management is left to update-unifi.sh.
 #
-# The user will see a clear message when they run apt-get upgrade:
+# WHY A PIN AND NOT `apt-mark hold`: dpkg-hold would freeze the versions too,
+# but `uos runnable current-version <pkg>` reports a HELD package as "not
+# installed", and Protect's whole-system backup calls exactly that to tag each
+# app's version — so with holds the backup aborts ("Invalid version for
+# protect"/"users") and only the un-held app (access) backs up. A pin avoids
+# that blind spot: status stays "install ok installed", so uos + backups work.
 #
-#   The following packages have been kept back:
-#     ds  unifi-access  unifi-core  unifi-protect  ...
-#
-# That message is intentional — it tells them these are managed separately.
-# To consciously override, they'd need `apt-mark unhold` or
-# `--allow-change-held-packages`.
+# `apt-get upgrade` will show these as "kept back" (managed separately). To
+# consciously override, remove /etc/apt/preferences.d/50-ubiquiti-pin.
 
-echo ">>> Phase 12: Holding Ubiquiti packages..."
+echo ">>> Phase 12: Pinning Ubiquiti packages..."
 
 # Packages managed by update-unifi.sh, not by apt-get upgrade. The set is
 # derived from the package DB — every installed package whose Maintainer
 # is a Ubiquiti address — rather than a hardcoded list. A newly added
-# Ubiquiti package is then held automatically, with no list to maintain.
-# update-unifi.sh derives the same set the same way (ubiquiti_packages()).
-TO_HOLD=()
+# Ubiquiti package is then pinned automatically, with no list to maintain.
+# update-unifi.sh derives the same set the same way (ubiquiti_packages()) and
+# regenerates this pin around its updates.
+TO_PIN=()
 while read -r pkg; do
-    [ -n "$pkg" ] && TO_HOLD+=("$pkg")
+    [ -n "$pkg" ] && TO_PIN+=("$pkg")
 done < <(dpkg-query -W -f='${Package} ${Maintainer}\n' 2>/dev/null \
     | grep -E '@ubnt\.com|@ui\.com' \
     | awk '{print $1}')
 
-if [ "${#TO_HOLD[@]}" -gt 0 ]; then
-    apt-mark hold "${TO_HOLD[@]}"
-    echo "    Held ${#TO_HOLD[@]} Ubiquiti packages."
-    echo "    A plain 'apt-get upgrade' will skip these. Use update-unifi.sh"
-    echo "    to update them, or 'apt-mark unhold <pkg>' to override."
+if [ "${#TO_PIN[@]}" -gt 0 ]; then
+    # Clear any legacy dpkg-holds (older installs used apt-mark hold, which
+    # breaks the Protect backup via uos), then pin instead.
+    apt-mark unhold "${TO_PIN[@]}" >/dev/null 2>&1 || true
+    {
+        echo "# Ubiquiti packages pinned so 'apt-get upgrade' won't bump them,"
+        echo "# while dpkg status stays 'install ok installed'. dpkg-hold would"
+        echo "# break 'uos runnable current-version' => Protect backup fails."
+        echo "# Update Ubiquiti packages via update-unifi.sh (regenerates this)."
+        echo "Package: ${TO_PIN[*]}"
+        echo "Pin: version *"
+        echo "Pin-Priority: -1"
+    } > /etc/apt/preferences.d/50-ubiquiti-pin
+    echo "    Pinned ${#TO_PIN[@]} Ubiquiti packages; 'apt-get upgrade' skips them."
+    echo "    Use update-unifi.sh to update them."
 fi
 
 echo ">>> Phase 12 complete."
