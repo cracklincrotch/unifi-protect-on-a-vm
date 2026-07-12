@@ -43,6 +43,7 @@
 #   ./update-unifi.sh --all          # Sync OS + Protect + Access to stable
 #   ./update-unifi.sh --all-edge     # Sync OS + Protect + Access to edge
 #   ./update-unifi.sh --yes          # Skip confirmation prompts
+#   ./update-unifi.sh --verify       # Check the storage/shim invariants (read-only)
 #
 # Environment overrides (rarely needed):
 #   FW_URL              - Override UNVR firmware download URL
@@ -66,6 +67,10 @@ set -euo pipefail
 WORKDIR="/opt/unifi-update"
 PLATFORM="UNVR"
 DEB_PLATFORM="uos-deb11-arm64"
+
+# Directory this script lives in — used to locate sibling installers
+# (install-shims.sh, install-storage.sh) for post-sync-os shim reconciliation.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PROTECT_CHANNEL="${PROTECT_CHANNEL:-release}"
 
@@ -116,6 +121,31 @@ hold_ubiquiti_packages() {
     write_ubiquiti_pin
 }
 
+# Post-update storage/shim health check. Read-only; prints per-check OK/FAIL and
+# returns non-zero if anything failed. Run automatically at the end of a sync-os
+# and on demand via --verify. Defined here (before arg parsing) so both the
+# --verify early-exit and sync_os_packages can call it.
+verify_shims() {
+    local fail=0 sj=/usr/share/unifi-core/app/service.js
+    _ck() { if [ "$1" -eq 0 ]; then printf "    [ OK ] %s\n" "$2"; else printf "    [FAIL] %s\n" "$2"; fail=1; fi; }
+    set +e
+    [ "$(grep -cF '["disk","inspect"]' "$sj" 2>/dev/null)" = 1 ]; _ck $? "service.js Patch A (disk list)"
+    [ "$(grep -cF ',!0?s.push' "$sj" 2>/dev/null)" = 1 ];        _ck $? "service.js Patch B (drive detect)"
+    head -3 /usr/bin/ustorage 2>/dev/null | grep -q 'ustorage-vm'; _ck $? "/usr/bin/ustorage is the VM shim"
+    systemctl is-active --quiet ustated-shim.service;             _ck $? "ustated-shim.service active"
+    ss -ltn 2>/dev/null | grep -q '127\.0\.0\.1:11052';           _ck $? "ustated-shim listening on :11052"
+    { [ "$(systemctl is-enabled usd.service 2>/dev/null)" = masked ] &&
+      [ "$(systemctl is-enabled ustated.service 2>/dev/null)" = masked ]; }; _ck $? "usd + ustated masked"
+    grep -q 'UUUU' /proc/mdstat 2>/dev/null;                      _ck $? "md array [UUUU]"
+    [ -s /var/run/anonymous_device_id ];                          _ck $? "anonymous_device_id present"
+    printf "    versions: unifi-core=%s unifi-protect=%s node=%s\n" \
+        "$(dpkg-query -W -f='${Version}' unifi-core 2>/dev/null || echo '?')" \
+        "$(dpkg-query -W -f='${Version}' unifi-protect 2>/dev/null || echo '?')" \
+        "$(node --version 2>/dev/null || echo '?')"
+    set -e
+    return $fail
+}
+
 ###############################################################################
 # ARGUMENT PARSING
 ###############################################################################
@@ -131,6 +161,7 @@ while [ $# -gt 0 ]; do
         --all)          ACTION="all"; PROTECT_CHANNEL="release" ;;
         --all-edge)     ACTION="all"; PROTECT_CHANNEL="beta" ;;
         --yes|-y)       ASSUME_YES=1 ;;
+        --verify)       ACTION="verify" ;;
         --help|-h)
             sed -n '2,32p' "$0" | sed 's/^# \?//'
             exit 0
@@ -151,6 +182,13 @@ done
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: Must run as root"
     exit 1
+fi
+
+# --verify is a local, read-only health check — no firmware/version query needed.
+if [ "$ACTION" = "verify" ]; then
+    echo "=== storage / shim verification ==="
+    verify_shims && { echo "All checks passed."; exit 0; } \
+                 || { echo "One or more checks FAILED — review above."; exit 1; }
 fi
 
 for cmd in wget jq curl; do
@@ -452,7 +490,7 @@ echo ""
 
 if [ "$ACTION" = "check" ]; then
     echo "Run with --sync-os, --protect, --protect-edge, --all, or"
-    echo "--all-edge to apply updates."
+    echo "--all-edge to apply updates, or --verify to check storage health."
     exit 0
 fi
 
@@ -587,16 +625,43 @@ sync_os_packages() {
     echo ">>> Masking VM-incompatible services..."
     # These services expect real UNVR hardware and fail on VMs.
     # Mask (not just disable) because they're triggered as dependencies
-    # of other services like ustated, regardless of whether they're enabled.
-    for svc in usd usdbd rpsd uhwd sfp sfpd; do
+    # of other services regardless of whether they're enabled. ustated is
+    # masked too — the ustated-shim replaces it.
+    for svc in usd usdbd rpsd uhwd sfp sfpd ustated; do
         systemctl stop "${svc}.service" 2>/dev/null || true
         systemctl mask "${svc}.service" 2>/dev/null || true
     done
 
+    # --sync-os reinstalled the whole @ubnt set, which clobbers the VM shims
+    # (ubnt-tools/uled-ctrl/smartctl and the ustd-owned /usr/bin/ustorage) and
+    # reverts the service.js patches. Re-lay them from the sibling installers so
+    # the storage subsystem comes back correct on the same run — without this,
+    # the first post-sync boot serves an unpatched service.js + stock ustorage.
+    echo ""
+    echo ">>> Reconciling VM shims after the OS sync..."
+    if [ -f "$SCRIPT_DIR/install-shims.sh" ]; then
+        bash "$SCRIPT_DIR/install-shims.sh" || echo "    WARNING: install-shims.sh returned non-zero — check it"
+    else
+        echo "    WARNING: $SCRIPT_DIR/install-shims.sh not found — shims NOT reapplied"
+    fi
+    if [ -f "$SCRIPT_DIR/install-storage.sh" ]; then
+        # re-lays /usr/bin/ustorage, re-masks usd+ustated, re-enables the storage
+        # units, and re-applies service.js Patch A + Patch B via the boot healer.
+        bash "$SCRIPT_DIR/install-storage.sh" || echo "    WARNING: install-storage.sh returned non-zero — check it"
+    else
+        echo "    WARNING: $SCRIPT_DIR/install-storage.sh not found — ustorage/patches NOT reapplied"
+    fi
+
     echo ""
     echo ">>> Restarting services..."
     systemctl daemon-reload
-    systemctl start uid-agent ulp-go unifi-core ds ai-feature-controller unifi-protect 2>/dev/null || true
+    # unifi-core must restart so the freshly re-applied service.js patches load.
+    systemctl restart unifi-core 2>/dev/null || true
+    systemctl start uid-agent ulp-go ds ai-feature-controller unifi-protect 2>/dev/null || true
+
+    echo ""
+    echo ">>> Verifying the storage shims survived the OS sync..."
+    verify_shims || echo "    WARNING: verification reported issues — review before trusting storage."
 }
 
 ###############################################################################
