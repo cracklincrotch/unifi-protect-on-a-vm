@@ -2,39 +2,39 @@
 ###############################################################################
 # unifi-core-storage-patch.sh
 #
-# Re-applies BOTH storage patches to unifi-core's bundled service.js on every
-# boot. service.js is a vendor bundle — a unifi-core update (e.g. --sync-os)
-# overwrites it and reverts the patches, so this runs at boot to restore them.
+# Re-applies the storage disk-list patch to unifi-core's bundled service.js on
+# every boot. service.js is a vendor bundle — a unifi-core update (e.g.
+# --sync-os) overwrites it and reverts the patch, so this restores it.
 #
-#   Patch A (disk LIST): system.ustorage.inspect hardcodes `disks:[]` and only
-#     calls `ustorage space inspect`. Patch A makes it also call
-#     `ustorage disk inspect` (served by ustorage-vm.py) so the Storage panel's
-#     disk list populates.
-#   Patch B (drive DETECTION): a `return <fn>()?s.push(...)` site gates whether
-#     drives get pushed into the detected set; Patch B forces it to always push
-#     (`return <fn>(),!0?s.push`). Previously this lived only in the installer
-#     and self-healed nowhere — folded in here so it survives updates too.
+#   Patch A (disk LIST): unifi-core's storage-inspect handler builds its
+#     snapshot as `tee={space:e,disks:[],sdcards:[]}` — disks hardcoded empty,
+#     populated only from `ustorage space inspect`. The patch injects a
+#     `ustorage disk inspect` call (served by ustorage-vm.py) so the Storage
+#     panel's per-disk list populates. tG() returns this `tee`, and on the v2
+#     path Lf() returns tG(), so the patched disks reach the UI.
 #
-# Both are idempotent and boot-safe: normal state (already applied, or cleanly
-# applied now) exits 0 quietly. BUT if a patch's anchor/pattern is MISSING —
-# not applied AND the site to patch can't be found — that usually means a
-# unifi-core update renamed the minified identifiers, which silently breaks the
-# Storage panel. So that case ALERTS loudly (journal err + Pushover) instead of
-# a silent no-op: the signal to re-derive the anchor for the new bundle.
+# The anchor + minified var names are compiler-assigned and CHANGE with each
+# unifi-core version. This anchor targets the 5.1.117-era bundle (unifi-core
+# 5.1.x / UniFi OS 5.1.19). If a future version renames the identifiers the
+# anchor won't match — that is NOT ignored silently: it ALERTS (journal err +
+# Pushover) so the anchor gets re-derived.
+#
+# HISTORY: the 5.1.110-era bundle used anchor `t={space:c,disks:[],sdcards:[]}`
+# plus a separate "Patch B" drive-detection gate (`return <fn>()?s.push`, forced
+# to always-push). 5.1.117 refactored the storage handler (new anchor below) and
+# removed that gate entirely — disks now flow solely via `ustorage disk inspect`
+# — so Patch B is obsolete and no longer applied.
+#
+# Idempotent + boot-safe: already-applied, or cleanly-applied-now, exits 0.
 ###############################################################################
 set -u
 
 SVC=/usr/share/unifi-core/app/service.js
 
-# Patch A — disk LIST
-A_MARKER='["disk","inspect"]'
-A_ANCHOR='t={space:c,disks:[],sdcards:[]};'
-A_REPL='let dd=[];try{dd=JSON.parse((await J("ustorage",["disk","inspect"])).stdout);}catch(_){va.error("Failed to retrieve disk info via ustorage:",_);}t={space:c,disks:dd,sdcards:[]};'
-
-# Patch B — drive DETECTION
-B_MARKER=',!0?s.push'          # present once Patch B is applied
-B_UNPATCHED='()?s.push'        # the un-patched site: `return <fn>()?s.push`
-B_SED='s/\(return [A-Za-z_$][A-Za-z0-9_$]*()\)?s\.push/\1,!0?s.push/'
+# Patch A — disk LIST (5.1.117-era anchor)
+MARKER='["disk","inspect"]'
+ANCHOR='tee={space:e,disks:[],sdcards:[]};'
+REPL='let dd=[];try{dd=JSON.parse((await Q("ustorage",["disk","inspect"])).stdout);}catch(_){hHe.error("Failed to retrieve disk info via ustorage:",_);}tee={space:e,disks:dd,sdcards:[]};'
 
 PUSH_CONF=/usr/local/etc/md-health-watch.conf
 
@@ -62,37 +62,26 @@ if [ ! -f "$SVC" ]; then
     exit 0
 fi
 
-# ---- Patch A (disk LIST) ----
-if grep -qF "$A_MARKER" "$SVC"; then
-    echo "storage-patch: Patch A already applied"
-else
-    a_n=$(grep -oF "$A_ANCHOR" "$SVC" 2>/dev/null | wc -l)
-    if [ "$a_n" = "1" ]; then
-        python3 - "$SVC" "$A_ANCHOR" "$A_REPL" <<'PY'
+if grep -qF "$MARKER" "$SVC"; then
+    echo "storage-patch: already applied"
+    exit 0
+fi
+
+n=$(grep -oF "$ANCHOR" "$SVC" 2>/dev/null | wc -l)
+if [ "$n" != "1" ]; then
+    alert "Patch A anchor not found (count=$n) in service.js — the Storage disk LIST will be empty. A unifi-core update likely renamed the minified identifiers; re-derive the anchor for this version."
+    exit 0
+fi
+
+python3 - "$SVC" "$ANCHOR" "$REPL" <<'PY'
 import sys
 path, anchor, repl = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(path).read()
+if s.count(anchor) != 1:
+    sys.stderr.write("storage-patch: anchor count changed mid-run — NOT patching\n")
+    sys.exit(0)
 open(path + ".prepatch", "w").write(s)
 open(path, "w").write(s.replace(anchor, repl, 1))
 print("storage-patch: Patch A applied (original saved to %s.prepatch)" % path)
 PY
-    else
-        alert "Patch A anchor not found (count=$a_n) in service.js — the Storage disk LIST will be empty. Re-derive the anchor for this unifi-core version."
-    fi
-fi
-
-# ---- Patch B (drive DETECTION) ----
-if grep -qF "$B_MARKER" "$SVC"; then
-    echo "storage-patch: Patch B already applied"
-elif grep -qF "$B_UNPATCHED" "$SVC"; then
-    sed -i "$B_SED" "$SVC"
-    if grep -qF "$B_MARKER" "$SVC"; then
-        echo "storage-patch: Patch B applied"
-    else
-        alert "Patch B substitution did not take (site present but sed failed) — drive DETECTION may be broken."
-    fi
-else
-    alert "Patch B site ('return <fn>()?s.push') not found in service.js — drive DETECTION patch could not be applied. Re-derive it for this unifi-core version."
-fi
-
 exit 0

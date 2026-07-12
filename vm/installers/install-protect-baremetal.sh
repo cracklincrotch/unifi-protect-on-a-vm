@@ -637,22 +637,18 @@ echo ">>> Phase 5 complete."
 
 echo ">>> Phase 6: Patching unifi-core for ustorage..."
 
-# Patch unifi-core's service.js for storage detection — without it, the
-# Storage Manager shows "No drives found". The site is a minified
-#   return <fn>()?s.push(...)
-# which we force to always push: `return <fn>(),!0?s.push(...)`. The
-# minified function name changes with every firmware build (Qe -> at ->
-# ...), so the pattern captures the identifier generically instead of
-# hardcoding it — one `return X()?s.push` exists in the bundle. Idempotent:
-# the replaced form `(),!0?s.push` no longer matches the pattern.
-SVC=/usr/share/unifi-core/app/service.js
-sed -i 's/\(return [A-Za-z_$][A-Za-z0-9_$]*()\)?s\.push/\1,!0?s.push/' "$SVC"
-if grep -qF ',!0?s.push' "$SVC"; then
-    echo "    storage-detection patch applied"
+# Storage service.js patching is handled by the unifi-core-storage-patch boot
+# service (Patch A: injects `ustorage disk inspect` so the Storage panel's disk
+# list populates). Run it now if it's installed so the panel works on first
+# boot; otherwise it applies at boot via its service. The old "Patch B"
+# drive-detection sed (`return <fn>()?s.push` forced to always-push) is OBSOLETE
+# as of unifi-core 5.1.x — that gate was removed and disks now flow entirely via
+# `ustorage disk inspect`.
+if [ -x /usr/local/bin/unifi-core-storage-patch.sh ]; then
+    /usr/local/bin/unifi-core-storage-patch.sh || \
+        echo "    (storage-patch reported non-zero; it re-runs at boot via its service)"
 else
-    echo "WARNING: storage-detection patch did not match — service.js may"
-    echo "have changed shape; storage detection may not work. Check $SVC"
-    echo "for a 'return <fn>()?s.push' site and patch it by hand."
+    echo "    storage-patch not yet installed; it applies at boot via its service"
 fi
 
 echo ">>> Phase 6 complete."
