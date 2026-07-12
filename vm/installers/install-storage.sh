@@ -121,9 +121,12 @@ systemctl enable provision-storage.service \
                  unifi-core-storage-patch.service \
                  seed-anonid.service \
                  protect-backup-to-array.timer \
+                 md-health-watch.timer \
+                 critical-services-watch.timer \
                  provision-on-setup.path >/dev/null
 say "enabled provision-storage, ustated-shim, unifi-core-storage-patch,"
-say "        seed-anonid, protect-backup-to-array.timer, provision-on-setup.path"
+say "        seed-anonid, protect-backup-to-array.timer, md-health-watch.timer,"
+say "        critical-services-watch.timer, provision-on-setup.path"
 
 # The shim is safe to (re)start now; provisioning + the patch apply at boot.
 systemctl restart ustated-shim.service

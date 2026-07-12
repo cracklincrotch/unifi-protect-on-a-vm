@@ -1,0 +1,5 @@
+[Unit]
+Description=md array health watcher (Pushover on degraded/failed)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/md-health-watch.sh

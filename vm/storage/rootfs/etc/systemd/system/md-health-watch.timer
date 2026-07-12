@@ -1,0 +1,8 @@
+[Unit]
+Description=Run md-health-watch every minute
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=60
+AccuracySec=10
+[Install]
+WantedBy=timers.target

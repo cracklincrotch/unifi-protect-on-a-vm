@@ -1,0 +1,6 @@
+# Pushover credentials shared by md-health-watch + critical-services-watch.
+# Copy to /usr/local/etc/md-health-watch.conf and fill in your keys. Without
+# this file the watchers still run but send no alerts (the Pushover call is
+# guarded on these being set), so monitoring is silent until you add them.
+PUSHOVER_TOKEN=your_pushover_app_token
+PUSHOVER_USER=your_pushover_user_key

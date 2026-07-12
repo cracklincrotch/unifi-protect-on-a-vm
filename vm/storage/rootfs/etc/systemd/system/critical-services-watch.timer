@@ -1,0 +1,12 @@
+# Run critical-services-watch every ~5 minutes (a service being down for up to
+# 5 min before alerting is acceptable; the array monitor runs tighter at 60s).
+[Unit]
+Description=Run critical-services-watch every 5 minutes
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=300
+AccuracySec=30
+
+[Install]
+WantedBy=timers.target

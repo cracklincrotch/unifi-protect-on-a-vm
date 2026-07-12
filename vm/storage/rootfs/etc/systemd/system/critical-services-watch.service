@@ -1,0 +1,9 @@
+# Alert (Pushover) if a long-running service or postgres cluster that should
+# always be up is failed/inactive. Silent-degradation guard. Driven by
+# critical-services-watch.timer. See /usr/local/sbin/critical-services-watch.sh.
+[Unit]
+Description=Alert if a critical service or DB cluster is down
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/critical-services-watch.sh

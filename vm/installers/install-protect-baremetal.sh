@@ -1164,6 +1164,8 @@ systemctl enable provision-storage.service \
                  unifi-core-storage-patch.service \
                  seed-anonid.service \
                  protect-backup-to-array.timer \
+                 md-health-watch.timer \
+                 critical-services-watch.timer \
                  provision-on-setup.path >/dev/null
 systemctl restart ustated-shim.service \
     || echo "    WARNING: ustated-shim did not start — check it"
