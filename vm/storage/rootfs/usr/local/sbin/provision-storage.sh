@@ -288,8 +288,8 @@ mount_arrays() {
         fi
         rm -rf /srv && ln -s "$STORAGE_VOLUME/.srv" /srv
         log "/srv -> $STORAGE_VOLUME/.srv (migrated)"
-        # Re-bind the database onto vda before the services come back.
-        systemctl restart postgres-vda.service 2>/dev/null || true
+        # Protect keeps its postgres cluster on the SSD (vda) via /ssd1
+        # detection; nothing to re-bind here after the /srv migration.
         if [ -n "${stopped// /}" ]; then
             log "restarting:$stopped"
             # shellcheck disable=SC2086

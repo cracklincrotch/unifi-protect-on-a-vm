@@ -117,13 +117,13 @@ say "applying unifi-core service.js patch"
 # provision-on-setup.path watches /etc/ustd/storage.conf and provisions the
 # array when the operator completes the storage wizard.
 systemctl enable provision-storage.service \
-                 postgres-vda.service \
                  ustated-shim.service \
                  unifi-core-storage-patch.service \
                  seed-anonid.service \
+                 protect-backup-to-array.timer \
                  provision-on-setup.path >/dev/null
-say "enabled provision-storage, postgres-vda, ustated-shim,"
-say "        unifi-core-storage-patch, seed-anonid, provision-on-setup.path"
+say "enabled provision-storage, ustated-shim, unifi-core-storage-patch,"
+say "        seed-anonid, protect-backup-to-array.timer, provision-on-setup.path"
 
 # The shim is safe to (re)start now; provisioning + the patch apply at boot.
 systemctl restart ustated-shim.service

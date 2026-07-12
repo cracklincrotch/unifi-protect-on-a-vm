@@ -95,10 +95,11 @@ DEVICE="${DEVICE:-UNVR}"
 # for the migration case instead of this script).
 STORAGE_DISK="${STORAGE_DISK:-/dev/sda}"
 
-# Postgres storage is no longer a config knob. The protect/access database
-# clusters run from vda (the OS disk — fast, NVMe-backed on the host) and
-# are kept on the recording array at rest by postgres-vda.service (see the
-# storage subsystem). There is no separate-disk migration step.
+# Postgres storage is no longer a config knob. Protect keeps its postgres
+# cluster on the built-in SSD (vda, NVMe-backed on the host) via its own /ssd1
+# detection — fast, while the recordings on the array travel with the disks.
+# The small config backups are mirrored to the array by protect-backup-to-array.
+# There is no separate-disk migration step.
 
 # Network interface name. Cloud remote access expects enp0s2 specifically.
 # If your VM's primary NIC is named differently, the script will create a
@@ -960,9 +961,15 @@ echo ">>> Phase 10: Preparing storage directories..."
 # Importing disks from another UNVR is a separate path: mount-storage.sh.
 #
 # A dedicated postgres disk (the old POSTGRES_DISK install option) is no
-# longer set up here. Postgres lives on the array at rest and is served
-# from a vda working copy while running, via postgres-vda.service — no
-# separate disk, and no migration step.
+# longer set up here. Protect runs its postgres cluster on the SSD (vda) via
+# /ssd1 detection; the small config backups are mirrored to the array by
+# protect-backup-to-array. No separate disk, and no migration step.
+
+# Create the /ssd1 marker so Protect's setuppgconf early-exits and keeps its
+# postgres cluster on /data (vda, SSD) rather than migrating it onto the array.
+# vda is always SSD-backed on this VM, so this mirrors a real UNVR fitted with
+# an internal SSD. Must exist before Protect first starts.
+mkdir -p /ssd1
 
 # Per-service data directories under /srv. Pre-created with the right
 # ownership so a service does not end up with a root-owned data dir; the
@@ -1157,10 +1164,10 @@ systemctl daemon-reload
 # provision-on-setup.path provisions the array when the operator finishes
 # the storage wizard (it watches /etc/ustd/storage.conf).
 systemctl enable provision-storage.service \
-                 postgres-vda.service \
                  ustated-shim.service \
                  unifi-core-storage-patch.service \
                  seed-anonid.service \
+                 protect-backup-to-array.timer \
                  provision-on-setup.path >/dev/null
 systemctl restart ustated-shim.service \
     || echo "    WARNING: ustated-shim did not start — check it"

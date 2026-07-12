@@ -27,18 +27,20 @@
 #
 # Older versions of this project kept postgres on a dedicated SSD and you
 # had to run `uninstall.sh migrate` to move it back onto the RAID before
-# export. That is no longer necessary. The storage subsystem's
-# postgres-vda service keeps the postgres clusters' durable home on the
-# array (/srv -> /volume1/.srv/postgresql) and only serves a working copy
-# from vda while the VM runs. At every clean shutdown it syncs that copy
-# back onto the array and drops the overlay — so the moment the VM is
-# powered off cleanly, the disks already carry a complete, self-contained,
-# UNVR-style layout with postgres in the right place. Just `poweroff`.
+# export. That mechanism (and its shutdown-time sync back to the array) is
+# gone. Protect keeps its postgres cluster on the built-in SSD (vda) via
+# its own /ssd1 detection — genuine UNVR-with-SSD behaviour — and the
+# database is captured in the whole-system config backup, not on the array.
+# The array carries the recordings, which travel with the disks. So the
+# recovery set is simply: the disks (recordings) plus the config backup you
+# restore on the target via its web UI — the standard UNVR path. There is
+# nothing to migrate; just take your web-UI backups and `poweroff`.
 #
-# An unclean power loss leaves the array with the last clean-shutdown
-# database (one session stale at worst), never absent. If you care about
-# the most recent rows, do a clean `systemctl poweroff` before pulling the
-# disks.
+# unifi-core writes those small config backups (protect + access + users,
+# a few MB — NOT recordings) to /data/unifi-core/backups on its own
+# schedule, and the protect-backup-to-array.timer mirrors them onto the
+# array at /volume1/.srv/protect-config-backups (newest 30 kept), so a copy
+# also travels with the disks.
 #
 # WHAT THIS SCRIPT DOES NOT DO
 #
@@ -73,7 +75,7 @@ TO COMPLETE THE REVERSE MIGRATION TO REAL HARDWARE:
   1. Back up Protect and Access via the VM web UI. Download both files.
   2. Verify the VM is working correctly.
   3. Shut the VM down cleanly: systemctl poweroff
-     (postgres-vda syncs the database onto the array here, automatically.)
+     (recordings are already on the disks; the backup carries the rest.)
   4. Pull the disks from the DAS.
   5. Install the disks in the target hardware (UNVR, ENVR, etc.).
   6. Power on the target. Wait for it to reach its setup state.
@@ -102,19 +104,26 @@ status() {
         echo ">>> Recording array: NOT mounted at /volume1 (!)"
     fi
 
-    # Is postgres-vda managing the database overlay?
-    if systemctl is-active --quiet postgres-vda.service 2>/dev/null; then
-        echo ">>> postgres-vda: active — postgres served from the vda working"
-        echo "    copy while running; synced to the array on clean shutdown."
+    # Postgres runs on the built-in SSD (vda) via Protect's own /ssd1
+    # detection; config backups are mirrored to the array on a timer.
+    if [ -e /ssd1 ]; then
+        echo ">>> Postgres: on the SSD (/data via /ssd1) — not on the array."
     else
-        echo ">>> postgres-vda: not active (postgres running directly on its"
-        echo "    data_directory; clean shutdown still leaves it on the array)."
+        echo ">>> Postgres: /ssd1 marker absent (Protect may place the DB on"
+        echo "    the array; the config backup below is the export path anyway)."
+    fi
+    if systemctl is-active --quiet protect-backup-to-array.timer 2>/dev/null; then
+        echo ">>> Config-backup mirror: active — backups copied to the array"
+        echo "    at /volume1/.srv/protect-config-backups (newest 30 kept)."
+    else
+        echo ">>> Config-backup mirror: protect-backup-to-array.timer not active"
+        echo "    (take/verify a web-UI backup before export)."
     fi
 
     echo ""
-    echo ">>> Where postgres data lives at rest (on the array):"
-    ls -la /volume1/.srv/postgresql 2>/dev/null | head -5 || \
-        echo "    /volume1/.srv/postgresql not present"
+    echo ">>> Config backups mirrored on the array:"
+    ls -la /volume1/.srv/protect-config-backups 2>/dev/null | head -5 || \
+        echo "    /volume1/.srv/protect-config-backups not present (none yet)"
 
     echo ""
     echo ">>> Mount points relevant to the data:"
@@ -146,8 +155,10 @@ case "$ACTION" in
         # Backward-compatibility note for anyone following older docs.
         echo "The 'migrate' step is no longer needed."
         echo ""
-        echo "postgres-vda keeps the database on the array at rest and syncs it"
-        echo "there at every clean shutdown, so there is nothing to migrate back."
+        echo "Protect keeps its postgres cluster on the built-in SSD (vda) via"
+        echo "its own /ssd1 detection, and the database is captured in the config"
+        echo "backup, so there is nothing to migrate onto the array. The disks"
+        echo "carry the recordings; the config backup carries the rest."
         echo "Just take your web-UI backups and 'systemctl poweroff'."
         echo ""
         echo "Run './uninstall.sh status' to see export readiness and the checklist."

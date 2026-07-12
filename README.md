@@ -122,11 +122,11 @@ In short: UTM if disk images, plain QEMU if raw disks.
               | USB ethernet|    | DAS         |
               +-------------+    |  - HDD RAID |
                                  |    holds    |
-                                 |  recs + DB  |
+                                 |  recordings |
                                  +-------------+
 ```
 
-The VM boots from a qcow2 file. The Protect data RAID is on spinning disks in the DAS, originally migrated from a UNVR. The Postgres database's durable home is on that array (so it travels with the recordings, UNVR-style), but while the VM runs it's served from a working copy on `vda` — the OS qcow2 on the host's NVMe — for speed, and synced back to the array at every clean shutdown. This is handled automatically by `postgres-vda.service`; there's no separate database disk to provision.
+The VM boots from a qcow2 file. The Protect data RAID is on spinning disks in the DAS, originally migrated from a UNVR, and holds the camera recordings — which travel with the disks. The Postgres database lives on the built-in SSD (`vda` — the OS qcow2 on the host's NVMe) for speed, exactly as a real UNVR fitted with an SSD keeps it: Protect's own `/ssd1` detection leaves the cluster on `/data` rather than moving it onto the array. There's no separate database disk to provision, and no database-migration step to run when you move the disks — a whole-system config backup carries the database, and `protect-backup-to-array.timer` also mirrors those small config backups onto the array.
 
 ## Hardware
 
@@ -146,7 +146,7 @@ The VM boots from a qcow2 file. The Protect data RAID is on spinning disks in th
 - **RAM**: 8GB works fine — that's exactly what I'm using. 16GB would be more comfortable for both the host and VM, especially if you also use the host for other tasks.
 - **Storage**: USB 3.2 Gen 2 or Thunderbolt DAS with enough bays for whatever disks you plan on using. I use a TerraMaster D6-320 (6 bays, 10Gbps).
 - **Disks**: Whatever HDDs you want in your RAID (4 matching disks is just what I had from the UNVR — your config can differ)
-- **Solid-state for the VM's OS disk (`vda`)**: The VM's `vda` qcow2 should live on solid-state storage — your host's internal NVMe is ideal. Postgres is served from `vda` while the VM runs (see below), so this is what makes the UI snappy; there's no separate postgres disk to provision. The bulk recording RAID can be spinning disks — only `vda` benefits from being on NVMe.
+- **Solid-state for the VM's OS disk (`vda`)**: The VM's `vda` qcow2 should live on solid-state storage — your host's internal NVMe is ideal. Protect keeps its postgres database on `vda` (see below), so this is what makes the UI snappy; there's no separate postgres disk to provision. The bulk recording RAID can be spinning disks — only `vda` benefits from being on NVMe.
 - **Network**: Wired ethernet recommended but not required. WiFi can work but may not be sufficient or reliable under sustained high camera bitrates.
 - **UPS**: Anything that can signal a clean shutdown when battery gets low
 
@@ -154,7 +154,7 @@ The VM boots from a qcow2 file. The Protect data RAID is on spinning disks in th
 
 - **ARM host** for native AArch64 execution of Debian and the UniFi binaries (which are compiled for the UNVR's ARM64 architecture).
 - **USB 3.2 Gen 2 (10Gbps) DAS** because it provides plenty of headroom for both video writes and database I/O. Anything slower works at smaller scales but cuts your future options.
-- **Postgres served from NVMe** because the Protect database determines how snappy the UI feels. Every face search, every timeline scroll, every smart detection query goes through postgres. On spinning storage shared with camera writes and swap, this is the #1 source of perceived slowness — so `postgres-vda` keeps the live database on the host's NVMe-backed `vda` disk while the VM runs, and writes it back to the array only at shutdown.
+- **Postgres on NVMe** because the Protect database determines how snappy the UI feels. Every face search, every timeline scroll, every smart detection query goes through postgres. On spinning storage shared with camera writes and swap, this is the #1 source of perceived slowness — so Protect keeps its database on the host's NVMe-backed `vda` disk (via its own `/ssd1` detection) instead of on the array.
 - **Wired networking** because high camera bitrates may overwhelm or be unreliable over WiFi. Ethernet is recommended but not strictly required.
 
 ## How it works (technical)
@@ -194,8 +194,8 @@ These are masked (not just disabled) because they're triggered as dependencies b
 
 Typical device map. The actual letters depend on how QEMU enumerates devices and which storage you've configured — see notes below.
 
-- **`/dev/vda`** (qcow2 on host disk): VM's operating system, around 32GB. Also holds the live postgres working copy (`/data/postgres-active`) that `postgres-vda` overlays onto `/srv/postgresql` while the VM runs.
-- **`/dev/sd?`** (RAID from DAS or single qcow2): Mounted at `/volume1`, symlinked to `/srv`. Holds camera recordings under `/srv/unifi-protect/`, Access data under `/srv/unifi-access/`, and the postgres clusters at rest under `/srv/postgresql/` (Access and Protect).
+- **`/dev/vda`** (qcow2 on host disk): VM's operating system, around 32GB. Also holds Protect's postgres cluster, which stays on `/data` (via Protect's own `/ssd1` detection) so queries run at NVMe speed.
+- **`/dev/sd?`** (RAID from DAS or single qcow2): Mounted at `/volume1`, symlinked to `/srv`. Holds camera recordings under `/srv/unifi-protect/`, Access data under `/srv/unifi-access/`, and the mirrored config backups under `/srv/protect-config-backups/`.
 - **`/dev/sr0`** (CD-ROM): The scripts ISO, when attached by `start-protect-vm.sh`. The VM doesn't mount this automatically — you mount it manually when you want to copy or refresh scripts. Ignored otherwise.
 
 Storage is mounted by filesystem UUID, not device name, because device letter assignment isn't stable:
@@ -230,13 +230,13 @@ If you're migrating from an existing UNVR, you don't need to create the RAID at 
 This is a Debian VM running standard Linux software. Everything in this README is the configuration that's been tested and that the scripts produce by default. None of it is mandatory:
 
 - Don't like the RAID layout? Build whatever you want before running the install script.
-- Don't want the postgres-on-`vda` working-copy behavior? Disable `postgres-vda.service` and postgres runs directly on the array (simpler, but slower on spinning disks).
+- Don't want the small config backups mirrored to the array? Disable `protect-backup-to-array.timer` — Protect still keeps its own copies in `/data/unifi-core/backups`.
 - Want to add monitoring, log shipping, additional storage tiers, encrypted volumes, network policy, anything else Linux supports? Add it. It's a VM.
 - Want a completely different distro? The install script is bash and dpkg-driven; porting to Ubuntu or any other Debian derivative is straightforward.
 
 The scripts in this repo encode one working configuration that handles the UNVR-shaped corner cases. They're a starting point, not a constraint.
 
-### Why postgres runs from vda (and how postgres-vda works)
+### Why postgres runs from the SSD (and how it stays there)
 
 When postgres lives on the same spinning RAID as camera recordings, every search query waits for the disks to seek away from continuous write operations. The disks never get a quiet moment to handle scattered small reads — the pattern postgres uses for face lookups, timeline queries, and smart detection event scans.
 
@@ -248,12 +248,14 @@ Serving postgres from solid-state storage instead:
 - Significantly improved smart detection response time
 - Stopped missing image snapshots in event entries
 
-**How it's done — `postgres-vda.service`.** Rather than carve out a dedicated postgres disk, the storage subsystem keeps the database in two places with a clear direction of trust:
+**How it's done — Protect's own `/ssd1` detection.** There's no custom mechanism here: Protect already knows how to keep its database on a built-in SSD. Its `unifi-protect-db-cluster-migrate-setuppgconf` step early-exits and leaves the cluster on `/data` whenever `/ssd1` exists, instead of migrating it onto the storage array. Since the VM's `/data` lives on `vda` — the OS qcow2, NVMe-backed on the host — postgres runs at NVMe speed. This is exactly how a real UNVR fitted with an SSD behaves.
 
-- **At rest, on the array**: the real cluster directory lives at `/srv/postgresql` (`/volume1/.srv/postgresql`), alongside the recordings. Pull the disks and the database travels with them — exactly where a real UNVR's postgres expects it. No migration step to remember before moving hardware.
-- **While running, on `vda`**: at boot, `postgres-vda` bind-mounts a working copy on `vda` (the OS qcow2, NVMe-backed on the host) over `/srv/postgresql`, so postgres runs at NVMe speed. At every clean shutdown it drops the bind and rsyncs the working copy back onto the array.
+That keeps the two kinds of data cleanly separated:
 
-The direction of trust matters: `vda` is authoritative while it holds a copy; the array seeds `vda` only when `vda` is empty (a fresh VM). So an unclean power loss simply drops the bind mount (mounts aren't persistent) and the array keeps the last clean-shutdown database — one session stale at worst, never absent, never a dangling pointer.
+- **Recordings, on the array**: the camera video lives on the RAID under `/srv/unifi-protect/` and travels with the disks when you pull them — unchanged.
+- **Database, on the SSD**: the postgres cluster stays on `vda`. It does not travel with the disks; instead it's captured in the whole-system config backup (protect + access + users — a few MB, not recordings) that you take from the web UI. A systemd timer, `protect-backup-to-array.timer` (script `/usr/local/sbin/protect-backup-to-array.sh`), also mirrors those small config backups from `/data/unifi-core/backups` onto the array at `/volume1/.srv/protect-config-backups` (newest 30 kept), so a copy travels with the disks too.
+
+So moving hardware is the standard UNVR path: the disks carry the recordings, and the config backup — restored on the target via its web UI — carries the database. No separate-disk migration step to run.
 
 The database working set is small — around 2.4GB in my setup — so the `vda` qcow2's normal ~32GB holds it comfortably; there's no separate sizing decision to make.
 
@@ -439,7 +441,7 @@ This is the recommended workflow if you have a working UNVR you want to replace:
    - **Use the Protect mobile app.** Under some circumstances the Protect *web UI* won't drive the re-adoption and will tell you to use the *mobile app* instead. The app can adopt cameras the web UI can't, so keep it handy for this step.
    - **Log into the device directly.** Browse to the camera's own IP and log in with username `ubnt` and the device's recovery password (shown in the UniFi UI / device settings). If the recovery password doesn't work, try the default password `ubnt`. From the device portal you can point it at the new controller.
 
-9. **Postgres performance is automatic** — no step to run. As long as the VM's `vda` qcow2 lives on solid-state storage (host NVMe), `postgres-vda.service` already serves the database from `vda` at runtime and syncs it to the array at clean shutdown.
+9. **Postgres performance is automatic** — no step to run. As long as the VM's `vda` qcow2 lives on solid-state storage (host NVMe), Protect keeps its database on `vda` (via its own `/ssd1` detection), which is what makes the UI snappy.
 
 ### Auto-starting the VM at boot
 
@@ -519,7 +521,7 @@ ssh root@<VM-IP> /root/vm/installers/update-unifi.sh --all
 
 **Why create is live but restore requires shutdown**: creating a snapshot only writes new metadata to the qcow2 file — qemu-img can do that with the VM briefly paused. Restoring rewrites the live image data to match the snapshot, which QEMU can't safely continue running on top of, so the VM has to be stopped first.
 
-**What gets snapshotted**: the VM rootfs qcow2 (which is `vda` — so it includes the live postgres working copy) plus any extra image files listed in `STORAGE_IMAGES`. Raw disk passthrough (bulk recording disks) is NOT snapshotted — those are real block devices, often 10+ TB, where qcow2-style snapshotting isn't practical. This asymmetry is fine: an update that breaks the controller can be rolled back via the qcow2 snapshots, and the recordings on the RAID continue uninterrupted.
+**What gets snapshotted**: the VM rootfs qcow2 (which is `vda` — so it includes the live postgres database) plus any extra image files listed in `STORAGE_IMAGES`. Raw disk passthrough (bulk recording disks) is NOT snapshotted — those are real block devices, often 10+ TB, where qcow2-style snapshotting isn't practical. This asymmetry is fine: an update that breaks the controller can be rolled back via the qcow2 snapshots, and the recordings on the RAID continue uninterrupted.
 
 Other snapshot commands:
 
@@ -812,7 +814,7 @@ If you decide to go back to a real UNVR, upgrade to an ENVR, or move to a differ
 **Workflow**:
 
 1. **Back up Protect and Access** via the VM's web UI. Download both backup files (Protect and Access have separate backups).
-2. **No database-migration step is needed.** `postgres-vda` syncs postgres onto the array (`/srv/postgresql`) at every clean shutdown, so the clean `systemctl poweroff` in the next step already leaves the disks with a complete UNVR-style layout. (`uninstall.sh status` shows export readiness and the checklist.)
+2. **No database-migration step is needed.** Protect keeps its postgres database on the SSD (`vda`), and the config backup you took in step 1 carries it — so there's nothing to sync onto the disks. The disks carry the recordings; restoring that backup on the target rebuilds the rest. (`uninstall.sh status` shows export readiness and the checklist.)
 3. **Cleanly shut down the VM**: `systemctl poweroff`
 4. **Remove the disks** from the DAS.
 5. **Install the disks** in the target hardware (real UNVR, ENVR, etc.).
@@ -915,7 +917,7 @@ If the QEMU process is killed (host reboot, `kill -9`, power loss) without givin
 **Fix** (inside the VM as root):
 
 ```
-rm -f /srv/postgresql/14/protect/data/postmaster.pid
+rm -f /data/postgresql/14/protect/data/postmaster.pid
 systemctl start postgresql@14-protect
 pg_lsclusters                    # confirm: status 'online'
 systemctl start unifi-protect
@@ -925,19 +927,15 @@ systemctl start unifi-protect
 
 The `postgresql@14-protect.service` unit ships with a `clean-postmaster-pid.conf` drop-in that is supposed to clean a stale pid before start, but the migrate-script's direct `pg_ctlcluster stop` call bypasses the systemd ExecStartPre chain in this case. Manual `rm` is the reliable recovery.
 
-### First-boot DB-cluster migration runs on every fresh install
+### First-boot DB placement — stays on the SSD (`/ssd1`)
 
-On a real UNVR, the storage array is present at first Protect start, so the DB initializes directly on `/srv/`. In this VM, the array is user-driven through the web UI — meaning the first Protect start happens *before* `/srv/` is real, the DB initializes on `/data/`, and only on the next start (after the array exists) does the cluster migrate to `/srv/`.
-
-This migrate path is normal. You'll see this in the journal:
+On a real UNVR *without* an internal SSD, Protect initializes its postgres cluster on `/data/` at first start and then migrates it onto the storage array (`/srv/`) once the array exists. This VM ships an `/ssd1` marker (the installer creates it), which is exactly how a real UNVR *fitted with* an internal SSD behaves: Protect's `unifi-protect-db-cluster-migrate-setuppgconf` step sees `/ssd1`, early-exits, and leaves the cluster on `/data/` — so it stays on the NVMe-backed `vda` and is never moved onto the spinning array. You'll see this in the journal:
 
 ```
-pre-start: PostgreSQL running with /data/ but /srv/ has the real DB, running migrate script
+Early exit: /ssd1 is mounted or is a directory.
 ```
 
-The migrate script (`/usr/bin/unifi-protect-db-cluster-migrate`) rsyncs the cluster directory, updates `data_directory` in the postgres config, and triggers a restart through systemd. It runs exactly once per cluster and writes `/srv/.db-cluster-migrated.ctl` when done.
-
-If it fails mid-way (most commonly because of the stale `postmaster.pid` trap above), the recovery is the same: clear the pid, start the cluster manually, then start `unifi-protect`. Leftover bytes in `/data/postgres-active/` and `/data/postgresql/14/protect/` after a successful migrate are harmless and can be cleaned up later.
+Leave `/ssd1` in place. If it's removed, setuppgconf reverts to migrating the DB onto `/srv/` on the next Protect start — and `postgresql-cluster@14-protect`'s `pg-cluster-setup` will re-initialize the cluster if its `.configured`/`conf` markers are missing — so the marker is load-bearing.
 
 ### Storage pane transient render race
 

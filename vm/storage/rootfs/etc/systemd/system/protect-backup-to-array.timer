@@ -1,0 +1,13 @@
+# Mirror UniFi OS config backups to the array daily (captures whatever the
+# unifi-core auto-backup scheduler or a manual UI backup produced). Persistent
+# so a missed run (VM off) fires on next boot.
+[Unit]
+Description=Daily mirror of UniFi OS config backups to the recording array
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

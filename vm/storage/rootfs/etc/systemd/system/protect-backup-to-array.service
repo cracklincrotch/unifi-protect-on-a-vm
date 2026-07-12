@@ -1,0 +1,11 @@
+# Mirror UniFi OS config backups (/data/unifi-core/backups) onto the recording
+# array so they are durable and travel with the disks. Read-only w.r.t. the
+# source; safe to run any time. Driven by protect-backup-to-array.timer.
+[Unit]
+Description=Mirror UniFi OS config backups to the recording array
+After=provision-storage.service
+ConditionPathIsMountPoint=/volume1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/protect-backup-to-array.sh

@@ -35,13 +35,13 @@
 # Protect's web UI responsiveness is dominated by postgres query speed
 # (face search, timeline scrubbing, smart-detection lookups), and the
 # array's spinning disks handle that scattered-small-read pattern worst.
-# This is now handled automatically by the storage subsystem's
-# postgres-vda service: the postgres clusters live on the array at rest
-# (so the database travels with the disks, UNVR-style) but are served from
-# a working copy on vda — the OS disk, a qcow2 on the host's NVMe — while
-# the VM runs, and synced back to the array at every clean shutdown. There
-# is no separate-disk migration step to run, and nothing here to configure.
-# See /usr/local/sbin/postgres-vda.sh for the mechanism.
+# So Protect keeps its postgres cluster on the built-in SSD (vda — a
+# qcow2 on the host's NVMe) rather than on the array. It does this on its
+# own: unifi-protect-db-cluster-migrate-setuppgconf early-exits and leaves
+# the cluster on /data whenever /ssd1 exists, which is exactly how a real
+# UNVR fitted with an SSD behaves. The recordings stay on the array and
+# travel with the disks. There is no separate-disk migration step to run,
+# and nothing here to configure.
 #
 # Usage:
 #   ./mount-storage.sh status
@@ -111,11 +111,12 @@ status() {
 
     echo ""
     echo ">>> Postgres clusters:"
-    # pg_lsclusters shows where each postgres cluster's data lives. The
-    # 'access' and 'protect' clusters' data_directory is /srv/postgresql,
-    # which the postgres-vda service overlays with a vda working copy
-    # while the VM runs (NVMe speed) and syncs back to the array at clean
-    # shutdown. 'main' lives on /data which is the VM rootfs.
+    # pg_lsclusters shows where each postgres cluster's data lives.
+    # Protect keeps its cluster on /data — the VM's SSD-backed rootfs on
+    # vda — via its own /ssd1 detection, rather than on the array, so
+    # queries run at NVMe speed. Only the recordings (and the small config
+    # backups mirrored to /volume1/.srv/protect-config-backups) live on the
+    # array.
     pg_lsclusters 2>/dev/null || echo "    pg_lsclusters not available"
 }
 
