@@ -66,7 +66,13 @@ fi
 if [ -f /sbin/ubnt-tools ] && [ ! -f /sbin/ubnt-tools.orig ]; then
     mv /sbin/ubnt-tools /sbin/ubnt-tools.orig
 fi
-cat > /sbin/ubnt-tools << 'UBNTEOF'
+# Write via a temp file + atomic rename, NOT `cat >` in place. A plain `cat >`
+# truncates the target first and fails with "Text file busy" (ETXTBSY) if the
+# real ubnt-tools is mid-execution — e.g. a crash-looping unifi-core re-running
+# it every few seconds during a --sync-os reconcile (this exact failure left the
+# shim uninstalled once, so unifi-core saw the real board model and crashed).
+# rename() swaps the directory entry without truncating, so it never hits ETXTBSY.
+cat > /sbin/ubnt-tools.new << 'UBNTEOF'
 #!/bin/bash
 
 if [ "${1:-}" = 'id' ]; then
@@ -109,7 +115,8 @@ if [ "${1:-}" = 'id' ]; then
     echo "board.qrid=sTpBUR"
 fi
 UBNTEOF
-chmod +x /sbin/ubnt-tools
+chmod +x /sbin/ubnt-tools.new
+mv -f /sbin/ubnt-tools.new /sbin/ubnt-tools
 
 # NOTE: /usr/bin/ustorage is deliberately NOT installed here. The dynamic
 # ustorage replacement (storage/rootfs/usr/bin/ustorage — it reads the
