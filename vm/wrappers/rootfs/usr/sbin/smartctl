@@ -17,13 +17,30 @@
 #   - a raw-passthrough disk -> the physical disk itself;
 #   - a qcow2 image disk     -> the host disk the image file lives on.
 #
-# The host returns smartctl JSON (NVMe or ATA). This wrapper normalizes it
-# into a synthetic smartctl ATA report carrying THIS VM disk's identity
-# (its own serial and capacity, presented as an HDD) populated with the
-# real health signals — overall health, temperature, power-on hours,
-# power cycles, reallocated/error counts. Protect's `ustorage` consumes
-# `smartctl --json`; a human runs `smartctl -a`. Both are served: JSON
-# when the caller passed --json/-j, human text otherwise.
+# TWO MODES, decided by whether the host device IS the VM disk:
+#
+# PASSTHROUGH (raw-passthrough disks — host serial == VM disk serial):
+#   the caller's own flags are forwarded to the host smartctl and its
+#   output comes back VERBATIM — the full report of the real drive
+#   (all vendor attributes, self-test logs, SCT temperature history,
+#   PHY event counters, ...), exactly as `smartctl -x` prints it on the
+#   host. The identities already agree, so nothing needs rewriting.
+#   Note the host runs its own smartctl (7.5 there today), so output
+#   reflects the host build, not the guest's.
+#
+# NORMALIZE (image-backed disks — the host device is the medium the
+#   image lives on, a different disk entirely): the host is asked for
+#   `--json -x` and the answer is normalized into a synthetic smartctl
+#   ATA report carrying THIS VM disk's identity (its own serial and
+#   capacity) populated with the real health signals — overall health,
+#   temperature, power-on hours, power cycles, reallocated/error counts.
+#   Protect's `ustorage` consumes `smartctl --json`; a human runs
+#   `smartctl -a`. Both are served: JSON when the caller passed
+#   --json/-j, human text otherwise.
+#
+# The host helper refuses state-changing flags (self-tests, --set, -s),
+# so a passthrough call carrying one falls back to the local smartctl
+# against the emulated disk — same behavior as before the proxy.
 #
 # Any failure (channel down, proxy disabled, unknown disk, no python)
 # falls through to the local real smartctl. The proxy is best-effort and
@@ -52,10 +69,15 @@ fallback() { exec "$REAL" "$@"; }
 [ -x "$CTL" ] || fallback "$@"
 command -v python3 >/dev/null 2>&1 || fallback "$@"
 
-# Find the device argument (last token that looks like a device path).
+# Split the command line: the device operand (last /dev/* token) is ours
+# to translate; every other token is forwarded to the host verbatim.
 dev=""
+fwd=()
 for a in "$@"; do
-    case "$a" in /dev/*) dev="$a" ;; esac
+    case "$a" in
+        /dev/*) dev="$a" ;;
+        *)      fwd+=("$a") ;;
+    esac
 done
 [ -n "$dev" ] || fallback "$@"
 
@@ -85,12 +107,60 @@ for a in "$@"; do
     case "$a" in -j|--json|--json=*) want_json=1 ;; esac
 done
 
-# Ask the host for structured SMART data. We always request --json -x
-# regardless of what the caller asked — the normalizer below renders the
-# caller's chosen format itself.
-host_json=$("$CTL" smartctl "$serial" --json -x 2>/dev/null)
+# First, run the caller's own request against the host device. If the
+# host answers about a disk with OUR serial, the host device IS this VM
+# disk (raw passthrough) and the output is correct verbatim — print it
+# and be done. A state-changing flag makes the helper refuse (rc != 0),
+# which drops us to the local-smartctl fallback, as before the proxy.
+host_out=$("$CTL" smartctl "$serial" "${fwd[@]}" 2>/dev/null)
 rc=$?
-[ "$rc" -eq 0 ] && [ -n "$host_json" ] || fallback "$@"
+[ "$rc" -eq 0 ] && [ -n "$host_out" ] || fallback "$@"
+
+# Whose disk did the host describe? JSON answers carry serial_number;
+# text answers print a "Serial Number:" line. Some queries (-H, -A)
+# include neither — then fall back to the device class: sd* disks are
+# raw passthrough in this VM's topology, vd* are image-backed.
+host_serial=""
+if [ "$want_json" = "1" ]; then
+    host_serial=$(printf '%s\n' "$host_out" | python3 -c '
+import sys, json
+try:
+    print((json.load(sys.stdin) or {}).get("serial_number", "") or "")
+except Exception:
+    pass' 2>/dev/null)
+else
+    host_serial=$(printf '%s\n' "$host_out" \
+        | sed -n 's/^[Ss]erial [Nn]umber:[[:space:]]*//p' | head -n1)
+fi
+host_serial=$(printf '%s' "$host_serial" | tr -d '[:space:]')
+
+same_disk=0
+if [ -n "$host_serial" ]; then
+    [ "$host_serial" = "$serial" ] && same_disk=1
+else
+    case "$lookup" in /dev/vd*) same_disk=0 ;; *) same_disk=1 ;; esac
+fi
+
+if [ "$same_disk" = "1" ]; then
+    printf '%s\n' "$host_out"
+    exit 0
+fi
+
+# Image-backed disk: the host described a different medium, so the
+# normalizer below rewrites it under this VM disk's identity. It needs
+# `--json -x` specifically; reuse the first answer when that is what the
+# caller already asked for, otherwise fetch the structured form now.
+had_x=0
+for a in "${fwd[@]}"; do
+    case "$a" in -x|--xall) had_x=1 ;; esac
+done
+if [ "$want_json" = "1" ] && [ "$had_x" = "1" ]; then
+    host_json="$host_out"
+else
+    host_json=$("$CTL" smartctl "$serial" --json -x 2>/dev/null)
+    rc=$?
+    [ "$rc" -eq 0 ] && [ -n "$host_json" ] || fallback "$@"
+fi
 
 # Normalize the host's backing-disk SMART into a synthetic ATA report
 # that carries this VM disk's identity.
