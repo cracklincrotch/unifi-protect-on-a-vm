@@ -381,8 +381,30 @@ for serial in "${DISK_SERIALS[@]}"; do
         continue
     fi
     echo "Disk: /dev/$bsd ($serial)"
+    # werror=stop,rerror=stop is the most important option on this line.
+    # Without it a transient USB fault is reported into the guest as a real
+    # I/O error and md kicks the member out of the array.
+    #
+    # Not hypothetical. On 2026-08-03 the host's USB ROOT PORT dropped the
+    # whole hub tree. The bus recovered in 2.4 s onto NEW /dev/diskN nodes,
+    # but QEMU kept the stale fds and synthesised "Aborted Command / DID_OK
+    # DRIVER_SENSE" into the guest -- QEMU's own invented sense data, not
+    # anything a drive actually said -- and md kicked sdd5 and sda5. The array
+    # survived only by luck: md could not persist its superblocks
+    # (super_written -5), so on-disk state froze healthy and a restart
+    # reassembled 4/4 with a bitmap resync and no rebuild.
+    #
+    # With these set, QEMU PAUSES the VM instead of lying to the guest.
+    # Recording stops until someone resumes it, which is strictly better than
+    # a rebuild measured in days -- in this failure class the delay costs
+    # recordings, never the array. Resume with QMP "cont" once the bus is
+    # healthy.
+    #
+    # A pause is otherwise SILENT: a frozen guest cannot run md-health-watch
+    # or critical-services-watch. That is what the BLOCK_IO_ERROR / STOP
+    # handling in the QMP event reader below exists for.
     DISK_ARGS+=(
-        -drive "if=none,id=disk_$serial,file=/dev/$bsd,format=raw,cache=$DISK_CACHE,aio=$DISK_AIO"
+        -drive "if=none,id=disk_$serial,file=/dev/$bsd,format=raw,cache=$DISK_CACHE,aio=$DISK_AIO,werror=stop,rerror=stop"
         -device "scsi-hd,bus=scsi0.0,drive=disk_$serial,serial=$serial"
     )
     # serial<TAB>kind<TAB>target — consumed by the optional smartctl proxy.
@@ -447,7 +469,9 @@ for entry in "${STORAGE_IMAGES[@]}"; do
     # disk from a raw-passthrough spinning disk (and only skips the RAID
     # resync, which would inflate the qcow2, for the all-image case).
     IMG_ARGS+=(
-        -drive "if=none,id=$id,file=$img,format=qcow2,cache=$DISK_CACHE,aio=$DISK_AIO,discard=$img_discard"
+        # werror/rerror for the same reason as the raw disks above: these are
+        # array members too, and a paused VM beats a kicked member.
+        -drive "if=none,id=$id,file=$img,format=qcow2,cache=$DISK_CACHE,aio=$DISK_AIO,discard=$img_discard,werror=stop,rerror=stop"
         -device "scsi-hd,bus=scsi0.0,drive=$id,serial=$serial,rotation_rate=1"
     )
     # serial<TAB>kind<TAB>target — for image disks the target is the
@@ -796,6 +820,11 @@ else
     echo "  $CONTROL_HELPER" >&2
 fi
 QMP_REASON_FILE="$(mktemp -t protect-vm-qmp-reason)"
+
+# Persistent, host-side record of block I/O errors and VM pauses.
+# Deliberately NOT a mktemp: a paused VM must still be diagnosable
+# tomorrow. See the note() helper in the QMP event reader.
+VM_IO_LOG="${VM_IO_LOG:-$VM_DATA_DIR/vm-io-events.log}"
 # shellcheck disable=SC2064
 trap '
     [ -n "$control_pid" ] && kill "$control_pid" 2>/dev/null
@@ -828,6 +857,70 @@ QEMU_BIN="$(command -v qemu-system-aarch64 || echo /opt/homebrew/bin/qemu-system
 VM_DISK_DISCARD=ignore
 backing_is_ssd "$VM_DISK" && VM_DISK_DISCARD=unmap
 
+###############################################################################
+# Built-in SSD image (/ssd1)
+###############################################################################
+#
+# Protect decides whether to start DELETING EVENTS by running df on /ssd1:
+#
+#     t.getBuiltInSsdSpace = async e => await df(C, e)   // const C = "/ssd1"
+#     i <= (r > 900 ? 64 : 8) ? warn("SSD available space ... deleting events")
+#
+# So the threshold is a hard 8 GB free for any /ssd1 smaller than 900 GB, it
+# re-checks every 10 minutes, and it hard-deletes rows -- DELETE FROM events
+# ... WHERE "locked" = false ORDER BY "end" ASC. Only locked (archived)
+# events survive.
+#
+# With no disk mounted there, /ssd1 is just a directory on the OS disk, so
+# that df reports the 30 GB root filesystem. Measured 2026-08-07: adding a
+# 4 GB swapfile took root free space from ~12 GB to 7.8 GB, crossing the
+# threshold, and Protect destroyed 183,198 events and 97,878 smart-detect
+# objects before anyone noticed. The only visible symptom was that the AI
+# Key looked broken -- its input was being deleted underneath it.
+#
+# Giving /ssd1 its own disk fixes that permanently, and it is also what
+# Protect expects: /ssd1 is real scratch space for the imageProcessing,
+# audioProcessing and caseReportGeneration workers.
+#
+# This is deliberately NOT a STORAGE_IMAGES entry. Those attach as scsi-hd
+# with a serial and rotation_rate=1, which is exactly how provision-storage
+# identifies a disk as an array candidate -- it would be offered to the RAID
+# and would show up as a bay in the storage panel. Attaching as if=virtio
+# instead makes it /dev/vdb, which the storage path never enumerates.
+#
+# Keep this image SMALL. The threshold jumps to 64 GB once /ssd1 exceeds
+# 900 GB, so a 64 GB disk with 60 GB free has far more headroom than a 1 TB
+# disk would.
+#
+# ORDERING IS LOAD-BEARING: SSD_ARGS must be appended AFTER the virtio-net
+# device in the QEMU invocation, never before it. Devices take PCI slots in
+# command-line order, and Debian derives interface names from the PCI path
+# (enp0sN). Putting this drive earlier shifts the NIC one slot, the interface
+# comes up under a new name, no config matches it, and the guest boots with
+# NO NETWORK -- QEMU running, ARP incomplete, unreachable. Learned the hard
+# way on 2026-08-07: the drive went in ahead of virtio-scsi-pci and the VM
+# came up deaf. Recovery required an ACPI shutdown over QMP, because killing
+# QEMU on a live guest risks an md resync measured in days.
+SSD_ARGS=()
+if [ -n "${SSD_IMAGE:-}" ]; then
+    if [ -f "$SSD_IMAGE" ]; then
+        SSD_DISCARD=ignore
+        backing_is_ssd "$SSD_IMAGE" && SSD_DISCARD=unmap
+        SSD_ARGS=(
+            -drive "if=virtio,file=$SSD_IMAGE,format=qcow2,discard=$SSD_DISCARD"
+        )
+        echo "Built-in SSD image (/ssd1, discard: $SSD_DISCARD):"
+        echo "  $SSD_IMAGE"
+    else
+        # Not fatal: the VM still boots, /ssd1 falls back to a directory on
+        # the OS disk, and Protect starts deleting events again once the
+        # root filesystem drops under 8 GB free. Say so loudly.
+        echo "WARNING: SSD_IMAGE is set but missing: $SSD_IMAGE" >&2
+        echo "WARNING: /ssd1 will fall back to the OS disk, and Protect will" >&2
+        echo "WARNING: delete events when it drops below 8 GB free." >&2
+    fi
+fi
+
 while :; do
     : > "$QMP_REASON_FILE"
 
@@ -836,10 +929,84 @@ while :; do
     # is involved. Once QEMU connects, block until the SHUTDOWN event and
     # record its reason.
     (
-        python3 - "$QMP_EVENT_SOCKET" "$QMP_REASON_FILE" <<'PYEOF'
-import json, os, socket, sys
+        python3 - "$QMP_EVENT_SOCKET" "$QMP_REASON_FILE" "$VM_IO_LOG" <<'PYEOF'
+import json, os, socket, sys, threading, time
 
 sock_path, out_path = sys.argv[1], sys.argv[2]
+io_log_path = sys.argv[3] if len(sys.argv) > 3 else os.devnull
+
+# --- DAS fault auto-recovery -------------------------------------------------
+#
+# werror=stop/rerror=stop on the DAS disks means a USB fault PAUSES the VM
+# instead of letting md kick an array member. That protects the array, but a
+# paused recorder that nobody resumes is its own outage. This resumes it.
+#
+# Retrying is SAFE: werror=stop stays armed after it fires, so if the array is
+# still broken the retried I/O simply pauses the VM again. The guest never sees
+# an error, so md never kicks a member no matter how many times we try. The
+# only real failure mode is thrash, which the cap below bounds.
+#
+# The retry also DISTINGUISHES the two fault shapes with no disk probing:
+#   * transient glitch, same /dev/diskN  -> the first cont succeeds, done.
+#   * bus re-enumerated onto NEW nodes   -> QEMU still holds the stale fds, so
+#     every cont re-pauses. After MAX_RESUMES we stop guessing and cold-restart,
+#     because only a relaunch re-runs resolve_disk_by_serial and reopens the
+#     correct devices. That is exactly what recovered the 2026-08-03 event:
+#     restart, clean 4/4 assemble, bitmap resync, no rebuild.
+#
+# Escalation asks the guest to halt first. A clean shutdown flushes the
+# filesystems, which is the "sync before you stop" this is really after -- and
+# it works even mid-fault because / and /ssd1 live on the host NVMe, not on the
+# DAS. If the halt does not complete in time we quit anyway; the array is
+# already frozen healthy by the pause, which is the whole point.
+MAX_RESUMES = 3          # cont attempts inside PAUSE_WINDOW before escalating
+RESUME_BACKOFF = 10      # seconds to let the bus settle before each cont
+SHUTDOWN_BUDGET = 90     # seconds to wait for a clean halt before forcing quit
+PAUSE_WINDOW = 3600      # pauses older than this no longer count toward the cap
+
+pauses = []
+escalated = False
+lock = threading.Lock()
+
+
+def note(text):
+    """Record where a human will find it.
+
+    A paused guest is frozen: md-health-watch and critical-services-watch run
+    INSIDE it and cannot fire. Without a host-side record the failure mode is a
+    silently stopped recorder -- the way the Access syslog engine stayed dead
+    for three months.
+    """
+    line = "%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
+    sys.stderr.write(line)                       # -> launchd log
+    sys.stderr.flush()
+    try:
+        with open(io_log_path, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def send(conn, cmd):
+    try:
+        conn.sendall((json.dumps({"execute": cmd}) + "\n").encode())
+        return True
+    except OSError as exc:
+        note("QMP send %s failed: %s" % (cmd, exc))
+        return False
+
+
+def force_quit_later(conn):
+    """Backstop: if the guest will not halt, stop QEMU so the loop relaunches."""
+    time.sleep(SHUTDOWN_BUDGET)
+    with lock:
+        still_going = escalated
+    if still_going:
+        note("clean halt did not finish in %ds -- forcing quit so the launcher "
+             "can relaunch and reopen the disks" % SHUTDOWN_BUDGET)
+        send(conn, "quit")
+
+
 try:
     os.unlink(sock_path)
 except OSError:
@@ -861,8 +1028,59 @@ for line in rx:
         msg = json.loads(line)
     except ValueError:
         continue
-    if msg.get("event") == "SHUTDOWN":
+    ev = msg.get("event")
+
+    if ev == "BLOCK_IO_ERROR":
+        d = msg.get("data", {})
+        note("BLOCK_IO_ERROR device=%s node=%s op=%s action=%s"
+             % (d.get("device", "?"), d.get("node-name", "?"),
+                d.get("operation", "?"), d.get("action", "?")))
+        continue
+
+    if ev == "STOP":
+        now = time.time()
+        with lock:
+            if escalated:
+                continue                         # already halting; ignore
+            pauses.append(now)
+            pauses[:] = [t for t in pauses if now - t < PAUSE_WINDOW]
+            n = len(pauses)
+        if n <= MAX_RESUMES:
+            note("VM PAUSED by werror/rerror (attempt %d/%d). The array is "
+                 "intact -- that is what the pause bought. Waiting %ds, then "
+                 "resuming." % (n, MAX_RESUMES, RESUME_BACKOFF))
+            time.sleep(RESUME_BACKOFF)
+            if send(conn, "cont"):
+                note("sent cont")
+        else:
+            with lock:
+                escalated = True
+            note("VM paused %d times in %d minutes -- the disks have almost "
+                 "certainly re-enumerated onto new /dev/diskN, so resuming "
+                 "cannot work (QEMU holds the old fds). Asking the guest to "
+                 "halt cleanly, then relaunching to reopen them by serial."
+                 % (n, PAUSE_WINDOW // 60))
+            send(conn, "cont")                   # guest must run to halt
+            time.sleep(2)
+            send(conn, "system_powerdown")
+            threading.Thread(target=force_quit_later, args=(conn,),
+                             daemon=True).start()
+        continue
+
+    if ev == "RESUME":
+        note("VM resumed -- recording continues.")
+        continue
+
+    if ev == "SHUTDOWN":
         reason = msg.get("data", {}).get("reason", "")
+        with lock:
+            if escalated:
+                # Our own recovery halt. Use a distinct token so the launcher
+                # loop cold-restarts instead of treating it as a user poweroff
+                # and exiting.
+                reason = "das-recovery"
+                note("guest halted for DAS recovery -- launcher will relaunch "
+                     "and re-resolve the disks by serial.")
         try:
             with open(out_path, "w") as f:
                 f.write(reason)
@@ -903,6 +1121,7 @@ PYEOF
         "${CDROM_ARGS[@]}" \
         -netdev "vmnet-bridged,id=net0,ifname=$EN" \
         -device "virtio-net-pci,netdev=net0,mac=$VM_MAC" \
+        "${SSD_ARGS[@]}" \
         "${CONSOLE_ARGS[@]}" \
         "${QMP_ARGS[@]}" \
         "${CONTROL_ARGS[@]}" || qemu_rc=$?
@@ -924,6 +1143,21 @@ PYEOF
             echo ">>> VM rebooted — cold-restarting QEMU."
             echo ""
             sleep 2                              # throttle a reboot loop
+            continue
+            ;;
+        das-recovery)
+            # The QMP reader halted the guest after repeated werror/rerror
+            # pauses -- the DAS almost certainly re-enumerated onto new
+            # /dev/diskN nodes and QEMU was holding the old fds. Restarting is
+            # the ONLY fix: the next pass through this loop re-runs
+            # resolve_disk_by_serial and reopens the real devices. md then
+            # reassembles from its bitmap. This is the recovery that worked by
+            # hand on 2026-08-03 -- clean 4/4 assemble, no rebuild.
+            echo ""
+            echo ">>> DAS fault recovery — cold-restarting QEMU so the disks"
+            echo "    are re-resolved by ATA serial."
+            echo ""
+            sleep 5                              # let the bus finish settling
             continue
             ;;
         guest-shutdown)
