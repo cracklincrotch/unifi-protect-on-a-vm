@@ -244,7 +244,13 @@ scan_arrays() {
 # Mount the data array at /volume1, enable swap, migrate + symlink /srv.
 mount_arrays() {
     if [ -n "$SWAP_MD" ]; then
-        swapon "$SWAP_MD" 2>/dev/null && log "swap on $SWAP_MD" \
+        # -p 1: this array is the RAID1 across the USB-attached DAS disks, and
+        # paging onto it is the load profile that preceded the June 2026 disk
+        # drops. Keep it only as a last-resort cushion, ALWAYS below the
+        # NVMe-backed swap on / (pinned pri=100 in /etc/fstab). Without an
+        # explicit priority the kernel assigns them by activation order, so the
+        # correct ordering would be incidental and could silently invert.
+        swapon -p 1 "$SWAP_MD" 2>/dev/null && log "swap on $SWAP_MD (pri 1)" \
             || log "note: swapon $SWAP_MD skipped (already on?)"
     fi
     [ -n "$DATA_MD" ] || { log "no data array found"; return 1; }

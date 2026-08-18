@@ -371,6 +371,20 @@ backing_is_ssd() {
 # We collect all failures before bailing out, so a user with seven disks
 # missing doesn't have to fix-and-retry seven times. The connected-disks
 # diagnostic is printed once at the end, listing everything we did find.
+# DISK_FDSET=1 REQUIRES A PATCHED QEMU. With a stock build the VM will NOT
+# start: macOS returns ENOTTY for fcntl(F_SETFL) on a raw disk device node
+# for every flags value, and QEMU treats that as fatal in two places --
+# qemu_dup_flags() (util/osdep.c), so fdset cannot open a device at all, and
+# qemu_set_blocking() (util/oslib-posix.c), so any SCM_RIGHTS message
+# carrying a device fd drops the monitor connection and takes add-fd with it.
+# Both are one-line "tolerate ENOTTY" fixes. Leave this at 0 unless QEMU_BIN
+# points at a build carrying them. The payoff, once it does: a re-enumerated
+# DAS can be reattached to a PAUSED guest via add-fd + blockdev-reopen, so
+# the array never goes dirty and there is no resync.
+DISK_FDSET="${DISK_FDSET:-0}"
+FDSET_EXEC="${FDSET_EXEC:-$(dirname "$0")/qemu-fdset-exec.py}"
+FDSET_SPECS=()
+FDSET_N=0
 DISK_ARGS=()
 MISSING_SERIALS=()
 MAP_ENTRIES=()
@@ -380,6 +394,17 @@ for serial in "${DISK_SERIALS[@]}"; do
         MISSING_SERIALS+=("$serial")
         continue
     fi
+
+    # QEMU refuses a whole disk that has ANY mounted volume on it: "If device
+    # /dev/diskN is mounted on the desktop, unmount it first before using it in
+    # QEMU". Each data disk now carries a small FAT marker partition (so macOS
+    # stops raising its "not readable ... Initialize" dialog per disk on every
+    # restart -- an Initialize misclick destroys an array member), and anything
+    # that mounts one would stop the VM from starting. /etc/fstab marks them
+    # noauto, and this is the belt to that braces: unmounting is a harmless
+    # no-op when nothing is mounted, and it also clears a volume someone mounted
+    # by hand.
+    diskutil unmountDisk "/dev/$bsd" >/dev/null 2>&1 || true
     echo "Disk: /dev/$bsd ($serial)"
     # werror=stop,rerror=stop is the most important option on this line.
     # Without it a transient USB fault is reported into the guest as a real
@@ -403,8 +428,29 @@ for serial in "${DISK_SERIALS[@]}"; do
     # A pause is otherwise SILENT: a frozen guest cannot run md-health-watch
     # or critical-services-watch. That is what the BLOCK_IO_ERROR / STOP
     # handling in the QMP event reader below exists for.
+    # DISK_FDSET=1 backs each DAS drive with an fdset instead of a bare path.
+    #
+    # A bare path is opened ONCE, at launch. When the DAS re-enumerates, that
+    # descriptor still refers to the device instance that went away, and is
+    # dead permanently -- which is why every "cont" after a bus event re-pauses
+    # within the same second, and why the only escape has been a cold restart
+    # that leaves the array dirty. Measured 2026-08-17: all four disks errored
+    # in the same second, and the resulting resync quoted 46 days.
+    #
+    # An fdset can be handed a FRESH descriptor at runtime with add-fd and the
+    # node repointed at it with blockdev-reopen, while the guest stays paused.
+    # A paused guest accrues no SCSI timeouts -- QEMU stops its clock -- so it
+    # can wait out the bus and resume onto live descriptors with the array
+    # still clean. DISK_FDSET=0 restores bare paths.
+    if [ "$DISK_FDSET" = "1" ]; then
+        FDSET_N=$((FDSET_N + 1))
+        FDSET_SPECS+=(--fd "$FDSET_N:/dev/$bsd")
+        _disk_file="/dev/fdset/$FDSET_N"
+    else
+        _disk_file="/dev/$bsd"
+    fi
     DISK_ARGS+=(
-        -drive "if=none,id=disk_$serial,file=/dev/$bsd,format=raw,cache=$DISK_CACHE,aio=$DISK_AIO,werror=stop,rerror=stop"
+        -drive "if=none,id=disk_$serial,file=$_disk_file,format=raw,cache=$DISK_CACHE,aio=$DISK_AIO,werror=stop,rerror=stop"
         -device "scsi-hd,bus=scsi0.0,drive=disk_$serial,serial=$serial"
     )
     # serial<TAB>kind<TAB>target — consumed by the optional smartctl proxy.
@@ -850,7 +896,14 @@ trap '
 # Resolve qemu to an absolute path: the sudo NOPASSWD rule is written with
 # an absolute path, so invoking qemu the same way makes the match reliable
 # regardless of sudo's secure_path.
-QEMU_BIN="$(command -v qemu-system-aarch64 || echo /opt/homebrew/bin/qemu-system-aarch64)"
+# Overridable so a bad QEMU upgrade can be rolled back without editing this
+# file under pressure: Homebrew keeps the previous build in the Cellar until
+# `brew cleanup` runs, so
+#   QEMU_BIN=/opt/homebrew/Cellar/qemu/<old>/bin/qemu-system-aarch64
+# in the environment (or the launchd plist) pins the VM to the known-good
+# binary. Unconditional assignment here meant an inherited value was
+# silently discarded.
+QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-aarch64 || echo /opt/homebrew/bin/qemu-system-aarch64)}"
 
 # discard=unmap for the OS disk too, when its qcow2 is on an SSD/NVMe —
 # the DB churn on /data keeps the image growing otherwise.
@@ -911,6 +964,25 @@ if [ -n "${SSD_IMAGE:-}" ]; then
         )
         echo "Built-in SSD image (/ssd1, discard: $SSD_DISCARD):"
         echo "  $SSD_IMAGE"
+        # /ssd1 holds the Protect DATABASE, and it was the one disk in the
+        # system with no health reporting at all. It is attached as a bare
+        # virtio drive, so it carries no serial for the smartctl proxy to
+        # resolve, and smartctl cannot probe virtio directly ("Unable to detect
+        # device type"). Giving it a serial would mean changing its device type
+        # to scsi-hd, which renames /dev/vdb and shifts PCI slots -- the class
+        # of change that has broken guest networking before. Registering it as
+        # an "image" entry instead lets the host resolve the qcow2 to the
+        # physical disk it lives on, so the guest sees THAT drive's real SMART:
+        # wear, temperature and power-on hours for the device the database
+        # actually sits on. The guest names it via
+        # SMARTCTL_PROXY_SERIAL_vdb=SSD1IMG in /etc/default/smartctl-proxy.
+        #
+        # Appended rather than pushed onto MAP_ENTRIES because the map is
+        # written further up, before this block runs.
+        if [ -n "${DISK_MAP:-}" ] && [ -f "$DISK_MAP" ]; then
+            grep -q '^SSD1IMG' "$DISK_MAP" 2>/dev/null \
+                || printf 'SSD1IMG\timage\t%s\n' "$SSD_IMAGE" >> "$DISK_MAP"
+        fi
     else
         # Not fatal: the VM still boots, /ssd1 falls back to a directory on
         # the OS disk, and Protect starts deleting events again once the
@@ -1106,7 +1178,14 @@ PYEOF
         || echo "WARNING: qmpevt socket not up yet — QEMU may abort" >&2
 
     qemu_rc=0
-    sudo "$QEMU_BIN" \
+    # With DISK_FDSET=1, QEMU is exec'd by the fdset wrapper, which opens the
+    # devices AFTER sudo -- sudo closes every descriptor >= 3, so anything
+    # opened before the privilege change never arrives.
+    QEMU_LAUNCH=()
+    if [ "$DISK_FDSET" = "1" ]; then
+        QEMU_LAUNCH=("$FDSET_EXEC" "${FDSET_SPECS[@]}" --)
+    fi
+    sudo ${QEMU_LAUNCH[@]+"${QEMU_LAUNCH[@]}"} "$QEMU_BIN" \
         -machine virt,accel=hvf \
         -cpu host \
         -smp "$VM_CPUS" \
