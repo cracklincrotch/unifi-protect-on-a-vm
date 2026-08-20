@@ -381,7 +381,7 @@ backing_is_ssd() {
 # points at a build carrying them. The payoff, once it does: a re-enumerated
 # DAS can be reattached to a PAUSED guest via add-fd + blockdev-reopen, so
 # the array never goes dirty and there is no resync.
-DISK_FDSET="${DISK_FDSET:-0}"
+DISK_FDSET="${DISK_FDSET:-1}"
 FDSET_EXEC="${FDSET_EXEC:-$(dirname "$0")/qemu-fdset-exec.py}"
 FDSET_SPECS=()
 FDSET_N=0
@@ -445,14 +445,28 @@ for serial in "${DISK_SERIALS[@]}"; do
     if [ "$DISK_FDSET" = "1" ]; then
         FDSET_N=$((FDSET_N + 1))
         FDSET_SPECS+=(--fd "$FDSET_N:/dev/$bsd")
-        _disk_file="/dev/fdset/$FDSET_N"
+        # Explicit -blockdev rather than -drive, for two load-bearing reasons:
+        #   * driver=host_device must be NAMED: QEMU guesses the plain-file
+        #     protocol for /dev/fdset/N and refuses it ("'file' driver
+        #     requires '/dev/fdset/N' to be a regular file").
+        #   * stable node-names: the whole point of fdset is that a
+        #     re-enumerated disk can be reattached at runtime with
+        #     add-fd + blockdev-reopen, and blockdev-reopen targets a node BY
+        #     NAME. Auto-generated names (#blockNNN) change every start -- the
+        #     same trap vm-snapshot.py has to work around.
+        # werror/rerror move to the -device line: they are guest-facing device
+        # policy, and -blockdev does not accept them.
+        DISK_ARGS+=(
+            -blockdev "driver=host_device,node-name=file_$serial,filename=/dev/fdset/$FDSET_N,aio=$DISK_AIO"
+            -blockdev "driver=raw,node-name=disk_$serial,file=file_$serial"
+            -device "scsi-hd,bus=scsi0.0,drive=disk_$serial,serial=$serial,werror=stop,rerror=stop"
+        )
     else
-        _disk_file="/dev/$bsd"
+        DISK_ARGS+=(
+            -drive "if=none,id=disk_$serial,file=/dev/$bsd,format=raw,cache=$DISK_CACHE,aio=$DISK_AIO,werror=stop,rerror=stop"
+            -device "scsi-hd,bus=scsi0.0,drive=disk_$serial,serial=$serial"
+        )
     fi
-    DISK_ARGS+=(
-        -drive "if=none,id=disk_$serial,file=$_disk_file,format=raw,cache=$DISK_CACHE,aio=$DISK_AIO,werror=stop,rerror=stop"
-        -device "scsi-hd,bus=scsi0.0,drive=disk_$serial,serial=$serial"
-    )
     # serial<TAB>kind<TAB>target — consumed by the optional smartctl proxy.
     MAP_ENTRIES+=("$serial"$'\t'"disk"$'\t'"/dev/$bsd")
 done
@@ -903,7 +917,7 @@ trap '
 # in the environment (or the launchd plist) pins the VM to the known-good
 # binary. Unconditional assignment here meant an inherited value was
 # silently discarded.
-QEMU_BIN="${QEMU_BIN:-$(command -v qemu-system-aarch64 || echo /opt/homebrew/bin/qemu-system-aarch64)}"
+QEMU_BIN="${QEMU_BIN:-/Users/donnie/qemu-patched/qemu-system-aarch64}"
 
 # discard=unmap for the OS disk too, when its qcow2 is on an SSD/NVMe —
 # the DB churn on /data keeps the image growing otherwise.
@@ -1001,11 +1015,13 @@ while :; do
     # is involved. Once QEMU connects, block until the SHUTDOWN event and
     # record its reason.
     (
-        python3 - "$QMP_EVENT_SOCKET" "$QMP_REASON_FILE" "$VM_IO_LOG" <<'PYEOF'
-import json, os, socket, sys, threading, time
+        python3 - "$QMP_EVENT_SOCKET" "$QMP_REASON_FILE" "$VM_IO_LOG" "$DISK_MAP" "$(dirname "$0")/qmp-das-reattach.py" <<'PYEOF'
+import json, os, socket, subprocess, sys, threading, time
 
 sock_path, out_path = sys.argv[1], sys.argv[2]
 io_log_path = sys.argv[3] if len(sys.argv) > 3 else os.devnull
+disk_map = sys.argv[4] if len(sys.argv) > 4 else ""
+reattach_helper = sys.argv[5] if len(sys.argv) > 5 else ""
 
 # --- DAS fault auto-recovery -------------------------------------------------
 #
@@ -1066,6 +1082,51 @@ def send(conn, cmd):
     except OSError as exc:
         note("QMP send %s failed: %s" % (cmd, exc))
         return False
+
+
+def reattach_or_halt(conn):
+    """Escalation: reattach the re-enumerated disks to the PAUSED guest.
+
+    The old escalation asked the guest to halt and relaunched. That can never
+    end cleanly -- marking md clean is itself a write to the disks that went
+    away, so every bus event cost a multi-day resync (five for five before the
+    fdset work; a sixth on 2026-08-20 while this was still unwired). With the
+    drives fdset-backed, qmp-das-reattach.py hands the still-paused QEMU fresh
+    descriptors for wherever the disks came back (add-fd + blockdev-reopen,
+    filename unchanged) and resumes it: no restart, no dirty array, no resync.
+
+    The helper waits up to its --window for the bus to return; the guest is
+    frozen and timeless meanwhile, so the wait is free. On any failure -- no
+    fdset nodes (DISK_FDSET=0), disks truly gone, stock unpatched QEMU -- fall
+    back to exactly the old halt+relaunch path.
+    """
+    global escalated
+    rc = 1
+    if disk_map and reattach_helper and os.path.exists(reattach_helper):
+        note("attempting live reattach via %s" % reattach_helper)
+        try:
+            with open(io_log_path, "a") as lg:
+                rc = subprocess.call(
+                    ["sudo", "-n", reattach_helper, "--map", disk_map,
+                     "--window", "600"],
+                    stdout=lg, stderr=lg)
+        except Exception as exc:
+            note("reattach helper did not run: %r" % exc)
+    else:
+        note("no reattach helper available (map=%r helper=%r)"
+             % (disk_map, reattach_helper))
+    if rc == 0:
+        note("LIVE REATTACH SUCCEEDED -- array clean, no resync, recording "
+             "resumed. Re-arming fault handling.")
+        with lock:
+            escalated = False
+            del pauses[:]
+        return
+    note("reattach failed (rc=%s) -- falling back to halt + relaunch" % rc)
+    send(conn, "cont")                       # guest must run to halt
+    time.sleep(2)
+    send(conn, "system_powerdown")
+    force_quit_later(conn)                   # already on a daemon thread
 
 
 def force_quit_later(conn):
@@ -1132,10 +1193,7 @@ for line in rx:
                  "cannot work (QEMU holds the old fds). Asking the guest to "
                  "halt cleanly, then relaunching to reopen them by serial."
                  % (n, PAUSE_WINDOW // 60))
-            send(conn, "cont")                   # guest must run to halt
-            time.sleep(2)
-            send(conn, "system_powerdown")
-            threading.Thread(target=force_quit_later, args=(conn,),
+            threading.Thread(target=reattach_or_halt, args=(conn,),
                              daemon=True).start()
         continue
 

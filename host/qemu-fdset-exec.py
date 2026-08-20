@@ -63,6 +63,30 @@ def main():
     else:
         sys.stderr.write("nofile soft=%s hard=%s (unchanged)\n" % (soft, hard))
 
+    def open_with_unmount(path, mode):
+        """Open a raw disk, force-unmounting its volumes if something races us.
+
+        /etc/fstab noauto SHOULD keep the marker partitions unmounted, but on
+        macOS 26 the msdos mounter runs through FSKit (mount flag `fskit`) and
+        demonstrably remounts them anyway -- all four were mounted seconds
+        after the launcher's own diskutil unmountDisk pass, and the open here
+        then fails EBUSY. Unmounting at the last instant, as root, in the same
+        process that opens the device, closes that race for good.
+        """
+        import errno
+        import subprocess
+        for attempt in range(3):
+            try:
+                return os.open(path, mode)
+            except OSError as exc:
+                if exc.errno != errno.EBUSY:
+                    raise
+                sys.stderr.write("%s busy; force-unmounting (attempt %d)\n"
+                                 % (path, attempt + 1))
+                subprocess.run(["diskutil", "unmountDisk", "force", path],
+                               capture_output=True)
+        return os.open(path, mode)          # final try; let EBUSY surface
+
     addfd = []
     for setid, path in pairs:
         # BOTH access modes go into the set. QEMU matches a descriptor by its
@@ -74,7 +98,7 @@ def main():
         # a later blockdev-reopen pick the mode it needs.
         for mode in (os.O_RDWR, os.O_RDONLY):
             try:
-                fd = os.open(path, mode)
+                fd = open_with_unmount(path, mode)
             except OSError as exc:
                 sys.exit("qemu-fdset-exec: cannot open %s: %s" % (path, exc))
             os.set_inheritable(fd, True)   # os.open sets O_CLOEXEC by default
