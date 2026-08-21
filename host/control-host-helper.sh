@@ -112,12 +112,19 @@ do_snapshot() {
     # NOPASSWD sudoers rule for snapshot.sh (see the README control-channel
     # section). sudo strips the environment, so PROTECT_ON_MAC_CONF would
     # be lost; pass the conf path as snapshot.sh's first argument instead.
-    if sudo -n "$SNAPSHOT_SH" "$CONF_FILE" list 2>/dev/null | grep -Fqw -- "$label"; then
+    # vm-snapshot.py, not snapshot.sh: snapshot.sh's bare qemu-img fails
+    # under sudo's stripped PATH (its list reported "image unreadable" on an
+    # image holding six snapshots, so this existence check was blind), and it
+    # only ever covered the root image. vm-snapshot.py snapshots EVERY qcow2
+    # image in one atomic job -- root and /ssd1, where the database lives --
+    # so a rollback actually rolls back. Needs no conf: it discovers the
+    # images from QEMU itself.
+    local snap="$SCRIPT_DIR/../vm-snapshot.py"
+    if sudo -n python3 "$snap" 2>/dev/null | grep -Fqw -- "$label"; then
         echo "snapshot '$label' already exists — left as-is"
         return 0
     fi
-    # </dev/null: snapshot.sh `create` is non-interactive.
-    sudo -n "$SNAPSHOT_SH" "$CONF_FILE" create "$label" </dev/null 2>&1
+    sudo -n python3 "$snap" "$label" </dev/null 2>&1
 }
 
 # smartctl <serial> <flags...> — delegate to the smartctl proxy helper,

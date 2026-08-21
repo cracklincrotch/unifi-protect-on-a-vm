@@ -93,6 +93,14 @@ QMP_SOCKET="${QMP_SOCKET:-/var/run/protect-vm.qmp.sock}"
 # Files snapshotted in the OFFLINE path. (The live path lets QEMU
 # snapshot every qcow2 it has open, which is the same set.)
 SNAPSHOT_FILES=("$VM_DISK")
+# /ssd1 is a qcow2 too, and since 2026-08-03 it is where the Protect DATABASE
+# lives. A restore that reverts VM_DISK but not SSD_IMAGE puts 7.1 binaries in
+# front of a database a newer Protect has already migrated -- a rollback that
+# does not roll back. Live snapshots (QEMU enumerates every qcow2 node) already
+# include it; the offline restore/delete path must too.
+if [ -n "${SSD_IMAGE:-}" ] && [ -f "$SSD_IMAGE" ]; then
+    SNAPSHOT_FILES+=("$SSD_IMAGE")
+fi
 for img in "${STORAGE_IMAGES[@]}"; do
     if [ -f "$img" ]; then
         SNAPSHOT_FILES+=("$img")
