@@ -43,6 +43,7 @@
 #   ./update-unifi.sh --all          # Sync OS + Protect + Access to stable
 #   ./update-unifi.sh --all-edge     # Sync OS + Protect + Access to edge
 #   ./update-unifi.sh --yes          # Skip confirmation prompts
+#   ./update-unifi.sh --verify       # Check the storage/shim invariants (read-only)
 #
 # Environment overrides (rarely needed):
 #   FW_URL              - Override UNVR firmware download URL
@@ -67,6 +68,10 @@ WORKDIR="/opt/unifi-update"
 PLATFORM="UNVR"
 DEB_PLATFORM="uos-deb11-arm64"
 
+# Directory this script lives in — used to locate sibling installers
+# (install-shims.sh, install-storage.sh) for post-sync-os shim reconciliation.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 PROTECT_CHANNEL="${PROTECT_CHANNEL:-release}"
 
 # Ubiquiti firmware API endpoints
@@ -76,23 +81,72 @@ FW_API="https://fw-update.ubnt.com/api/firmware-latest"
 ACTION="check"
 ASSUME_YES=0
 
-# Ubiquiti packages are held to prevent uncoordinated `apt-get upgrade`
-# runs from upgrading them outside this script. We unhold them before our
-# installs and re-hold afterward. The set is derived at run time by
-# ubiquiti_packages() (see HELPERS) — no static list to keep in sync.
+# Ubiquiti packages are version-PINNED (APT preferences, not dpkg-hold) to stop
+# uncoordinated `apt-get upgrade` runs from upgrading them outside this script.
+# dpkg-hold is avoided because `uos runnable current-version` reports a HELD
+# package as "not installed", which makes Protect's whole-system backup abort
+# ("Invalid version"); a pin keeps the dpkg status "install ok installed". We
+# drop the pin before our installs and rewrite it afterward. The set is derived
+# at run time by ubiquiti_packages() (see HELPERS) — no static list to sync.
+UBNT_PIN_FILE=/etc/apt/preferences.d/50-ubiquiti-pin
 
-# Unhold Ubiquiti packages so apt can upgrade them.
+# Write the APT pin for the current Ubiquiti package set.
+write_ubiquiti_pin() {
+    local pkgs
+    pkgs="$(ubiquiti_packages | tr '\n' ' ')"
+    [ -n "$pkgs" ] || return 0
+    {
+        echo "# Ubiquiti packages pinned so 'apt-get upgrade' won't bump them,"
+        echo "# while dpkg status stays 'install ok installed'. dpkg-hold would"
+        echo "# break 'uos runnable current-version' => Protect backup fails."
+        echo "# Managed by update-unifi.sh; regenerated on each run."
+        echo "Package: $pkgs"
+        echo "Pin: version *"
+        echo "Pin-Priority: -1"
+    } > "$UBNT_PIN_FILE"
+}
+
+# Unlock Ubiquiti packages so apt can (re)install them: drop the pin, and clear
+# any legacy dpkg-holds left by older installs. (Name kept for call sites.)
 unhold_ubiquiti_packages() {
     local pkgs
     pkgs="$(ubiquiti_packages)"
+    rm -f "$UBNT_PIN_FILE"
     [ -n "$pkgs" ] && apt-mark unhold $pkgs >/dev/null 2>&1 || true
 }
 
-# Re-hold Ubiquiti packages after installation.
+# Re-lock Ubiquiti packages after installation: rewrite the pin for the current
+# set. Does NOT dpkg-hold (that breaks the Protect backup via uos).
 hold_ubiquiti_packages() {
-    local pkgs
-    pkgs="$(ubiquiti_packages)"
-    [ -n "$pkgs" ] && apt-mark hold $pkgs >/dev/null 2>&1 || true
+    write_ubiquiti_pin
+}
+
+# Post-update storage/shim health check. Read-only; prints per-check OK/FAIL and
+# returns non-zero if anything failed. Run automatically at the end of a sync-os
+# and on demand via --verify. Defined here (before arg parsing) so both the
+# --verify early-exit and sync_os_packages can call it.
+verify_shims() {
+    local fail=0 sj=/usr/share/unifi-core/app/service.js
+    _ck() { if [ "$1" -eq 0 ]; then printf "    [ OK ] %s\n" "$2"; else printf "    [FAIL] %s\n" "$2"; fail=1; fi; }
+    set +e
+    [ "$(grep -cF '["disk","inspect"]' "$sj" 2>/dev/null)" = 1 ]; _ck $? "service.js Patch A (disk list)"
+    # Patch B (the 5.1.110-era drive-detect gate) is obsolete: 5.1.117
+    # refactored that code path away and unifi-core-storage-patch.sh no
+    # longer applies it. Its marker is correctly absent -- do not report that
+    # as a failure.
+    head -3 /usr/bin/ustorage 2>/dev/null | grep -q 'ustorage-vm'; _ck $? "/usr/bin/ustorage is the VM shim"
+    systemctl is-active --quiet ustated-shim.service;             _ck $? "ustated-shim.service active"
+    ss -ltn 2>/dev/null | grep -q '127\.0\.0\.1:11052';           _ck $? "ustated-shim listening on :11052"
+    { [ "$(systemctl is-enabled usd.service 2>/dev/null)" = masked ] &&
+      [ "$(systemctl is-enabled ustated.service 2>/dev/null)" = masked ]; }; _ck $? "usd + ustated masked"
+    grep -q 'UUUU' /proc/mdstat 2>/dev/null;                      _ck $? "md array [UUUU]"
+    [ -s /var/run/anonymous_device_id ];                          _ck $? "anonymous_device_id present"
+    printf "    versions: unifi-core=%s unifi-protect=%s node=%s\n" \
+        "$(dpkg-query -W -f='${Version}' unifi-core 2>/dev/null || echo '?')" \
+        "$(dpkg-query -W -f='${Version}' unifi-protect 2>/dev/null || echo '?')" \
+        "$(node --version 2>/dev/null || echo '?')"
+    set -e
+    return $fail
 }
 
 ###############################################################################
@@ -110,6 +164,7 @@ while [ $# -gt 0 ]; do
         --all)          ACTION="all"; PROTECT_CHANNEL="release" ;;
         --all-edge)     ACTION="all"; PROTECT_CHANNEL="beta" ;;
         --yes|-y)       ASSUME_YES=1 ;;
+        --verify)       ACTION="verify" ;;
         --help|-h)
             sed -n '2,32p' "$0" | sed 's/^# \?//'
             exit 0
@@ -130,6 +185,13 @@ done
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: Must run as root"
     exit 1
+fi
+
+# --verify is a local, read-only health check — no firmware/version query needed.
+if [ "$ACTION" = "verify" ]; then
+    echo "=== storage / shim verification ==="
+    verify_shims && { echo "All checks passed."; exit 0; } \
+                 || { echo "One or more checks FAILED — review above."; exit 1; }
 fi
 
 for cmd in wget jq curl; do
@@ -334,6 +396,43 @@ ai_deps_of_deb() {
     done
 }
 
+# Every OTHER dependency of the Protect deb that the running system does not
+# satisfy, as "<package> <op> <version>" lines (op/version absent if the
+# dependency is unversioned).
+#
+# Protect 7.2 moved its media stack out of the UniFi OS firmware and into
+# independently published debs: 7.2.105 depends on ms/msr/msp/mst >= 5.1.309,
+# ds = 7.2.14, msf >= 0.0.7 and a new protect-verify >= 0.9.1 -- none of
+# which firmware 5.1.25 carries, and all of which the firmware API publishes
+# as their own products on the deb platform. Fetching only the ai-feature-*
+# debs left apt with seven unmet dependencies and an aborted install
+# (2026-08-21). Resolve them the same way the AI packages are resolved.
+unmet_deps_of_deb() {
+    local deb="$1" depends entry name op ver have
+    depends="$(dpkg-deb -f "$deb" Depends 2>/dev/null)" || return 0
+    local IFS=','
+    for entry in $depends; do
+        entry="$(echo "$entry" | sed 's/|.*//')"        # first alternative
+        name="$(echo "$entry" | grep -oE '[a-z0-9][a-z0-9.+-]+' | head -1)"
+        [ -n "$name" ] || continue
+        case "$name" in ai-feature-*) continue ;; esac   # handled above
+        op="$(echo "$entry" | grep -oE '(>=|<=|>>|<<|=)' | head -1)"
+        ver="$(echo "$entry" | grep -oE '[0-9][0-9a-zA-Z.+~:-]*' | head -1)"
+        have="$(dpkg-query -W -f='${Version}' "$name" 2>/dev/null)"
+        if [ -n "$have" ]; then
+            if [ -z "$op" ]; then continue; fi
+            case "$op" in
+                ">=") dpkg --compare-versions "$have" ge "$ver" && continue ;;
+                "<=") dpkg --compare-versions "$have" le "$ver" && continue ;;
+                ">>") dpkg --compare-versions "$have" gt "$ver" && continue ;;
+                "<<") dpkg --compare-versions "$have" lt "$ver" && continue ;;
+                "=")  dpkg --compare-versions "$have" eq "$ver" && continue ;;
+            esac
+        fi
+        echo "$name $op $ver"
+    done
+}
+
 # Best-effort pre-flight: warn about any non-ai Protect dependency the
 # running system does not have installed. Pure warning — apt still
 # decides. Catches the common "ran --protect without --sync-os first"
@@ -360,10 +459,10 @@ preflight_protect_deps() {
     return 0
 }
 
-# The installed Ubiquiti packages to hold/unhold around our installs.
+# The installed Ubiquiti packages to pin/unpin around our installs.
 # Derived at run time: every installed package whose Maintainer is a
 # Ubiquiti address. Deriving it (rather than hardcoding a list) means a
-# newly introduced Ubiquiti package is held automatically and can't be
+# newly introduced Ubiquiti package is pinned automatically and can't be
 # silently upgraded by a routine `apt-get upgrade`.
 ubiquiti_packages() {
     dpkg-query -W -f='${Package} ${Maintainer}\n' 2>/dev/null \
@@ -431,7 +530,7 @@ echo ""
 
 if [ "$ACTION" = "check" ]; then
     echo "Run with --sync-os, --protect, --protect-edge, --all, or"
-    echo "--all-edge to apply updates."
+    echo "--all-edge to apply updates, or --verify to check storage health."
     exit 0
 fi
 
@@ -566,16 +665,43 @@ sync_os_packages() {
     echo ">>> Masking VM-incompatible services..."
     # These services expect real UNVR hardware and fail on VMs.
     # Mask (not just disable) because they're triggered as dependencies
-    # of other services like ustated, regardless of whether they're enabled.
-    for svc in usd usdbd rpsd uhwd sfp sfpd; do
+    # of other services regardless of whether they're enabled. ustated is
+    # masked too — the ustated-shim replaces it.
+    for svc in usd usdbd rpsd uhwd sfp sfpd ustated; do
         systemctl stop "${svc}.service" 2>/dev/null || true
         systemctl mask "${svc}.service" 2>/dev/null || true
     done
 
+    # --sync-os reinstalled the whole @ubnt set, which clobbers the VM shims
+    # (ubnt-tools/uled-ctrl/smartctl and the ustd-owned /usr/bin/ustorage) and
+    # reverts the service.js patches. Re-lay them from the sibling installers so
+    # the storage subsystem comes back correct on the same run — without this,
+    # the first post-sync boot serves an unpatched service.js + stock ustorage.
+    echo ""
+    echo ">>> Reconciling VM shims after the OS sync..."
+    if [ -f "$SCRIPT_DIR/install-shims.sh" ]; then
+        bash "$SCRIPT_DIR/install-shims.sh" || echo "    WARNING: install-shims.sh returned non-zero — check it"
+    else
+        echo "    WARNING: $SCRIPT_DIR/install-shims.sh not found — shims NOT reapplied"
+    fi
+    if [ -f "$SCRIPT_DIR/install-storage.sh" ]; then
+        # re-lays /usr/bin/ustorage, re-masks usd+ustated, re-enables the storage
+        # units, and re-applies service.js Patch A + Patch B via the boot healer.
+        bash "$SCRIPT_DIR/install-storage.sh" || echo "    WARNING: install-storage.sh returned non-zero — check it"
+    else
+        echo "    WARNING: $SCRIPT_DIR/install-storage.sh not found — ustorage/patches NOT reapplied"
+    fi
+
     echo ""
     echo ">>> Restarting services..."
     systemctl daemon-reload
-    systemctl start uid-agent ulp-go unifi-core ds ai-feature-controller unifi-protect 2>/dev/null || true
+    # unifi-core must restart so the freshly re-applied service.js patches load.
+    systemctl restart unifi-core 2>/dev/null || true
+    systemctl start uid-agent ulp-go ds ai-feature-controller unifi-protect 2>/dev/null || true
+
+    echo ""
+    echo ">>> Verifying the storage shims survived the OS sync..."
+    verify_shims || echo "    WARNING: verification reported issues — review before trusting storage."
 }
 
 ###############################################################################
@@ -642,6 +768,32 @@ upgrade_protect() {
     [ "${#ai_pkgs[@]}" -gt 0 ] \
         || echo "    Protect declares no ai-feature-* dependency."
 
+    # Anything else Protect needs that the system lacks: try the firmware
+    # API for it on the deb platform. What the API does not publish is left
+    # to apt, which then reports it plainly.
+    echo ""
+    echo ">>> Resolving Protect's other unmet dependencies..."
+    local dep_pkg dep_op dep_ver dep_info dep_url dep_ver_avail dep_sha
+    local n_dep=0
+    while read -r dep_pkg dep_op dep_ver; do
+        [ -n "$dep_pkg" ] || continue
+        echo "    Protect $PROTECT_VERSION needs: $dep_pkg $dep_op $dep_ver"
+        if ! dep_info="$(get_latest_version "$dep_pkg" "$PROTECT_CHANNEL" \
+                         "$DEB_PLATFORM" 2>/dev/null)" \
+           || [ "$(echo "$dep_info" | jq -r '.url')" = "null" ]; then
+            echo "    (not published on the firmware API -- leaving to apt)"
+            continue
+        fi
+        dep_ver_avail="$(echo "$dep_info" | jq -r '.version')"
+        dep_sha="$(echo "$dep_info" | jq -r '.sha256')"
+        dep_url="$(echo "$dep_info" | jq -r '.url')"
+        echo ">>> Downloading $dep_pkg ($dep_ver_avail)..."
+        download_verified "$dep_url" "$WORKDIR/${dep_pkg}.deb" "$dep_sha"
+        ai_debs+=("$WORKDIR/${dep_pkg}.deb")
+        n_dep=$((n_dep + 1))
+    done < <(unmet_deps_of_deb "$WORKDIR/unifi-protect.deb")
+    [ "$n_dep" -gt 0 ] || echo "    (none)"
+
     # Best-effort heads-up about non-ai deps the system lacks (node24,
     # unifi-core ...). Those are installed by --sync-os from the firmware.
     preflight_protect_deps "$WORKDIR/unifi-protect.deb"
@@ -653,10 +805,18 @@ upgrade_protect() {
     echo ""
     echo ">>> Installing..."
     unhold_ubiquiti_packages
-    apt-get install -y --allow-downgrades --no-install-recommends \
+    # If apt refuses, bring the OLD Protect straight back. On 2026-08-21 an
+    # unmet-dependency abort left the service stopped -- recording down --
+    # until someone noticed.
+    if ! apt-get install -y --allow-downgrades --no-install-recommends \
         -o Dpkg::Options::='--force-confdef' \
         -o Dpkg::Options::='--force-confold' \
-        "$WORKDIR/unifi-protect.deb" "${ai_debs[@]}"
+        "$WORKDIR/unifi-protect.deb" "${ai_debs[@]}"; then
+        echo "" >&2
+        echo "ERROR: install failed -- restarting the existing Protect." >&2
+        systemctl start unifi-protect "${ai_pkgs[@]}" 2>/dev/null || true
+        return 1
+    fi
     hold_ubiquiti_packages
 
     echo ""
