@@ -408,7 +408,16 @@ ai_deps_of_deb() {
 # debs left apt with seven unmet dependencies and an aborted install
 # (2026-08-21). Resolve them the same way the AI packages are resolved.
 unmet_deps_of_deb() {
-    local deb="$1" depends entry name op ver have
+    # This script runs under `set -euo pipefail`, and this function runs
+    # inside a process substitution, where an abort is SILENT. An unversioned
+    # dependency makes `grep | head` exit non-zero; pipefail turns that into
+    # a failed assignment; -e kills the function -- and the caller sees an
+    # empty list and reports "(none)". That is exactly how the 2026-08-21
+    # retry failed a second time. Relax the options for this function only
+    # (`local -` restores them on return) and guard every probe.
+    local -
+    set +e +o pipefail
+    local deb="$1" depends entry name op ver have cmp
     depends="$(dpkg-deb -f "$deb" Depends 2>/dev/null)" || return 0
     local IFS=','
     for entry in $depends; do
@@ -420,17 +429,18 @@ unmet_deps_of_deb() {
         ver="$(echo "$entry" | grep -oE '[0-9][0-9a-zA-Z.+~:-]*' | head -1)"
         have="$(dpkg-query -W -f='${Version}' "$name" 2>/dev/null)"
         if [ -n "$have" ]; then
-            if [ -z "$op" ]; then continue; fi
+            [ -n "$op" ] || continue                   # unversioned: satisfied
             case "$op" in
-                ">=") dpkg --compare-versions "$have" ge "$ver" && continue ;;
-                "<=") dpkg --compare-versions "$have" le "$ver" && continue ;;
-                ">>") dpkg --compare-versions "$have" gt "$ver" && continue ;;
-                "<<") dpkg --compare-versions "$have" lt "$ver" && continue ;;
-                "=")  dpkg --compare-versions "$have" eq "$ver" && continue ;;
+                ">=") cmp=ge ;; "<=") cmp=le ;; ">>") cmp=gt ;;
+                "<<") cmp=lt ;; "=")  cmp=eq ;; *) cmp=ge ;;
             esac
+            if dpkg --compare-versions "$have" "$cmp" "$ver"; then
+                continue
+            fi
         fi
         echo "$name $op $ver"
     done
+    return 0
 }
 
 # Best-effort pre-flight: warn about any non-ai Protect dependency the
