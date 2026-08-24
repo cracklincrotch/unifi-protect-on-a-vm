@@ -932,6 +932,44 @@ function main() {
   }
 
   const server = new grpc.Server();
+
+  // Accessory API (unifi.firmware.accessory.v1) — REQUIRED BY PROTECT 7.2.
+  //
+  // 7.2's recording-spaces sync BLOCKS until the PeripheralState stream has
+  // delivered at least one message: video.recording.log repeats "Skipping
+  // sync: peripheral state stream not yet received data" every 30s, no
+  // record output streams are ever opened (isRecord:true count stays 0), and
+  // NOTHING RECORDS -- while live view works perfectly, because live never
+  // touches the recorder. Found on 2026-08-24, the first guest BOOT on
+  // Protect 7.2.105: the 08-21 upgrade itself only restarted services, and
+  // the spaces cache survives restarts -- so recording worked for three days
+  // and then died silently on the first real boot.
+  //
+  // The honest answer for a VM is "one peripheral, zero storage-expansion
+  // shelves, and expansion unsupported". Protect only needs the stream to
+  // SPEAK; an empty expansions list is the truth here.
+  try {
+    const PBA = NM + '/@ubnt/unifi-protobufs/unifi/firmware/accessory/v1';
+    const acc_grpc = require(PBA + '/api_grpc_pb.js');
+    const acc_pb = require(PBA + '/api_pb.js');
+    const per_pb = require(PBA + '/peripheral_pb.js');
+    server.addService(acc_grpc.AccessoryAPIService, {
+      peripheralExpandabilityStatus: function (call, cb) {
+        const r = new acc_pb.PeripheralExpandabilityStatusResponse();
+        r.setSupportsStorageExpansion(false);
+        cb(null, r);
+      },
+      peripheralState: streamer('accessory/PeripheralState', function () {
+        const r = new acc_pb.PeripheralStateResponse();
+        r.setPeripheral(new per_pb.Peripheral());
+        return r;
+      }),
+    });
+    log('accessory v1 registered (PeripheralState + ExpandabilityStatus)');
+  } catch (e) {
+    log('accessory v1 NOT registered: ' + (e && e.message) +
+        ' — Protect 7.2+ will not record until it is');
+  }
   for (const v of versions) {
     server.addService(v.service, v.impl);
   }

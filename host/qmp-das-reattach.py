@@ -190,10 +190,18 @@ def main():
         for fd in stale:
             q.cmd("remove-fd", **{"fdset-id": sid, "fd": fd})
         log("%s: dropped stale fds %s" % (s, stale))
+        # Repeat EVERY option the node was created with. blockdev-reopen
+        # treats an omitted option as "reset to default" and refuses --
+        # "Option 'aio' cannot be reset to its default value" -- EVEN when the
+        # explicit value equals the default. That single omission made the
+        # first production engagement (2026-08-24 09:10) fall back to the
+        # cold restart this helper exists to avoid, three steps from the
+        # finish line: resolve, add-fd and remove-fd had all succeeded.
         q.cmd("blockdev-reopen", options=[{
             "driver": "host_device",
             "node-name": "file_" + s,
             "filename": "/dev/fdset/%d" % sid,
+            "aio": "threads",
             "auto-read-only": False,
         }])
         log("%s: blockdev-reopen OK (filename unchanged, descriptors new)" % s)
