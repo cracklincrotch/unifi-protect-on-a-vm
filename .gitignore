@@ -29,3 +29,4 @@ host/*.bak-*
 vm-data/pushover.conf
 vm-data/md-layout.map
 vm-data/das-detached.list
+vm-data/das-temps.csv
