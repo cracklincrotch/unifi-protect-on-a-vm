@@ -1016,7 +1016,7 @@ while :; do
     # record its reason.
     (
         python3 - "$QMP_EVENT_SOCKET" "$QMP_REASON_FILE" "$VM_IO_LOG" "$DISK_MAP" "$(dirname "$0")/qmp-das-reattach.py" <<'PYEOF'
-import json, os, socket, subprocess, sys, threading, time
+import json, os, socket, subprocess, sys, threading, time, urllib.request, urllib.parse
 
 sock_path, out_path = sys.argv[1], sys.argv[2]
 io_log_path = sys.argv[3] if len(sys.argv) > 3 else os.devnull
@@ -1084,6 +1084,165 @@ def send(conn, cmd):
         return False
 
 
+err_events = []          # (wall_time, serial) per BLOCK_IO_ERROR
+esc_hist = []            # wall_time of each escalation, for livelock detection
+
+
+def pushover(title, message, priority=0):
+    """Host-side paging. The guest watchers cannot fire while the guest is
+    paused -- during a DAS event the ONLY component awake is this reader, and
+    until now it only wrote to a log file (the 2026-08-20 event was found by
+    its side effects). Reads PUSHOVER_TOKEN/PUSHOVER_USER from
+    vm-data/pushover.conf; silently a no-op if the file is absent."""
+    conf = os.path.join(os.path.dirname(io_log_path), "pushover.conf")
+    tok = usr = None
+    try:
+        for ln in open(conf):
+            k, _, v = ln.strip().partition("=")
+            if k == "PUSHOVER_TOKEN":
+                tok = v.strip().strip('"')
+            elif k == "PUSHOVER_USER":
+                usr = v.strip().strip('"')
+    except OSError:
+        return
+    if not tok or not usr:
+        return
+    try:
+        data = urllib.parse.urlencode({
+            "token": tok, "user": usr, "title": title,
+            "message": message, "priority": priority}).encode()
+        urllib.request.urlopen(
+            "https://api.pushover.net/1/messages.json", data, timeout=10)
+    except Exception as exc:
+        note("pushover failed: %r" % exc)
+
+
+def recent_error_serials(window_s=90):
+    now = time.time()
+    return sorted({ser for (t, ser) in err_events if now - t <= window_s})
+
+
+def load_md_layout():
+    """vm-data/md-layout.map -> {array: {level, layout, nd, members:{serial:(role, healthy)}}}
+    Pushed by the guest every 5 minutes while healthy (md-layout-report.sh);
+    the guest is paused and unaskable when this gets read."""
+    path = os.path.join(os.path.dirname(io_log_path), "md-layout.map")
+    arrays = {}
+    try:
+        for ln in open(path):
+            f = ln.split()
+            if len(f) != 7:
+                continue
+            name, level, layout, nd, role, serial, state = f
+            a = arrays.setdefault(name, {"level": level,
+                                         "layout": int(layout or 0),
+                                         "nd": int(nd or 0), "members": {}})
+            healthy = "in_sync" in state or "active" in state
+            a["members"][serial] = (int(role) if role.isdigit() else -1, healthy)
+    except OSError:
+        return None
+    return arrays or None
+
+
+def load_detached():
+    path = os.path.join(os.path.dirname(disk_map), "das-detached.list")
+    try:
+        return {l.strip() for l in open(path) if l.strip()}
+    except OSError:
+        return set()
+
+
+def may_detach(serial):
+    """POLICY: may this disk be hot-unplugged with every md array on it still
+    functional? Computed per RAID level, conservatively -- an unknown level or
+    layout means NO, and so does a stale/missing map.
+
+      raid1        : >= 1 healthy member must remain
+      raid5        : tolerates exactly one loss -- so no PRIOR loss allowed
+      raid6        : tolerates two
+      raid10 near-2: the role^1 mirror partner must remain healthy
+      raid0/linear : never
+    """
+    arrays = load_md_layout()
+    if arrays is None:
+        note("may_detach(%s): no md-layout.map -- refusing" % serial)
+        return False
+    gone = load_detached()
+    for name, a in arrays.items():
+        if serial not in a["members"]:
+            continue
+        role, target_healthy = a["members"][serial]
+        lost = {s for s, (r, h) in a["members"].items()
+                if not h or s in gone}
+        if serial in lost:
+            continue                      # already contributes nothing
+        lost.add(serial)
+        lvl, nd = a["level"], a["nd"]
+        if lvl == "raid1":
+            ok = nd - len(lost) >= 1
+        elif lvl == "raid5":
+            ok = len(lost) <= 1
+        elif lvl == "raid6":
+            ok = len(lost) <= 2
+        elif lvl == "raid10" and a["layout"] == 258 and nd % 2 == 0:
+            partner = role ^ 1
+            ok = any(r == partner and h and s not in gone and s != serial
+                     for s, (r, h) in a["members"].items())
+        else:
+            ok = False                    # raid0/linear/unknown: never
+        note("may_detach(%s): %s %s role=%s lost=%s -> %s"
+             % (serial, name, lvl, role, sorted(lost), "YES" if ok else "NO"))
+        if not ok:
+            return False
+    return True
+
+
+def single_disk_recover(conn, serial, livelock):
+    """One disk is failing while the rest are healthy. Wait briefly for it to
+    come back (the 2026-08-20 single-disk drop DID return -- a fast reattach
+    beats a kicked member every time); if it stays gone and the policy allows,
+    hot-detach it so the guest runs DEGRADED and keeps recording. Returns True
+    if the situation was resolved either way."""
+    global escalated
+    wait_s = 5 if livelock else int(os.environ.get("DISK_SINGLE_WAIT_S", "120"))
+    allow = may_detach(serial)
+    argv = ["sudo", "-n", reattach_helper, "--map", disk_map,
+            "--serial", serial, "--window", str(wait_s)]
+    if allow:
+        argv.append("--detach")
+    note("single-disk fault on %s (livelock=%s): reattach window %ds, "
+         "detach %s" % (serial, livelock, wait_s,
+                        "ALLOWED" if allow else "refused by policy"))
+    try:
+        with open(io_log_path, "a") as lg:
+            rc = subprocess.call(argv, stdout=lg, stderr=lg)
+    except Exception as exc:
+        note("single-disk helper did not run: %r" % exc)
+        return False
+    if rc == 0:
+        note("disk %s reattached -- array clean, recording resumed" % serial)
+        pushover("UNVR DAS: disk recovered",
+                 "%s dropped and was reattached live; no resync." % serial)
+        with lock:
+            escalated = False
+            del pauses[:]
+        return True
+    if rc == 5:
+        note("disk %s DETACHED -- guest now runs DEGRADED and keeps "
+             "recording. Reinsert/replace the disk, then: "
+             "qmp-das-reattach.py --serial %s --readd" % (serial, serial))
+        pushover("UNVR DAS: running DEGRADED",
+                 "%s did not return in %ds and was hot-detached so recording "
+                 "continues. Array degraded until the disk is re-added."
+                 % (serial, wait_s), priority=1)
+        with lock:
+            escalated = False
+            del pauses[:]
+        return True
+    note("single-disk path failed (rc=%s) -- trying the full-bus path" % rc)
+    return False
+
+
 def reattach_or_halt(conn):
     """Escalation: reattach the re-enumerated disks to the PAUSED guest.
 
@@ -1101,9 +1260,21 @@ def reattach_or_halt(conn):
     back to exactly the old halt+relaunch path.
     """
     global escalated
+    now = time.time()
+    esc_hist.append(now)
+    livelock = len([t for t in esc_hist if now - t < 900]) >= 3
+    serials = recent_error_serials()
+    if (len(serials) == 1 and os.environ.get("DISK_DEGRADE", "1") != "0"
+            and disk_map and reattach_helper
+            and os.path.exists(reattach_helper)):
+        if single_disk_recover(conn, serials[0], livelock):
+            return
     rc = 1
     if disk_map and reattach_helper and os.path.exists(reattach_helper):
         note("attempting live reattach via %s" % reattach_helper)
+        pushover("UNVR DAS fault",
+                 "Bus event on %s; VM paused, attempting live reattach."
+                 % (", ".join(serials) or "multiple disks"))
         try:
             with open(io_log_path, "a") as lg:
                 rc = subprocess.call(
@@ -1118,11 +1289,15 @@ def reattach_or_halt(conn):
     if rc == 0:
         note("LIVE REATTACH SUCCEEDED -- array clean, no resync, recording "
              "resumed. Re-arming fault handling.")
+        pushover("UNVR DAS: recovered",
+                 "All disks reattached live; array clean, no resync.")
         with lock:
             escalated = False
             del pauses[:]
         return
     note("reattach failed (rc=%s) -- falling back to halt + relaunch" % rc)
+    pushover("UNVR DAS: reattach failed",
+             "Falling back to restart; expect a resync.", priority=1)
     send(conn, "cont")                       # guest must run to halt
     time.sleep(2)
     send(conn, "system_powerdown")
@@ -1165,6 +1340,10 @@ for line in rx:
 
     if ev == "BLOCK_IO_ERROR":
         d = msg.get("data", {})
+        _n = d.get("node-name") or d.get("device") or ""
+        if _n.startswith("disk_"):
+            err_events.append((time.time(), _n[5:]))
+            del err_events[:-400]
         note("BLOCK_IO_ERROR device=%s node=%s op=%s action=%s"
              % (d.get("device", "?"), d.get("node-name", "?"),
                 d.get("operation", "?"), d.get("action", "?")))

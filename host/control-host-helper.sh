@@ -140,6 +140,7 @@ dispatch() {
         ping)     do_ping ;;
         snapshot) do_snapshot "$@" ;;
         smartctl) do_smartctl "$@" ;;
+        store)    do_store "$@" ;;
         *)        echo "unknown verb: $verb"; return 64 ;;
     esac
 }
@@ -163,6 +164,35 @@ serve() {
         if out="$(dispatch "$verb" "${tok[@]:1}")"; then rc=0; else rc=$?; fi
         printf '%s\n%s %d\n' "$out" "$SENTINEL_PREFIX" "$rc"
     done
+}
+
+# store <name> <base64> — persist a small guest-produced state file host-side.
+#
+# The guest is the only place some facts exist -- above all the md layout:
+# which serial holds which ROLE of which ARRAY at which RAID LEVEL. The QMP
+# fault handler needs that to decide whether a failed disk may be detached
+# (guest keeps recording degraded) or must be waited for (detaching would
+# kill an array) -- and it needs it while the guest is PAUSED and unaskable.
+# So the guest pushes it here periodically while healthy.
+#
+# Only whitelisted names, only base64 payloads, bounded size, atomic write.
+do_store() {
+    local name="${1:-}" b64="${2:-}"
+    case "$name" in
+        md-layout) ;;
+        *) echo "store: unknown name '$name'"; return 64 ;;
+    esac
+    [ -n "$b64" ] || { echo "store: missing payload"; return 64; }
+    [ "${#b64}" -le 8192 ] || { echo "store: payload too large"; return 64; }
+    local out="$VM_DATA_DIR/${name}.map" tmp
+    tmp="$out.tmp.$$"
+    if printf '%s' "$b64" | base64 -d > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$out"
+        echo "store: $name saved ($(wc -c < "$out" | tr -d ' ') bytes)"
+    else
+        rm -f "$tmp"
+        echo "store: base64 decode failed"; return 64
+    fi
 }
 
 ###############################################################################

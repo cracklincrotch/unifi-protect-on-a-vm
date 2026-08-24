@@ -122,6 +122,16 @@ def main():
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--window", type=int, default=600,
                     help="seconds to keep waiting for the disks to return")
+    ap.add_argument("--serial", action="append", default=[],
+                    help="operate on this serial only (repeatable); default all")
+    ap.add_argument("--detach", action="store_true",
+                    help="single --serial mode: if the disk does not return "
+                         "within the window, hot-unplug its scsi-hd so the "
+                         "guest md kicks the member and runs DEGRADED. Exit 5.")
+    ap.add_argument("--readd", action="store_true",
+                    help="single --serial mode: after reattaching descriptors, "
+                         "device_add the scsi-hd back (for a disk detached "
+                         "earlier); the guest re-adds it to md")
     a = ap.parse_args()
 
     serials = []
@@ -133,12 +143,24 @@ def main():
     if not serials:
         log("no raw disks in %s" % a.map)
         return 2
+    if a.serial:
+        unknown = [x for x in a.serial if x not in serials]
+        if unknown:
+            log("serial(s) not in the map: %s" % " ".join(unknown))
+            return 2
+        serials = a.serial
+    if (a.detach or a.readd) and len(serials) != 1:
+        log("--detach/--readd need exactly one --serial")
+        return 2
+    detached_list = os.path.join(os.path.dirname(a.map), "das-detached.list")
     log("raw disks: %s" % " ".join(serials))
 
     deadline = time.time() + a.window
     mapping = resolve_all(serials)
     while mapping is None:
         if time.time() > deadline:
+            if a.detach:
+                return do_detach(a, serials[0], detached_list)
             log("disks did not all return within %ds" % a.window)
             return 3
         log("waiting for the bus (found %d of %d)..."
@@ -206,9 +228,74 @@ def main():
         }])
         log("%s: blockdev-reopen OK (filename unchanged, descriptors new)" % s)
 
+    if a.readd:
+        # The blockdev nodes survived the earlier device_del; only the guest-
+        # visible scsi-hd is missing. Recreate it against the (now fresh)
+        # fdset-backed node -- werror/rerror MUST be respecified, they are
+        # device properties and this is a new device. The guest sees a hotplug
+        # arrival; re-adding the member to md is a guest-side step:
+        #     mdadm /dev/mdX --re-add /dev/sdYN   (bitmap makes it a catch-up)
+        sser = serials[0]
+        q.cmd("device_add", driver="scsi-hd", bus="scsi0.0",
+              drive="disk_" + sser, serial=sser, id="hd_" + sser,
+              werror="stop", rerror="stop")
+        log("%s: device_add OK -- guest sees the disk again; run mdadm "
+            "--re-add in the guest (or reboot) to rejoin the array" % sser)
+        try:
+            lines = [l for l in open(detached_list).read().split("\n")
+                     if l.strip() and l.strip() != sser]
+            open(detached_list, "w").write("\n".join(lines) + ("\n" if lines else ""))
+        except OSError:
+            pass
+
     q.cmd("cont")
     log("cont sent -- suspended writes now retry against live descriptors")
     return 0
+
+
+def do_detach(a, serial, detached_list):
+    """Hot-unplug one absent disk so the guest can run DEGRADED.
+
+    The pause bought array integrity; this spends a little of it for
+    availability, by POLICY (the caller computed that every md array on this
+    disk survives the loss). device_del of a scsi-hd under virtio-scsi is
+    immediate -- no guest ACK needed -- and cancels the werror-stopped
+    request; on cont the guest gets the hotplug removal, md kicks the member,
+    and recording continues on the survivors. The blockdev nodes and fdset
+    stay behind so --readd can restore the disk later.
+
+    Anonymous devices are fine: device_del accepts a QOM path, found by
+    matching the scsi-hd whose drive property is disk_<SERIAL>.
+    """
+    q = Qmp(a.qmp)
+    path = None
+    for e in q.cmd("qom-list", path="/machine/peripheral-anon"):
+        if not e["name"].startswith("device["):
+            continue
+        p = "/machine/peripheral-anon/" + e["name"]
+        try:
+            if q.cmd("qom-get", path=p, property="type") != "scsi-hd":
+                continue
+            if q.cmd("qom-get", path=p, property="drive") == "disk_" + serial:
+                path = p
+                break
+        except RuntimeError:
+            continue
+    if path is None:
+        log("%s: no attached scsi-hd found (already detached?)" % serial)
+        return 3
+    q.cmd("device_del", id=path)
+    log("%s: device_del sent (%s)" % (serial, path))
+    q.cmd("cont")
+    log("%s: cont -- guest will kick the member and run DEGRADED. "
+        "Restore later with: qmp-das-reattach.py --map %s --serial %s --readd"
+        % (serial, a.map, serial))
+    try:
+        with open(detached_list, "a") as f:
+            f.write(serial + "\n")
+    except OSError:
+        pass
+    return 5
 
 
 if __name__ == "__main__":
