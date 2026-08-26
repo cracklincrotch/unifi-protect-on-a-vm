@@ -68,6 +68,23 @@ parent=$(lsblk -ndo PKNAME "$dev" 2>/dev/null | head -n1)
 
 # Serial is the map key the host uses to find the backing device.
 serial=$(lsblk -ndo SERIAL "$lookup" 2>/dev/null | head -n1 | tr -d '[:space:]')
+
+# Some disks reach the guest with NO serial: the built-in SSD image is
+# attached as `-drive if=virtio,...` (the legacy form, which carries no
+# serial=) so /dev/vdb reports an empty SERIAL and used to fall straight
+# through to the real smartctl -- which cannot read a virtio device at all
+# ("Unable to detect device type"), leaving Protect's Bay 5 blank.
+# Allow an explicit override per kernel name, e.g. in
+# /etc/default/smartctl-proxy:
+#     SMARTCTL_PROXY_SERIAL_vdb=SSD1IMG
+# The value must match a key in the host's disk-serial.map, where
+# start-protect-vm.sh records `SSD1IMG image <path-to-ssd1.qcow2>`.
+# Regressed 2026-08-24 when the wrapper was reinstalled; restored 08-26.
+if [ -z "$serial" ]; then
+    _kname=$(basename "$lookup")
+    _ovr="SMARTCTL_PROXY_SERIAL_${_kname}"
+    serial="${!_ovr:-}"
+fi
 [ -n "$serial" ] || fallback "$@"
 
 # The VM disk's own capacity — used as the synthesized disk's identity.
