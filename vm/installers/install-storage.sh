@@ -118,6 +118,7 @@ say "applying unifi-core service.js patch"
 # array when the operator completes the storage wizard.
 systemctl enable provision-storage.service \
 systemctl enable --now md-layout-report.timer 2>/dev/null || true
+systemctl enable --now vm-resume-watch.service 2>/dev/null || true
                  postgres-vda.service \
                  ustated-shim.service \
                  unifi-core-storage-patch.service \
