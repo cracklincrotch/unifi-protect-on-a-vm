@@ -1277,9 +1277,21 @@ def reattach_or_halt(conn):
                  % (", ".join(serials) or "multiple disks"))
         try:
             with open(io_log_path, "a") as lg:
+                # WAIT LONG. A paused guest loses NOTHING -- the vCPU is
+                # frozen, dirty pages sit intact in RAM, the array stays
+                # clean, and no SCSI timeouts accrue. Force-quitting loses
+                # ~24s of dirty pages, may leave the array needing a resync,
+                # and then the launcher REFUSES TO START on a missing serial
+                # anyway -- so the VM is down either way. Force-quit buys
+                # nothing when the disks are gone, and costs everything when
+                # they were about to come back. Between 2026-08-17 and 08-26
+                # this path force-quit 4 times and reattached live 0 times.
+                # Recovery after a long pause is handled in the guest by
+                # vm-resume-watch.service (RTC-drift detection -> clock step
+                # -> media-stack restart -> verify recording actually resumed).
                 rc = subprocess.call(
                     ["sudo", "-n", reattach_helper, "--map", disk_map,
-                     "--window", "600"],
+                     "--window", os.environ.get("DISK_WAIT_S", "3600")],
                     stdout=lg, stderr=lg)
         except Exception as exc:
             note("reattach helper did not run: %r" % exc)
@@ -1295,9 +1307,14 @@ def reattach_or_halt(conn):
             escalated = False
             del pauses[:]
         return
-    note("reattach failed (rc=%s) -- falling back to halt + relaunch" % rc)
-    pushover("UNVR DAS: reattach failed",
-             "Falling back to restart; expect a resync.", priority=1)
+    note("reattach failed (rc=%s) after the full wait -- the disks did not "
+         "come back. Falling back to halt + relaunch; note the launcher will "
+         "refuse to start while a serial is missing, so the VM stays down "
+         "until the enclosure is restored." % rc)
+    pushover("UNVR DAS: disks did not return",
+             "Waited the full window and the disks never came back. The VM is "
+             "being halted and will stay down until the enclosure is restored.",
+             priority=1)
     send(conn, "cont")                       # guest must run to halt
     time.sleep(2)
     send(conn, "system_powerdown")
