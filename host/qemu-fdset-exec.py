@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Open block devices as root, then exec QEMU with them as /dev/fdset members.
 
-    qemu-fdset-exec.py --fd <setid>:<path> [--fd ...] -- <qemu> <args...>
+    qemu-fdset-exec.py --fd <setid>:<path> [--nocache-fd <setid>:<path>] ... -- <qemu> <args...>
+
+--nocache-fd is --fd plus fcntl(F_NOCACHE) on the descriptors: for regular
+files (the qcow2 images) it keeps guest disk pages out of the host's buffer
+cache. Per-descriptor, inherited across the exec below.
 
 Why this exists: the launcher runs as an unprivileged user and reaches root via
 sudo, and sudo closes every descriptor >= 3. So a descriptor opened before the
@@ -20,6 +24,7 @@ the array still clean.
 Fds are marked inheritable explicitly; Python sets O_CLOEXEC on os.open by
 default, which would silently reproduce the very problem this exists to solve.
 """
+import fcntl
 import os
 import resource
 import sys
@@ -37,14 +42,14 @@ def main():
     pairs = []
     i = 0
     while i < len(spec):
-        if spec[i] != "--fd":
+        if spec[i] not in ("--fd", "--nocache-fd"):
             sys.exit("qemu-fdset-exec: unexpected argument %r" % spec[i])
         if i + 1 >= len(spec):
-            sys.exit("qemu-fdset-exec: --fd needs <setid>:<path>")
+            sys.exit("qemu-fdset-exec: %s needs <setid>:<path>" % spec[i])
         setid, _, path = spec[i + 1].partition(":")
         if not setid.isdigit() or not path:
-            sys.exit("qemu-fdset-exec: bad --fd value %r" % spec[i + 1])
-        pairs.append((int(setid), path))
+            sys.exit("qemu-fdset-exec: bad %s value %r" % (spec[i], spec[i + 1]))
+        pairs.append((int(setid), path, spec[i] == "--nocache-fd"))
         i += 2
 
     # QEMU dup()s every descriptor registered with -add-fd, so the process
@@ -88,7 +93,7 @@ def main():
         return os.open(path, mode)          # final try; let EBUSY surface
 
     addfd = []
-    for setid, path in pairs:
+    for setid, path, nocache in pairs:
         # BOTH access modes go into the set. QEMU matches a descriptor by its
         # access mode rather than accepting a more permissive one, so an
         # O_RDWR-only set is rejected with
@@ -101,9 +106,23 @@ def main():
                 fd = open_with_unmount(path, mode)
             except OSError as exc:
                 sys.exit("qemu-fdset-exec: cannot open %s: %s" % (path, exc))
+            if nocache:
+                # Regular files only: keep guest disk pages out of the host's
+                # unified buffer cache -- the guest has its own. The flag lives
+                # on the open file description, so it survives QEMU's dup() and
+                # F_GETFL/F_SETFL round-trip (verified 2026-09-06).
+                try:
+                    fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+                except OSError as exc:
+                    # Degrade to the cached path rather than dying before the
+                    # exec: a wrapper failure here would put launchd into a
+                    # 30 s relaunch loop with the guest down.
+                    sys.stderr.write("F_NOCACHE on %s failed (%s); continuing cached\n" % (path, exc))
+                    nocache = False
             os.set_inheritable(fd, True)   # os.open sets O_CLOEXEC by default
             addfd += ["-add-fd", "fd=%d,set=%d,opaque=%s" % (fd, setid, path)]
-        sys.stderr.write("fdset %d <- %s (rw+ro)\n" % (setid, path))
+        sys.stderr.write("fdset %d <- %s (rw+ro%s)\n"
+                         % (setid, path, ", nocache" if nocache else ""))
 
     # Prove every descriptor is still open and inheritable at the moment of
     # exec. If QEMU then says it cannot dup one of these, the descriptor was

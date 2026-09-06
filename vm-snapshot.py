@@ -41,12 +41,21 @@ def qcow2_nodes(cmd):
     vmstate (RAM) rides in the root image. Raw DAS passthrough and pflash are
     not qcow2 and are correctly left out.
     """
+    # The images reach QEMU through fdsets (opened uncached on the host by
+    # qemu-fdset-exec.py), so a node's "file" reads /dev/fdset/N; the wrapper
+    # records the real path as each fdset's opaque string.
+    fdpath = {}
+    for st in cmd("query-fdsets").get("return", []):
+        for e in st.get("fds", []):
+            if e.get("opaque"):
+                fdpath["/dev/fdset/%d" % st["fdset-id"]] = e["opaque"]
     root, nodes, files = None, [], {}
     for n in cmd("query-named-block-nodes").get("return", []):
         if n.get("drv") != "qcow2":
             continue
-        nodes.append(n["node-name"]); files[n["node-name"]] = n.get("file", "")
-        if n.get("file", "").endswith("protect.qcow2"):
+        f = fdpath.get(n.get("file", ""), n.get("file", ""))
+        nodes.append(n["node-name"]); files[n["node-name"]] = f
+        if f.endswith("protect.qcow2"):
             root = n["node-name"]
     if not root:
         sys.exit("could not find the root qcow2 block node")

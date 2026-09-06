@@ -1004,13 +1004,50 @@ backing_is_ssd "$VM_DISK" && VM_DISK_DISCARD=unmap
 # way on 2026-08-07: the drive went in ahead of virtio-scsi-pci and the VM
 # came up deaf. Recovery required an ACPI shutdown over QMP, because killing
 # QEMU on a live guest risks an md resync measured in days.
+###############################################################################
+# qcow2 images: through the fdset wrapper, uncached on the host
+###############################################################################
+# The OS and SSD images are regular files, so QEMU's read()/write() on them go
+# through the macOS unified buffer cache and every guest disk page is cached
+# TWICE: once in the guest's page cache, once in the host's file cache -- on a
+# 16 GB host that already runs its compressor to hold the VMs. F_NOCACHE on the
+# descriptor tells XNU not to retain those pages (the guest keeps its own).
+# It is a per-descriptor flag, works only on regular files (specfs ignores it
+# on /dev/diskN, which is why the DAS uses /dev/rdiskN instead), and survives
+# dup/exec/F_SETFL -- so the images ride the same wrapper as the DAS: it opens
+# them, sets the flag, and the unchanged -drive lines get /dev/fdset/N (same
+# ids, same command-line position, same PCI order, same guest device names).
+# vm-snapshot.py resolves /dev/fdset/N back to the path via query-fdsets.
+# IMG_NOCACHE=0 restores the plain paths. Verified 2026-09-06.
+#
+# Two things an fdset-backed image cannot do, neither of which anything here
+# does: (1) a blockdev-reopen to read-only cannot be reopened read-write again
+# (the fdset keeps the old RDWR description open, and its OFD lock bytes block
+# the "write" lock) -- restart instead; (2) STORAGE_IMAGES (image-backed array
+# members, IMG_ARGS below) are deliberately left on plain paths.
+IMG_NOCACHE="${IMG_NOCACHE:-1}"
+VM_DISK_FILE="$VM_DISK"
+SSD_IMAGE_FILE="${SSD_IMAGE:-}"
+if [ "$DISK_FDSET" = "1" ] && [ "$IMG_NOCACHE" = "1" ]; then
+    FDSET_N=$((FDSET_N + 1))
+    FDSET_SPECS+=(--nocache-fd "$FDSET_N:$VM_DISK")
+    VM_DISK_FILE="/dev/fdset/$FDSET_N"
+    if [ -n "${SSD_IMAGE:-}" ] && [ -f "$SSD_IMAGE" ]; then
+        FDSET_N=$((FDSET_N + 1))
+        FDSET_SPECS+=(--nocache-fd "$FDSET_N:$SSD_IMAGE")
+        SSD_IMAGE_FILE="/dev/fdset/$FDSET_N"
+    fi
+    echo "qcow2 images via fdset + F_NOCACHE: $VM_DISK -> $VM_DISK_FILE"
+    [ "$SSD_IMAGE_FILE" != "${SSD_IMAGE:-}" ] && echo "                                     $SSD_IMAGE -> $SSD_IMAGE_FILE"
+fi
+
 SSD_ARGS=()
 if [ -n "${SSD_IMAGE:-}" ]; then
     if [ -f "$SSD_IMAGE" ]; then
         SSD_DISCARD=ignore
         backing_is_ssd "$SSD_IMAGE" && SSD_DISCARD=unmap
         SSD_ARGS=(
-            -drive "if=virtio,file=$SSD_IMAGE,format=qcow2,discard=$SSD_DISCARD"
+            -drive "if=virtio,file=$SSD_IMAGE_FILE,format=qcow2,discard=$SSD_DISCARD"
         )
         echo "Built-in SSD image (/ssd1, discard: $SSD_DISCARD):"
         echo "  $SSD_IMAGE"
@@ -1483,7 +1520,7 @@ PYEOF
         -no-reboot \
         -drive if=pflash,format=raw,unit=0,file="$EFI_CODE",readonly=on \
         -drive if=pflash,format=raw,unit=1,file="$EFI_VARS" \
-        -drive if=virtio,file="$VM_DISK",format=qcow2,discard="$VM_DISK_DISCARD" \
+        -drive if=virtio,file="$VM_DISK_FILE",format=qcow2,discard="$VM_DISK_DISCARD" \
         -object iothread,id=iothread0 \
         -device virtio-scsi-pci,id=scsi0,iothread=iothread0,num_queues=4 \
         "${DISK_ARGS[@]}" \
