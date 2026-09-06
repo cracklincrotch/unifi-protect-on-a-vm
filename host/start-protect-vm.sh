@@ -444,7 +444,17 @@ for serial in "${DISK_SERIALS[@]}"; do
     # still clean. DISK_FDSET=0 restores bare paths.
     if [ "$DISK_FDSET" = "1" ]; then
         FDSET_N=$((FDSET_N + 1))
-        FDSET_SPECS+=(--fd "$FDSET_N:/dev/$bsd")
+        # RAW character node, not the buffered block node. /dev/diskN routes
+        # every IO through the macOS unified buffer cache in page-sized
+        # (16 KB on Apple Silicon) chunks: measured 2026-09-06, the guest
+        # issued 176 KB average writes and the host executed them as 16.00 KB/t
+        # at ~1000 IOPS -- an ~11x IOPS inflation, double-caching every block
+        # (guest page cache + host buffer cache), ~60% guest iowait, and a
+        # 22 TB scrub crawling at 3.5 MB/s. /dev/rdiskN bypasses the cache:
+        # same disk measured 217 KB/t at 115 MB/s vs 16 KB/t at 75 MB/s.
+        # diskutil and the smartctl map keep the block node; only the fd
+        # handed to QEMU changes.
+        FDSET_SPECS+=(--fd "$FDSET_N:/dev/r$bsd")
         # Explicit -blockdev rather than -drive, for two load-bearing reasons:
         #   * driver=host_device must be NAMED: QEMU guesses the plain-file
         #     protocol for /dev/fdset/N and refuses it ("'file' driver
@@ -821,6 +831,32 @@ echo "Starting VM..."
 #       Adds a virtio-scsi controller. We use this instead of plain
 #       virtio-blk for the data disks because virtio-scsi supports
 #       serial numbers (which we use to identify disks inside the VM).
+#
+#       DEDICATED IOTHREAD (2026-08-30). Without one, block requests for all
+#       four DAS disks are serviced on QEMU's main loop, which also runs the
+#       monitor, timers and netdev. On a host carrying 39 ffmpeg processes that
+#       thread is not scheduled promptly and the guest sees multi-second I/O
+#       stalls: /proc/pressure/io measured full=60 (every runnable task blocked
+#       on I/O 60% of the time) and Protect logged 266 [recurrenceSlow] gaps
+#       across 47 minutes, up to 19 cameras gapping in the same minute.
+#
+#       ONE iothread is sufficient: the array runs ~272 IOPS, far below what a
+#       single iothread saturates. The problem was main-loop serialisation, not
+#       iothread throughput. num_queues=4 matches VM_CPUS so the guest's blk-mq
+#       gets a queue per vCPU.
+#
+#       DO NOT use the JSON -device form for multiple iothreads
+#       (iothread-vq-mapping). It parses and QEMU starts, but the controller is
+#       realised in a phase where bus scsi0.0 does not exist yet for the
+#       following keyval `-device scsi-hd,bus=scsi0.0`, which dies with
+#       "Bus 'scsi0.0' not found". That took the VM down on 2026-08-30; the
+#       dotted keyval form is rejected outright. Test any change WITH a scsi-hd
+#       attached, not just the controller alone.
+#
+#       Topology is unchanged -- one controller, still bus=scsi0.0 -- so
+#       DISK_ARGS/IMG_ARGS and the fdset node names are untouched. The DAS
+#       add-fd/blockdev-reopen reattach should be re-validated: block nodes now
+#       live in an iothread AioContext.
 #
 #   "${DISK_ARGS[@]}" "${IMG_ARGS[@]}"
 #       The dynamically-built disk arguments from above. Each raw disk
@@ -1448,7 +1484,8 @@ PYEOF
         -drive if=pflash,format=raw,unit=0,file="$EFI_CODE",readonly=on \
         -drive if=pflash,format=raw,unit=1,file="$EFI_VARS" \
         -drive if=virtio,file="$VM_DISK",format=qcow2,discard="$VM_DISK_DISCARD" \
-        -device virtio-scsi-pci,id=scsi0 \
+        -object iothread,id=iothread0 \
+        -device virtio-scsi-pci,id=scsi0,iothread=iothread0,num_queues=4 \
         "${DISK_ARGS[@]}" \
         "${IMG_ARGS[@]}" \
         "${CDROM_ARGS[@]}" \

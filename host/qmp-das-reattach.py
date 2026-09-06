@@ -202,7 +202,10 @@ def main():
                        capture_output=True)
         stale = fdsets.get(sid, [])
         for mode, label in ((os.O_RDWR, "rw"), (os.O_RDONLY, "ro")):
-            fd = os.open(dev, mode)
+            # Raw node, matching the launcher: reopening on the buffered
+            # /dev/diskN after a bus fault would silently put that one
+            # drive back through the 16 KB page cache path.
+            fd = os.open(dev.replace('/dev/disk', '/dev/rdisk', 1), mode)
             try:
                 r = q.cmd("add-fd", scm_fd=fd, **{"fdset-id": sid,
                                                   "opaque": dev + "-" + label})
