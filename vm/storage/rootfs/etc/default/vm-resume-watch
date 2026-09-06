@@ -1,0 +1,6 @@
+# vm-resume-watch settings.
+# OBSERVE=1 -> detect and log only (still steps the clock, which is safe).
+# Set OBSERVE=0 once we have seen the RTC advance through a real pause.
+OBSERVE=1
+THRESHOLD=30
+INTERVAL=15

@@ -17,30 +17,13 @@
 #   - a raw-passthrough disk -> the physical disk itself;
 #   - a qcow2 image disk     -> the host disk the image file lives on.
 #
-# TWO MODES, decided by whether the host device IS the VM disk:
-#
-# PASSTHROUGH (raw-passthrough disks — host serial == VM disk serial):
-#   the caller's own flags are forwarded to the host smartctl and its
-#   output comes back VERBATIM — the full report of the real drive
-#   (all vendor attributes, self-test logs, SCT temperature history,
-#   PHY event counters, ...), exactly as `smartctl -x` prints it on the
-#   host. The identities already agree, so nothing needs rewriting.
-#   Note the host runs its own smartctl (7.5 there today), so output
-#   reflects the host build, not the guest's.
-#
-# NORMALIZE (image-backed disks — the host device is the medium the
-#   image lives on, a different disk entirely): the host is asked for
-#   `--json -x` and the answer is normalized into a synthetic smartctl
-#   ATA report carrying THIS VM disk's identity (its own serial and
-#   capacity) populated with the real health signals — overall health,
-#   temperature, power-on hours, power cycles, reallocated/error counts.
-#   Protect's `ustorage` consumes `smartctl --json`; a human runs
-#   `smartctl -a`. Both are served: JSON when the caller passed
-#   --json/-j, human text otherwise.
-#
-# The host helper refuses state-changing flags (self-tests, --set, -s),
-# so a passthrough call carrying one falls back to the local smartctl
-# against the emulated disk — same behavior as before the proxy.
+# The host returns smartctl JSON (NVMe or ATA). This wrapper normalizes it
+# into a synthetic smartctl ATA report carrying THIS VM disk's identity
+# (its own serial and capacity, presented as an HDD) populated with the
+# real health signals — overall health, temperature, power-on hours,
+# power cycles, reallocated/error counts. Protect's `ustorage` consumes
+# `smartctl --json`; a human runs `smartctl -a`. Both are served: JSON
+# when the caller passed --json/-j, human text otherwise.
 #
 # Any failure (channel down, proxy disabled, unknown disk, no python)
 # falls through to the local real smartctl. The proxy is best-effort and
@@ -69,15 +52,10 @@ fallback() { exec "$REAL" "$@"; }
 [ -x "$CTL" ] || fallback "$@"
 command -v python3 >/dev/null 2>&1 || fallback "$@"
 
-# Split the command line: the device operand (last /dev/* token) is ours
-# to translate; every other token is forwarded to the host verbatim.
+# Find the device argument (last token that looks like a device path).
 dev=""
-fwd=()
 for a in "$@"; do
-    case "$a" in
-        /dev/*) dev="$a" ;;
-        *)      fwd+=("$a") ;;
-    esac
+    case "$a" in /dev/*) dev="$a" ;; esac
 done
 [ -n "$dev" ] || fallback "$@"
 
@@ -90,6 +68,23 @@ parent=$(lsblk -ndo PKNAME "$dev" 2>/dev/null | head -n1)
 
 # Serial is the map key the host uses to find the backing device.
 serial=$(lsblk -ndo SERIAL "$lookup" 2>/dev/null | head -n1 | tr -d '[:space:]')
+
+# Some disks reach the guest with NO serial: the built-in SSD image is
+# attached as `-drive if=virtio,...` (the legacy form, which carries no
+# serial=) so /dev/vdb reports an empty SERIAL and used to fall straight
+# through to the real smartctl -- which cannot read a virtio device at all
+# ("Unable to detect device type"), leaving Protect's Bay 5 blank.
+# Allow an explicit override per kernel name, e.g. in
+# /etc/default/smartctl-proxy:
+#     SMARTCTL_PROXY_SERIAL_vdb=SSD1IMG
+# The value must match a key in the host's disk-serial.map, where
+# start-protect-vm.sh records `SSD1IMG image <path-to-ssd1.qcow2>`.
+# Regressed 2026-08-24 when the wrapper was reinstalled; restored 08-26.
+if [ -z "$serial" ]; then
+    _kname=$(basename "$lookup")
+    _ovr="SMARTCTL_PROXY_SERIAL_${_kname}"
+    serial="${!_ovr:-}"
+fi
 [ -n "$serial" ] || fallback "$@"
 
 # The VM disk's own capacity — used as the synthesized disk's identity.
@@ -107,60 +102,12 @@ for a in "$@"; do
     case "$a" in -j|--json|--json=*) want_json=1 ;; esac
 done
 
-# First, run the caller's own request against the host device. If the
-# host answers about a disk with OUR serial, the host device IS this VM
-# disk (raw passthrough) and the output is correct verbatim — print it
-# and be done. A state-changing flag makes the helper refuse (rc != 0),
-# which drops us to the local-smartctl fallback, as before the proxy.
-host_out=$("$CTL" smartctl "$serial" "${fwd[@]}" 2>/dev/null)
+# Ask the host for structured SMART data. We always request --json -x
+# regardless of what the caller asked — the normalizer below renders the
+# caller's chosen format itself.
+host_json=$("$CTL" smartctl "$serial" --json -x 2>/dev/null)
 rc=$?
-[ "$rc" -eq 0 ] && [ -n "$host_out" ] || fallback "$@"
-
-# Whose disk did the host describe? JSON answers carry serial_number;
-# text answers print a "Serial Number:" line. Some queries (-H, -A)
-# include neither — then fall back to the device class: sd* disks are
-# raw passthrough in this VM's topology, vd* are image-backed.
-host_serial=""
-if [ "$want_json" = "1" ]; then
-    host_serial=$(printf '%s\n' "$host_out" | python3 -c '
-import sys, json
-try:
-    print((json.load(sys.stdin) or {}).get("serial_number", "") or "")
-except Exception:
-    pass' 2>/dev/null)
-else
-    host_serial=$(printf '%s\n' "$host_out" \
-        | sed -n 's/^[Ss]erial [Nn]umber:[[:space:]]*//p' | head -n1)
-fi
-host_serial=$(printf '%s' "$host_serial" | tr -d '[:space:]')
-
-same_disk=0
-if [ -n "$host_serial" ]; then
-    [ "$host_serial" = "$serial" ] && same_disk=1
-else
-    case "$lookup" in /dev/vd*) same_disk=0 ;; *) same_disk=1 ;; esac
-fi
-
-if [ "$same_disk" = "1" ]; then
-    printf '%s\n' "$host_out"
-    exit 0
-fi
-
-# Image-backed disk: the host described a different medium, so the
-# normalizer below rewrites it under this VM disk's identity. It needs
-# `--json -x` specifically; reuse the first answer when that is what the
-# caller already asked for, otherwise fetch the structured form now.
-had_x=0
-for a in "${fwd[@]}"; do
-    case "$a" in -x|--xall) had_x=1 ;; esac
-done
-if [ "$want_json" = "1" ] && [ "$had_x" = "1" ]; then
-    host_json="$host_out"
-else
-    host_json=$("$CTL" smartctl "$serial" --json -x 2>/dev/null)
-    rc=$?
-    [ "$rc" -eq 0 ] && [ -n "$host_json" ] || fallback "$@"
-fi
+[ "$rc" -eq 0 ] && [ -n "$host_json" ] || fallback "$@"
 
 # Normalize the host's backing-disk SMART into a synthetic ATA report
 # that carries this VM disk's identity.
@@ -289,13 +236,8 @@ table = [
     mkattr(199, "UDMA_CRC_Error_Count",   0),
 ]
 
-# Pass the backing disk's real model/firmware through when the host SMART
-# reports them (raw-passthrough disks ARE the real drive, so its model is
-# meaningful and wanted in the Protect UI). Fall back to a generic label only
-# when the host gives no model — e.g. a qcow2-image-backed disk, where the
-# host device is the image's filesystem volume, not a meaningful drive.
-MODEL = dig(host, "model_name") or dig(host, "model_family") or "UniFi Protect VM Disk"
-FIRMWARE = dig(host, "firmware_version") or "PM-1.0"
+MODEL = "UniFi Protect VM Disk"
+FIRMWARE = "PM-1.0"
 
 doc = {
     "json_format_version": [1, 0],

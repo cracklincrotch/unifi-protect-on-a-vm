@@ -179,18 +179,6 @@ function primaryArrayName() {
   return n.startsWith('md') ? n : '';
 }
 
-// True when a member is mid-rebuild. The kernel reports a rebuilding
-// member's state as 'spare' for the entire resync, but it occupies a real
-// slot from the moment recovery starts — an idle hot spare's slot reads
-// 'none'. Without this test a disk being rebuilt INTO the array is
-// indistinguishable from a spare waiting beside it, and the console paints
-// a degraded, rebuilding array as healthy-with-a-hot-spare.
-function memberIsRebuilding(md, member, state) {
-  if (state.indexOf('spare') === -1) return false;
-  const slot = readFile('/sys/block/' + md + '/md/dev-' + member + '/slot');
-  return slot !== '' && slot !== 'none';
-}
-
 // md sync/rebuild state: { action, degraded, pct }.
 function mdSyncState(md) {
   const base = '/sys/block/' + md + '/md';
@@ -247,16 +235,13 @@ function fsUsage(mountpoint) {
   }
 }
 
-// True when the primary array currently carries an IDLE spare member.
-// A 'spare' that is actively rebuilding into the array doesn't count —
-// it is the repair in progress, not a spare on deck.
+// True when the primary array currently carries a spare member.
 function hasHotSpare() {
   const primary = primaryArrayName();
   if (!primary) return false;
   const states = mdMemberStates(primary);
   return Object.keys(states).some(function (m) {
-    return states[m].indexOf('spare') !== -1 &&
-           !memberIsRebuilding(primary, m, states[m]);
+    return states[m].indexOf('spare') !== -1;
   });
 }
 
@@ -282,12 +267,7 @@ function collectDisks() {
         map.set(p, { node: p, present: fs.existsSync('/sys/class/block/' + p),
                      primaryRole: '' });
       }
-      let role = states[m] || '';
-      // Tag rebuilding members so the disk-state mappers can tell them
-      // apart from idle spares — the raw kernel state says 'spare' either
-      // way (see memberIsRebuilding).
-      if (memberIsRebuilding(primary, m, role)) role = 'rebuilding,' + role;
-      map.get(p).primaryRole = role;
+      map.get(p).primaryRole = states[m] || '';
     }
   }
   return [...map.values()].sort(function (a, b) {
@@ -368,11 +348,10 @@ function buildV1() {
     if (isHdd) info.setHddRpm(u32(rotation));
 
     disk.setState(
-      reasons.length                            ? D.DiskState.DISK_STATE_AT_RISK   :
-      primaryRole.indexOf('faulty')     !== -1  ? D.DiskState.DISK_STATE_FAULTY    :
-      primaryRole.indexOf('rebuilding') !== -1  ? D.DiskState.DISK_STATE_REPAIRING :
-      primaryRole.indexOf('spare')      !== -1  ? D.DiskState.DISK_STATE_SPARE     :
-                                                  D.DiskState.DISK_STATE_NORMAL);
+      reasons.length                       ? D.DiskState.DISK_STATE_AT_RISK :
+      primaryRole.indexOf('faulty') !== -1  ? D.DiskState.DISK_STATE_FAULTY  :
+      primaryRole.indexOf('spare')  !== -1  ? D.DiskState.DISK_STATE_SPARE   :
+                                              D.DiskState.DISK_STATE_NORMAL);
     disk.setInfo(info);
     return disk;
   }
@@ -689,11 +668,10 @@ function buildV2() {
     info.setSmartAttr(sa);
 
     info.setRaidState(
-      primaryRole.indexOf('faulty')     !== -1 ? D.DiskRaidState.DISK_RAID_STATE_FAULTY :
-      primaryRole.indexOf('rebuilding') !== -1 ? D.DiskRaidState.DISK_RAID_STATE_REPAIRING :
-      primaryRole.indexOf('spare')      !== -1 ? D.DiskRaidState.DISK_RAID_STATE_LOCAL_SPARE :
-      primaryRole.indexOf('in_sync')    !== -1 ? D.DiskRaidState.DISK_RAID_STATE_ACTIVE :
-                                                 D.DiskRaidState.DISK_RAID_STATE_NOT_IN_RAID);
+      primaryRole.indexOf('faulty')  !== -1 ? D.DiskRaidState.DISK_RAID_STATE_FAULTY :
+      primaryRole.indexOf('spare')   !== -1 ? D.DiskRaidState.DISK_RAID_STATE_LOCAL_SPARE :
+      primaryRole.indexOf('in_sync') !== -1 ? D.DiskRaidState.DISK_RAID_STATE_ACTIVE :
+                                              D.DiskRaidState.DISK_RAID_STATE_NOT_IN_RAID);
 
     const ab = new D.DiskAbnormalInfo();
     const reasons = [];
@@ -750,25 +728,17 @@ function buildV2() {
     const level = readFile('/sys/block/' + md + '/md/level');
     let expected = parseInt(readFile('/sys/block/' + md + '/md/raid_disks'), 10);
     if (!Number.isFinite(expected)) expected = members.length;
-    // Idle spares only — a member rebuilding into the array reports the
-    // kernel state 'spare' too, but counting it here turns into
-    // hotspare:true upstream while the array is degraded and repairing.
     const spares = Object.keys(states).filter(function (m) {
-      return states[m].indexOf('spare') !== -1 &&
-             !memberIsRebuilding(md, m, states[m]);
+      return states[m].indexOf('spare') !== -1;
     }).length;
 
     const R = raid_pb;
     const lvl = raidLevelEnum(level);
     const info = new R.RaidInfo();
     info.setUuid(readFile('/sys/block/' + md + '/md/uuid'));
-    // mdadm 'recover' rebuilds a missing member onto a degraded array —
-    // that is a REPAIR (restoring redundancy), not a benign 'resync'.
-    // Same reasoning as the v1 space state: the console renders SYNCING
-    // as routine background work but REPAIRING as an active repair.
     info.setSyncAction(
-      sync.action === 'resync'                              ? R.RaidSyncAction.RAID_SYNC_ACTION_SYNCING :
-      sync.action === 'recover' || sync.action === 'repair' ? R.RaidSyncAction.RAID_SYNC_ACTION_REPAIRING :
+      sync.action === 'resync' || sync.action === 'recover' ? R.RaidSyncAction.RAID_SYNC_ACTION_SYNCING :
+      sync.action === 'repair'                              ? R.RaidSyncAction.RAID_SYNC_ACTION_REPAIRING :
       sync.action === 'reshape'                             ? R.RaidSyncAction.RAID_SYNC_ACTION_EXPANDING :
       sync.action === 'check'                               ? R.RaidSyncAction.RAID_SYNC_ACTION_CHECKING :
                                                               R.RaidSyncAction.RAID_SYNC_ACTION_NONE);
@@ -839,16 +809,6 @@ function buildV2() {
       const sp = new S.Space();
       sp.setDevice(primary);
       sp.setType(S.SpaceType.SPACE_TYPE_DATA);
-      // A degraded array reports AT_RISK even while a member is actively
-      // rebuilding. Protect 7.1's dashboard knows exactly three storage
-      // presentations, all keyed off the blob health unifi-core derives
-      // from this state: "health" renders the normal usage tile, "atrisk"
-      // renders an accurate "At Risk" label (with a sloppy "reinstall this
-      // hard drive" HOVER tooltip — its chooser has no repairing branch),
-      // and NO health (what SCANNING maps to) renders a blank tile, hiding
-      // the rebuild entirely. AT_RISK is the least-wrong of the three; the
-      // honest repairing view lives on the storage details page, fed by
-      // the raid DEGRADED/REPAIRING state and the member's REPAIRING state.
       sp.setState(
         sync.degraded                                      ? S.SpaceState.SPACE_STATE_AT_RISK :
         (sync.action === 'resync' || sync.action === 'recover' ||
@@ -972,6 +932,40 @@ function main() {
   }
 
   const server = new grpc.Server();
+
+  // Accessory API (unifi.firmware.accessory.v1) — REQUIRED BY PROTECT 7.2.
+  //
+  // 7.2's recording-spaces sync BLOCKS until the PeripheralState stream has
+  // delivered at least one message: video.recording.log repeats "Skipping
+  // sync: peripheral state stream not yet received data" every 30s, no record
+  // output streams open, and NOTHING RECORDS -- while live view works fine,
+  // because live never touches the recorder.
+  //
+  // Found 2026-08-24, LOST AGAIN on the 08-26 reboot because only the live
+  // file had been patched -- this file is re-provisioned from the repo tree,
+  // so BOTH copies must carry it (same trap as Patch A).
+  try {
+    const PBA = NM + '/@ubnt/unifi-protobufs/unifi/firmware/accessory/v1';
+    const acc_grpc = require(PBA + '/api_grpc_pb.js');
+    const acc_pb = require(PBA + '/api_pb.js');
+    const per_pb = require(PBA + '/peripheral_pb.js');
+    server.addService(acc_grpc.AccessoryAPIService, {
+      peripheralExpandabilityStatus: function (call, cb) {
+        const r = new acc_pb.PeripheralExpandabilityStatusResponse();
+        r.setSupportsStorageExpansion(false);
+        cb(null, r);
+      },
+      peripheralState: streamer('accessory/PeripheralState', function () {
+        const r = new acc_pb.PeripheralStateResponse();
+        r.setPeripheral(new per_pb.Peripheral());
+        return r;
+      }),
+    });
+    log('accessory v1 registered (PeripheralState + ExpandabilityStatus)');
+  } catch (e) {
+    log('accessory v1 NOT registered: ' + (e && e.message) +
+        ' — Protect 7.2+ will not record until it is');
+  }
   for (const v of versions) {
     server.addService(v.service, v.impl);
   }

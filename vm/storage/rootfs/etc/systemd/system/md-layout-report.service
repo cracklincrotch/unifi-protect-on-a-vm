@@ -1,0 +1,5 @@
+[Unit]
+Description=Push md member layout to the QEMU host (DAS fault policy input)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/md-layout-report.sh

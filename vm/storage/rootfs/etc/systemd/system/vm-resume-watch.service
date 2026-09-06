@@ -1,0 +1,12 @@
+[Unit]
+Description=Detect QEMU pause via RTC drift and recover Protect
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/vm-resume-watch.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

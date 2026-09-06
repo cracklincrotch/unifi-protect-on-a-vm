@@ -57,6 +57,7 @@ host/                       Runs on the macOS host
   make-scripts-iso.sh       Bundle the vm/ tree into a CD-ROM ISO
   control-host-helper.sh    Host side of the virtio-serial control channel
   smartctl-host-helper.sh   Runs real SMART queries for the control channel
+  das-marker-format.sh      Format the DAS marker partitions, mark them noauto
   protect-on-mac.conf.example   Config template (copy to protect-on-mac.conf)
   com.protect-on-mac.vm.plist   launchd plist template
 
@@ -69,6 +70,8 @@ vm/                         Copied into the VM and run there
                             install-storage.sh installs this tree verbatim:
     usr/bin/ustorage
     usr/local/sbin/provision-storage.sh
+    usr/local/sbin/das-marker-partition.sh   optional; silences macOS's
+                                             unreadable-disk dialog
     usr/local/bin/ustated-shim.js
     usr/local/bin/unifi-core-storage-patch.sh
     etc/systemd/system/*.service
@@ -224,6 +227,72 @@ The script's default is RAID0 because it's the safest no-data-loss assumption: a
 #### Migrating an existing RAID from a real UNVR
 
 If you're migrating from an existing UNVR, you don't need to create the RAID at all. Connect the disks via the DAS, and `mount-storage.sh import` will detect the existing array and mount it. The RAID level (whatever the UNVR was using — typically RAID10 for 4-bay or RAID1 for 2-bay) is preserved.
+
+#### Silencing macOS's "disk not readable" dialog (optional)
+
+The data disks carry only Linux partitions, so macOS can mount nothing on them
+and Disk Arbitration raises
+
+> The disk you attached was not readable by this computer.
+> **Eject** / **Initialize...** / **Ignore**
+
+once per disk, **every time QEMU releases the disks** — which means on every VM
+restart. Four disks, four dialogs, and they stack up unattended. This is not a
+cosmetic annoyance: **Initialize... destroys an array member**, and it sits
+immediately beside Ignore.
+
+There is no supported way to switch the dialog off. There is no
+`diskarbitrationd` preference for it, `/etc/fstab` cannot match a partition that
+has no filesystem, and the agent that raises it (`DiskArbitrationAgent`) cannot
+be unloaded — `launchctl bootout` fails with *"Operation not permitted while
+System Integrity Protection is engaged"*.
+
+What does work is giving macOS one thing it *can* read on each disk. The dialog
+is raised **per disk**, when nothing on the whole device is mountable — not per
+partition. (Four disks with four unreadable Linux partitions each produce four
+dialogs, not sixteen.) So one small readable partition per disk is enough, and
+every UniFi partition is left exactly as it is.
+
+Two steps, both required:
+
+```bash
+# 1. In the GUEST, once the array exists. Dry run first.
+sudo /usr/local/sbin/das-marker-partition.sh          # show the plan
+sudo /usr/local/sbin/das-marker-partition.sh --yes
+
+# 2. On the HOST, with the VM SHUT DOWN.
+./das-marker-format.sh                                # show the plan
+./das-marker-format.sh --yes
+```
+
+Step 1 adds one partition per disk using space that is **already unallocated** —
+nothing is shrunk, moved or repurposed, so there is no data to lose. UniFi's
+layout leaves gaps; the script discovers them rather than assuming offsets, and
+deliberately takes the *smallest* gap that is big enough. That detail matters:
+the large gap sits where a partition 4 would go (the numbering skips 4), so it is
+almost certainly reserved, and preferring the smallest suitable gap avoids it
+structurally. New partitions are numbered from 6 for the same reason.
+
+Step 2 formats them FAT and writes `noauto` entries to `/etc/fstab`. Both halves
+are needed, for opposite reasons:
+
+* **unformatted**, macOS still finds nothing mountable and still prompts;
+* **auto-mounting**, QEMU refuses the disk entirely — *"If device /dev/diskN is
+  mounted on the desktop, unmount it first before using it in QEMU"* — and the
+  VM will not start.
+
+The target state is precisely **recognised, never mounted**: macOS probes the
+filesystem (no dialog) and `fstab` stops it being mounted (QEMU keeps the disk).
+`start-protect-vm.sh` also runs `diskutil unmountDisk` on each data disk before
+handing it to QEMU, as a belt to that braces. The FAT volumes are labelled with
+the drive serials, so if one ever does mount, its mount point names its disk.
+
+**The risk that remains, stated plainly:** nobody has verified how a real UniFi
+NVR reacts to an extra partition on its disks. It may ignore it; it may
+re-provision. Undoing this is just deleting the partition, since the space was
+never allocated to anything — but remove the `fstab` block with it, or you leave
+stale UUID references behind. If you plan to put these disks back into real
+hardware, treat this as unproven.
 
 ### A note on configurability
 

@@ -18,3 +18,12 @@
 # Set to 0 to disable the proxy without removing the wrapper. The wrapper
 # then behaves as a plain pass-through to the real smartctl. Default: 1.
 SMARTCTL_PROXY_ENABLED=1
+
+# Per-device host-serial override, for disks that reach the guest with NO
+# serial. The built-in SSD image is attached as `-drive if=virtio,...` (the
+# legacy form carries no serial=), so /dev/vdb reports an empty SERIAL and the
+# wrapper would fall through to the real smartctl -- which cannot read a
+# virtio device, leaving Protect's SSD bay blank. The value must match a key
+# in the host's vm-data/disk-serial.map, where start-protect-vm.sh records
+#   SSD1IMG   image   <path to ssd1.qcow2>
+SMARTCTL_PROXY_SERIAL_vdb=SSD1IMG

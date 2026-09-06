@@ -31,10 +31,15 @@ set -u
 
 SVC=/usr/share/unifi-core/app/service.js
 
-# Patch A — disk LIST (5.1.117-era anchor)
+# Patch A — disk LIST (5.1.132-era anchor)
+# The minifier renames BOTH identifiers every core release:
+#   5.1.117: tee / hHe    5.1.126: y_e / rpt    5.1.132: iwe / Elt
+# Re-derive the anchor variable AND the logger in REPL together, and
+# update the REPO copy too — the 5.1.126 re-derivation was applied only
+# to the live script, and the next --sync-os reinstalled this stale one.
 MARKER='["disk","inspect"]'
-ANCHOR='tee={space:e,disks:[],sdcards:[]};'
-REPL='let dd=[];try{dd=JSON.parse((await Q("ustorage",["disk","inspect"])).stdout);}catch(_){hHe.error("Failed to retrieve disk info via ustorage:",_);}tee={space:e,disks:dd,sdcards:[]};'
+ANCHOR='iwe={space:e,disks:[],sdcards:[]};'
+REPL='let dd=[];try{dd=JSON.parse((await Q("ustorage",["disk","inspect"])).stdout);}catch(_){Elt.error("Failed to retrieve disk info via ustorage:",_);}iwe={space:e,disks:dd,sdcards:[]};'
 
 PUSH_CONF=/usr/local/etc/md-health-watch.conf
 

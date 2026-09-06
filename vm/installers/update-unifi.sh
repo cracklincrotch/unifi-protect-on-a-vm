@@ -130,7 +130,10 @@ verify_shims() {
     _ck() { if [ "$1" -eq 0 ]; then printf "    [ OK ] %s\n" "$2"; else printf "    [FAIL] %s\n" "$2"; fail=1; fi; }
     set +e
     [ "$(grep -cF '["disk","inspect"]' "$sj" 2>/dev/null)" = 1 ]; _ck $? "service.js Patch A (disk list)"
-    [ "$(grep -cF ',!0?s.push' "$sj" 2>/dev/null)" = 1 ];        _ck $? "service.js Patch B (drive detect)"
+    # Patch B (the 5.1.110-era drive-detect gate) is obsolete: 5.1.117
+    # refactored that code path away and unifi-core-storage-patch.sh no
+    # longer applies it. Its marker is correctly absent -- do not report that
+    # as a failure.
     head -3 /usr/bin/ustorage 2>/dev/null | grep -q 'ustorage-vm'; _ck $? "/usr/bin/ustorage is the VM shim"
     systemctl is-active --quiet ustated-shim.service;             _ck $? "ustated-shim.service active"
     ss -ltn 2>/dev/null | grep -q '127\.0\.0\.1:11052';           _ck $? "ustated-shim listening on :11052"
@@ -391,6 +394,53 @@ ai_deps_of_deb() {
                 ;;
         esac
     done
+}
+
+# Every OTHER dependency of the Protect deb that the running system does not
+# satisfy, as "<package> <op> <version>" lines (op/version absent if the
+# dependency is unversioned).
+#
+# Protect 7.2 moved its media stack out of the UniFi OS firmware and into
+# independently published debs: 7.2.105 depends on ms/msr/msp/mst >= 5.1.309,
+# ds = 7.2.14, msf >= 0.0.7 and a new protect-verify >= 0.9.1 -- none of
+# which firmware 5.1.25 carries, and all of which the firmware API publishes
+# as their own products on the deb platform. Fetching only the ai-feature-*
+# debs left apt with seven unmet dependencies and an aborted install
+# (2026-08-21). Resolve them the same way the AI packages are resolved.
+unmet_deps_of_deb() {
+    # This script runs under `set -euo pipefail`, and this function runs
+    # inside a process substitution, where an abort is SILENT. An unversioned
+    # dependency makes `grep | head` exit non-zero; pipefail turns that into
+    # a failed assignment; -e kills the function -- and the caller sees an
+    # empty list and reports "(none)". That is exactly how the 2026-08-21
+    # retry failed a second time. Relax the options for this function only
+    # (`local -` restores them on return) and guard every probe.
+    local -
+    set +e +o pipefail
+    local deb="$1" depends entry name op ver have cmp
+    depends="$(dpkg-deb -f "$deb" Depends 2>/dev/null)" || return 0
+    local IFS=','
+    for entry in $depends; do
+        entry="$(echo "$entry" | sed 's/|.*//')"        # first alternative
+        name="$(echo "$entry" | grep -oE '[a-z0-9][a-z0-9.+-]+' | head -1)"
+        [ -n "$name" ] || continue
+        case "$name" in ai-feature-*) continue ;; esac   # handled above
+        op="$(echo "$entry" | grep -oE '(>=|<=|>>|<<|=)' | head -1)"
+        ver="$(echo "$entry" | grep -oE '[0-9][0-9a-zA-Z.+~:-]*' | head -1)"
+        have="$(dpkg-query -W -f='${Version}' "$name" 2>/dev/null)"
+        if [ -n "$have" ]; then
+            [ -n "$op" ] || continue                   # unversioned: satisfied
+            case "$op" in
+                ">=") cmp=ge ;; "<=") cmp=le ;; ">>") cmp=gt ;;
+                "<<") cmp=lt ;; "=")  cmp=eq ;; *) cmp=ge ;;
+            esac
+            if dpkg --compare-versions "$have" "$cmp" "$ver"; then
+                continue
+            fi
+        fi
+        echo "$name $op $ver"
+    done
+    return 0
 }
 
 # Best-effort pre-flight: warn about any non-ai Protect dependency the
@@ -728,6 +778,32 @@ upgrade_protect() {
     [ "${#ai_pkgs[@]}" -gt 0 ] \
         || echo "    Protect declares no ai-feature-* dependency."
 
+    # Anything else Protect needs that the system lacks: try the firmware
+    # API for it on the deb platform. What the API does not publish is left
+    # to apt, which then reports it plainly.
+    echo ""
+    echo ">>> Resolving Protect's other unmet dependencies..."
+    local dep_pkg dep_op dep_ver dep_info dep_url dep_ver_avail dep_sha
+    local n_dep=0
+    while read -r dep_pkg dep_op dep_ver; do
+        [ -n "$dep_pkg" ] || continue
+        echo "    Protect $PROTECT_VERSION needs: $dep_pkg $dep_op $dep_ver"
+        if ! dep_info="$(get_latest_version "$dep_pkg" "$PROTECT_CHANNEL" \
+                         "$DEB_PLATFORM" 2>/dev/null)" \
+           || [ "$(echo "$dep_info" | jq -r '.url')" = "null" ]; then
+            echo "    (not published on the firmware API -- leaving to apt)"
+            continue
+        fi
+        dep_ver_avail="$(echo "$dep_info" | jq -r '.version')"
+        dep_sha="$(echo "$dep_info" | jq -r '.sha256')"
+        dep_url="$(echo "$dep_info" | jq -r '.url')"
+        echo ">>> Downloading $dep_pkg ($dep_ver_avail)..."
+        download_verified "$dep_url" "$WORKDIR/${dep_pkg}.deb" "$dep_sha"
+        ai_debs+=("$WORKDIR/${dep_pkg}.deb")
+        n_dep=$((n_dep + 1))
+    done < <(unmet_deps_of_deb "$WORKDIR/unifi-protect.deb")
+    [ "$n_dep" -gt 0 ] || echo "    (none)"
+
     # Best-effort heads-up about non-ai deps the system lacks (node24,
     # unifi-core ...). Those are installed by --sync-os from the firmware.
     preflight_protect_deps "$WORKDIR/unifi-protect.deb"
@@ -739,10 +815,18 @@ upgrade_protect() {
     echo ""
     echo ">>> Installing..."
     unhold_ubiquiti_packages
-    apt-get install -y --allow-downgrades --no-install-recommends \
+    # If apt refuses, bring the OLD Protect straight back. On 2026-08-21 an
+    # unmet-dependency abort left the service stopped -- recording down --
+    # until someone noticed.
+    if ! apt-get install -y --allow-downgrades --no-install-recommends \
         -o Dpkg::Options::='--force-confdef' \
         -o Dpkg::Options::='--force-confold' \
-        "$WORKDIR/unifi-protect.deb" "${ai_debs[@]}"
+        "$WORKDIR/unifi-protect.deb" "${ai_debs[@]}"; then
+        echo "" >&2
+        echo "ERROR: install failed -- restarting the existing Protect." >&2
+        systemctl start unifi-protect "${ai_pkgs[@]}" 2>/dev/null || true
+        return 1
+    fi
     hold_ubiquiti_packages
 
     echo ""

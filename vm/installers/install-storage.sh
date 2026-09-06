@@ -127,6 +127,9 @@ systemctl enable provision-storage.service \
 say "enabled provision-storage, ustated-shim, unifi-core-storage-patch,"
 say "        seed-anonid, protect-backup-to-array.timer, md-health-watch.timer,"
 say "        critical-services-watch.timer, provision-on-setup.path"
+systemctl enable --now md-layout-report.timer 2>/dev/null || true
+systemctl enable --now vm-resume-watch.service 2>/dev/null || true
+say "enabled --now md-layout-report.timer, vm-resume-watch.service"
 
 # The shim is safe to (re)start now; provisioning + the patch apply at boot.
 systemctl restart ustated-shim.service

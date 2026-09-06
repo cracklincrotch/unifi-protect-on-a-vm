@@ -371,6 +371,20 @@ backing_is_ssd() {
 # We collect all failures before bailing out, so a user with seven disks
 # missing doesn't have to fix-and-retry seven times. The connected-disks
 # diagnostic is printed once at the end, listing everything we did find.
+# DISK_FDSET=1 REQUIRES A PATCHED QEMU. With a stock build the VM will NOT
+# start: macOS returns ENOTTY for fcntl(F_SETFL) on a raw disk device node
+# for every flags value, and QEMU treats that as fatal in two places --
+# qemu_dup_flags() (util/osdep.c), so fdset cannot open a device at all, and
+# qemu_set_blocking() (util/oslib-posix.c), so any SCM_RIGHTS message
+# carrying a device fd drops the monitor connection and takes add-fd with it.
+# Both are one-line "tolerate ENOTTY" fixes. Leave this at 0 unless QEMU_BIN
+# points at a build carrying them. The payoff, once it does: a re-enumerated
+# DAS can be reattached to a PAUSED guest via add-fd + blockdev-reopen, so
+# the array never goes dirty and there is no resync.
+DISK_FDSET="${DISK_FDSET:-1}"
+FDSET_EXEC="${FDSET_EXEC:-$(dirname "$0")/qemu-fdset-exec.py}"
+FDSET_SPECS=()
+FDSET_N=0
 DISK_ARGS=()
 MISSING_SERIALS=()
 MAP_ENTRIES=()
@@ -380,11 +394,89 @@ for serial in "${DISK_SERIALS[@]}"; do
         MISSING_SERIALS+=("$serial")
         continue
     fi
+
+    # QEMU refuses a whole disk that has ANY mounted volume on it: "If device
+    # /dev/diskN is mounted on the desktop, unmount it first before using it in
+    # QEMU". Each data disk now carries a small FAT marker partition (so macOS
+    # stops raising its "not readable ... Initialize" dialog per disk on every
+    # restart -- an Initialize misclick destroys an array member), and anything
+    # that mounts one would stop the VM from starting. /etc/fstab marks them
+    # noauto, and this is the belt to that braces: unmounting is a harmless
+    # no-op when nothing is mounted, and it also clears a volume someone mounted
+    # by hand.
+    diskutil unmountDisk "/dev/$bsd" >/dev/null 2>&1 || true
     echo "Disk: /dev/$bsd ($serial)"
-    DISK_ARGS+=(
-        -drive "if=none,id=disk_$serial,file=/dev/$bsd,format=raw,cache=$DISK_CACHE,aio=$DISK_AIO"
-        -device "scsi-hd,bus=scsi0.0,drive=disk_$serial,serial=$serial"
-    )
+    # werror=stop,rerror=stop is the most important option on this line.
+    # Without it a transient USB fault is reported into the guest as a real
+    # I/O error and md kicks the member out of the array.
+    #
+    # Not hypothetical. On 2026-08-03 the host's USB ROOT PORT dropped the
+    # whole hub tree. The bus recovered in 2.4 s onto NEW /dev/diskN nodes,
+    # but QEMU kept the stale fds and synthesised "Aborted Command / DID_OK
+    # DRIVER_SENSE" into the guest -- QEMU's own invented sense data, not
+    # anything a drive actually said -- and md kicked sdd5 and sda5. The array
+    # survived only by luck: md could not persist its superblocks
+    # (super_written -5), so on-disk state froze healthy and a restart
+    # reassembled 4/4 with a bitmap resync and no rebuild.
+    #
+    # With these set, QEMU PAUSES the VM instead of lying to the guest.
+    # Recording stops until someone resumes it, which is strictly better than
+    # a rebuild measured in days -- in this failure class the delay costs
+    # recordings, never the array. Resume with QMP "cont" once the bus is
+    # healthy.
+    #
+    # A pause is otherwise SILENT: a frozen guest cannot run md-health-watch
+    # or critical-services-watch. That is what the BLOCK_IO_ERROR / STOP
+    # handling in the QMP event reader below exists for.
+    # DISK_FDSET=1 backs each DAS drive with an fdset instead of a bare path.
+    #
+    # A bare path is opened ONCE, at launch. When the DAS re-enumerates, that
+    # descriptor still refers to the device instance that went away, and is
+    # dead permanently -- which is why every "cont" after a bus event re-pauses
+    # within the same second, and why the only escape has been a cold restart
+    # that leaves the array dirty. Measured 2026-08-17: all four disks errored
+    # in the same second, and the resulting resync quoted 46 days.
+    #
+    # An fdset can be handed a FRESH descriptor at runtime with add-fd and the
+    # node repointed at it with blockdev-reopen, while the guest stays paused.
+    # A paused guest accrues no SCSI timeouts -- QEMU stops its clock -- so it
+    # can wait out the bus and resume onto live descriptors with the array
+    # still clean. DISK_FDSET=0 restores bare paths.
+    if [ "$DISK_FDSET" = "1" ]; then
+        FDSET_N=$((FDSET_N + 1))
+        # RAW character node, not the buffered block node. /dev/diskN routes
+        # every IO through the macOS unified buffer cache in page-sized
+        # (16 KB on Apple Silicon) chunks: measured 2026-09-06, the guest
+        # issued 176 KB average writes and the host executed them as 16.00 KB/t
+        # at ~1000 IOPS -- an ~11x IOPS inflation, double-caching every block
+        # (guest page cache + host buffer cache), ~60% guest iowait, and a
+        # 22 TB scrub crawling at 3.5 MB/s. /dev/rdiskN bypasses the cache:
+        # same disk measured 217 KB/t at 115 MB/s vs 16 KB/t at 75 MB/s.
+        # diskutil and the smartctl map keep the block node; only the fd
+        # handed to QEMU changes.
+        FDSET_SPECS+=(--fd "$FDSET_N:/dev/r$bsd")
+        # Explicit -blockdev rather than -drive, for two load-bearing reasons:
+        #   * driver=host_device must be NAMED: QEMU guesses the plain-file
+        #     protocol for /dev/fdset/N and refuses it ("'file' driver
+        #     requires '/dev/fdset/N' to be a regular file").
+        #   * stable node-names: the whole point of fdset is that a
+        #     re-enumerated disk can be reattached at runtime with
+        #     add-fd + blockdev-reopen, and blockdev-reopen targets a node BY
+        #     NAME. Auto-generated names (#blockNNN) change every start -- the
+        #     same trap vm-snapshot.py has to work around.
+        # werror/rerror move to the -device line: they are guest-facing device
+        # policy, and -blockdev does not accept them.
+        DISK_ARGS+=(
+            -blockdev "driver=host_device,node-name=file_$serial,filename=/dev/fdset/$FDSET_N,aio=$DISK_AIO"
+            -blockdev "driver=raw,node-name=disk_$serial,file=file_$serial"
+            -device "scsi-hd,bus=scsi0.0,drive=disk_$serial,serial=$serial,werror=stop,rerror=stop"
+        )
+    else
+        DISK_ARGS+=(
+            -drive "if=none,id=disk_$serial,file=/dev/$bsd,format=raw,cache=$DISK_CACHE,aio=$DISK_AIO,werror=stop,rerror=stop"
+            -device "scsi-hd,bus=scsi0.0,drive=disk_$serial,serial=$serial"
+        )
+    fi
     # serial<TAB>kind<TAB>target — consumed by the optional smartctl proxy.
     MAP_ENTRIES+=("$serial"$'\t'"disk"$'\t'"/dev/$bsd")
 done
@@ -447,7 +539,9 @@ for entry in "${STORAGE_IMAGES[@]}"; do
     # disk from a raw-passthrough spinning disk (and only skips the RAID
     # resync, which would inflate the qcow2, for the all-image case).
     IMG_ARGS+=(
-        -drive "if=none,id=$id,file=$img,format=qcow2,cache=$DISK_CACHE,aio=$DISK_AIO,discard=$img_discard"
+        # werror/rerror for the same reason as the raw disks above: these are
+        # array members too, and a paused VM beats a kicked member.
+        -drive "if=none,id=$id,file=$img,format=qcow2,cache=$DISK_CACHE,aio=$DISK_AIO,discard=$img_discard,werror=stop,rerror=stop"
         -device "scsi-hd,bus=scsi0.0,drive=$id,serial=$serial,rotation_rate=1"
     )
     # serial<TAB>kind<TAB>target — for image disks the target is the
@@ -738,6 +832,32 @@ echo "Starting VM..."
 #       virtio-blk for the data disks because virtio-scsi supports
 #       serial numbers (which we use to identify disks inside the VM).
 #
+#       DEDICATED IOTHREAD (2026-08-30). Without one, block requests for all
+#       four DAS disks are serviced on QEMU's main loop, which also runs the
+#       monitor, timers and netdev. On a host carrying 39 ffmpeg processes that
+#       thread is not scheduled promptly and the guest sees multi-second I/O
+#       stalls: /proc/pressure/io measured full=60 (every runnable task blocked
+#       on I/O 60% of the time) and Protect logged 266 [recurrenceSlow] gaps
+#       across 47 minutes, up to 19 cameras gapping in the same minute.
+#
+#       ONE iothread is sufficient: the array runs ~272 IOPS, far below what a
+#       single iothread saturates. The problem was main-loop serialisation, not
+#       iothread throughput. num_queues=4 matches VM_CPUS so the guest's blk-mq
+#       gets a queue per vCPU.
+#
+#       DO NOT use the JSON -device form for multiple iothreads
+#       (iothread-vq-mapping). It parses and QEMU starts, but the controller is
+#       realised in a phase where bus scsi0.0 does not exist yet for the
+#       following keyval `-device scsi-hd,bus=scsi0.0`, which dies with
+#       "Bus 'scsi0.0' not found". That took the VM down on 2026-08-30; the
+#       dotted keyval form is rejected outright. Test any change WITH a scsi-hd
+#       attached, not just the controller alone.
+#
+#       Topology is unchanged -- one controller, still bus=scsi0.0 -- so
+#       DISK_ARGS/IMG_ARGS and the fdset node names are untouched. The DAS
+#       add-fd/blockdev-reopen reattach should be re-validated: block nodes now
+#       live in an iothread AioContext.
+#
 #   "${DISK_ARGS[@]}" "${IMG_ARGS[@]}"
 #       The dynamically-built disk arguments from above. Each raw disk
 #       (DISK_ARGS) and each disk image (IMG_ARGS) gets a -drive and
@@ -796,6 +916,11 @@ else
     echo "  $CONTROL_HELPER" >&2
 fi
 QMP_REASON_FILE="$(mktemp -t protect-vm-qmp-reason)"
+
+# Persistent, host-side record of block I/O errors and VM pauses.
+# Deliberately NOT a mktemp: a paused VM must still be diagnosable
+# tomorrow. See the note() helper in the QMP event reader.
+VM_IO_LOG="${VM_IO_LOG:-$VM_DATA_DIR/vm-io-events.log}"
 # shellcheck disable=SC2064
 trap '
     [ -n "$control_pid" ] && kill "$control_pid" 2>/dev/null
@@ -821,12 +946,102 @@ trap '
 # Resolve qemu to an absolute path: the sudo NOPASSWD rule is written with
 # an absolute path, so invoking qemu the same way makes the match reliable
 # regardless of sudo's secure_path.
-QEMU_BIN="$(command -v qemu-system-aarch64 || echo /opt/homebrew/bin/qemu-system-aarch64)"
+# Overridable so a bad QEMU upgrade can be rolled back without editing this
+# file under pressure: Homebrew keeps the previous build in the Cellar until
+# `brew cleanup` runs, so
+#   QEMU_BIN=/opt/homebrew/Cellar/qemu/<old>/bin/qemu-system-aarch64
+# in the environment (or the launchd plist) pins the VM to the known-good
+# binary. Unconditional assignment here meant an inherited value was
+# silently discarded.
+QEMU_BIN="${QEMU_BIN:-/Users/donnie/qemu-patched/qemu-system-aarch64}"
 
 # discard=unmap for the OS disk too, when its qcow2 is on an SSD/NVMe —
 # the DB churn on /data keeps the image growing otherwise.
 VM_DISK_DISCARD=ignore
 backing_is_ssd "$VM_DISK" && VM_DISK_DISCARD=unmap
+
+###############################################################################
+# Built-in SSD image (/ssd1)
+###############################################################################
+#
+# Protect decides whether to start DELETING EVENTS by running df on /ssd1:
+#
+#     t.getBuiltInSsdSpace = async e => await df(C, e)   // const C = "/ssd1"
+#     i <= (r > 900 ? 64 : 8) ? warn("SSD available space ... deleting events")
+#
+# So the threshold is a hard 8 GB free for any /ssd1 smaller than 900 GB, it
+# re-checks every 10 minutes, and it hard-deletes rows -- DELETE FROM events
+# ... WHERE "locked" = false ORDER BY "end" ASC. Only locked (archived)
+# events survive.
+#
+# With no disk mounted there, /ssd1 is just a directory on the OS disk, so
+# that df reports the 30 GB root filesystem. Measured 2026-08-07: adding a
+# 4 GB swapfile took root free space from ~12 GB to 7.8 GB, crossing the
+# threshold, and Protect destroyed 183,198 events and 97,878 smart-detect
+# objects before anyone noticed. The only visible symptom was that the AI
+# Key looked broken -- its input was being deleted underneath it.
+#
+# Giving /ssd1 its own disk fixes that permanently, and it is also what
+# Protect expects: /ssd1 is real scratch space for the imageProcessing,
+# audioProcessing and caseReportGeneration workers.
+#
+# This is deliberately NOT a STORAGE_IMAGES entry. Those attach as scsi-hd
+# with a serial and rotation_rate=1, which is exactly how provision-storage
+# identifies a disk as an array candidate -- it would be offered to the RAID
+# and would show up as a bay in the storage panel. Attaching as if=virtio
+# instead makes it /dev/vdb, which the storage path never enumerates.
+#
+# Keep this image SMALL. The threshold jumps to 64 GB once /ssd1 exceeds
+# 900 GB, so a 64 GB disk with 60 GB free has far more headroom than a 1 TB
+# disk would.
+#
+# ORDERING IS LOAD-BEARING: SSD_ARGS must be appended AFTER the virtio-net
+# device in the QEMU invocation, never before it. Devices take PCI slots in
+# command-line order, and Debian derives interface names from the PCI path
+# (enp0sN). Putting this drive earlier shifts the NIC one slot, the interface
+# comes up under a new name, no config matches it, and the guest boots with
+# NO NETWORK -- QEMU running, ARP incomplete, unreachable. Learned the hard
+# way on 2026-08-07: the drive went in ahead of virtio-scsi-pci and the VM
+# came up deaf. Recovery required an ACPI shutdown over QMP, because killing
+# QEMU on a live guest risks an md resync measured in days.
+SSD_ARGS=()
+if [ -n "${SSD_IMAGE:-}" ]; then
+    if [ -f "$SSD_IMAGE" ]; then
+        SSD_DISCARD=ignore
+        backing_is_ssd "$SSD_IMAGE" && SSD_DISCARD=unmap
+        SSD_ARGS=(
+            -drive "if=virtio,file=$SSD_IMAGE,format=qcow2,discard=$SSD_DISCARD"
+        )
+        echo "Built-in SSD image (/ssd1, discard: $SSD_DISCARD):"
+        echo "  $SSD_IMAGE"
+        # /ssd1 holds the Protect DATABASE, and it was the one disk in the
+        # system with no health reporting at all. It is attached as a bare
+        # virtio drive, so it carries no serial for the smartctl proxy to
+        # resolve, and smartctl cannot probe virtio directly ("Unable to detect
+        # device type"). Giving it a serial would mean changing its device type
+        # to scsi-hd, which renames /dev/vdb and shifts PCI slots -- the class
+        # of change that has broken guest networking before. Registering it as
+        # an "image" entry instead lets the host resolve the qcow2 to the
+        # physical disk it lives on, so the guest sees THAT drive's real SMART:
+        # wear, temperature and power-on hours for the device the database
+        # actually sits on. The guest names it via
+        # SMARTCTL_PROXY_SERIAL_vdb=SSD1IMG in /etc/default/smartctl-proxy.
+        #
+        # Appended rather than pushed onto MAP_ENTRIES because the map is
+        # written further up, before this block runs.
+        if [ -n "${DISK_MAP:-}" ] && [ -f "$DISK_MAP" ]; then
+            grep -q '^SSD1IMG' "$DISK_MAP" 2>/dev/null \
+                || printf 'SSD1IMG\timage\t%s\n' "$SSD_IMAGE" >> "$DISK_MAP"
+        fi
+    else
+        # Not fatal: the VM still boots, /ssd1 falls back to a directory on
+        # the OS disk, and Protect starts deleting events again once the
+        # root filesystem drops under 8 GB free. Say so loudly.
+        echo "WARNING: SSD_IMAGE is set but missing: $SSD_IMAGE" >&2
+        echo "WARNING: /ssd1 will fall back to the OS disk, and Protect will" >&2
+        echo "WARNING: delete events when it drops below 8 GB free." >&2
+    fi
+fi
 
 while :; do
     : > "$QMP_REASON_FILE"
@@ -836,10 +1051,323 @@ while :; do
     # is involved. Once QEMU connects, block until the SHUTDOWN event and
     # record its reason.
     (
-        python3 - "$QMP_EVENT_SOCKET" "$QMP_REASON_FILE" <<'PYEOF'
-import json, os, socket, sys
+        python3 - "$QMP_EVENT_SOCKET" "$QMP_REASON_FILE" "$VM_IO_LOG" "$DISK_MAP" "$(dirname "$0")/qmp-das-reattach.py" <<'PYEOF'
+import json, os, socket, subprocess, sys, threading, time, urllib.request, urllib.parse
 
 sock_path, out_path = sys.argv[1], sys.argv[2]
+io_log_path = sys.argv[3] if len(sys.argv) > 3 else os.devnull
+disk_map = sys.argv[4] if len(sys.argv) > 4 else ""
+reattach_helper = sys.argv[5] if len(sys.argv) > 5 else ""
+
+# --- DAS fault auto-recovery -------------------------------------------------
+#
+# werror=stop/rerror=stop on the DAS disks means a USB fault PAUSES the VM
+# instead of letting md kick an array member. That protects the array, but a
+# paused recorder that nobody resumes is its own outage. This resumes it.
+#
+# Retrying is SAFE: werror=stop stays armed after it fires, so if the array is
+# still broken the retried I/O simply pauses the VM again. The guest never sees
+# an error, so md never kicks a member no matter how many times we try. The
+# only real failure mode is thrash, which the cap below bounds.
+#
+# The retry also DISTINGUISHES the two fault shapes with no disk probing:
+#   * transient glitch, same /dev/diskN  -> the first cont succeeds, done.
+#   * bus re-enumerated onto NEW nodes   -> QEMU still holds the stale fds, so
+#     every cont re-pauses. After MAX_RESUMES we stop guessing and cold-restart,
+#     because only a relaunch re-runs resolve_disk_by_serial and reopens the
+#     correct devices. That is exactly what recovered the 2026-08-03 event:
+#     restart, clean 4/4 assemble, bitmap resync, no rebuild.
+#
+# Escalation asks the guest to halt first. A clean shutdown flushes the
+# filesystems, which is the "sync before you stop" this is really after -- and
+# it works even mid-fault because / and /ssd1 live on the host NVMe, not on the
+# DAS. If the halt does not complete in time we quit anyway; the array is
+# already frozen healthy by the pause, which is the whole point.
+MAX_RESUMES = 3          # cont attempts inside PAUSE_WINDOW before escalating
+RESUME_BACKOFF = 10      # seconds to let the bus settle before each cont
+SHUTDOWN_BUDGET = 90     # seconds to wait for a clean halt before forcing quit
+PAUSE_WINDOW = 3600      # pauses older than this no longer count toward the cap
+
+pauses = []
+escalated = False
+lock = threading.Lock()
+
+
+def note(text):
+    """Record where a human will find it.
+
+    A paused guest is frozen: md-health-watch and critical-services-watch run
+    INSIDE it and cannot fire. Without a host-side record the failure mode is a
+    silently stopped recorder -- the way the Access syslog engine stayed dead
+    for three months.
+    """
+    line = "%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
+    sys.stderr.write(line)                       # -> launchd log
+    sys.stderr.flush()
+    try:
+        with open(io_log_path, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def send(conn, cmd):
+    try:
+        conn.sendall((json.dumps({"execute": cmd}) + "\n").encode())
+        return True
+    except OSError as exc:
+        note("QMP send %s failed: %s" % (cmd, exc))
+        return False
+
+
+err_events = []          # (wall_time, serial) per BLOCK_IO_ERROR
+esc_hist = []            # wall_time of each escalation, for livelock detection
+
+
+def pushover(title, message, priority=0):
+    """Host-side paging. The guest watchers cannot fire while the guest is
+    paused -- during a DAS event the ONLY component awake is this reader, and
+    until now it only wrote to a log file (the 2026-08-20 event was found by
+    its side effects). Reads PUSHOVER_TOKEN/PUSHOVER_USER from
+    vm-data/pushover.conf; silently a no-op if the file is absent."""
+    conf = os.path.join(os.path.dirname(io_log_path), "pushover.conf")
+    tok = usr = None
+    try:
+        for ln in open(conf):
+            k, _, v = ln.strip().partition("=")
+            if k == "PUSHOVER_TOKEN":
+                tok = v.strip().strip('"')
+            elif k == "PUSHOVER_USER":
+                usr = v.strip().strip('"')
+    except OSError:
+        return
+    if not tok or not usr:
+        return
+    try:
+        data = urllib.parse.urlencode({
+            "token": tok, "user": usr, "title": title,
+            "message": message, "priority": priority}).encode()
+        urllib.request.urlopen(
+            "https://api.pushover.net/1/messages.json", data, timeout=10)
+    except Exception as exc:
+        note("pushover failed: %r" % exc)
+
+
+def recent_error_serials(window_s=90):
+    now = time.time()
+    return sorted({ser for (t, ser) in err_events if now - t <= window_s})
+
+
+def load_md_layout():
+    """vm-data/md-layout.map -> {array: {level, layout, nd, members:{serial:(role, healthy)}}}
+    Pushed by the guest every 5 minutes while healthy (md-layout-report.sh);
+    the guest is paused and unaskable when this gets read."""
+    path = os.path.join(os.path.dirname(io_log_path), "md-layout.map")
+    arrays = {}
+    try:
+        for ln in open(path):
+            f = ln.split()
+            if len(f) != 7:
+                continue
+            name, level, layout, nd, role, serial, state = f
+            a = arrays.setdefault(name, {"level": level,
+                                         "layout": int(layout or 0),
+                                         "nd": int(nd or 0), "members": {}})
+            healthy = "in_sync" in state or "active" in state
+            a["members"][serial] = (int(role) if role.isdigit() else -1, healthy)
+    except OSError:
+        return None
+    return arrays or None
+
+
+def load_detached():
+    path = os.path.join(os.path.dirname(disk_map), "das-detached.list")
+    try:
+        return {l.strip() for l in open(path) if l.strip()}
+    except OSError:
+        return set()
+
+
+def may_detach(serial):
+    """POLICY: may this disk be hot-unplugged with every md array on it still
+    functional? Computed per RAID level, conservatively -- an unknown level or
+    layout means NO, and so does a stale/missing map.
+
+      raid1        : >= 1 healthy member must remain
+      raid5        : tolerates exactly one loss -- so no PRIOR loss allowed
+      raid6        : tolerates two
+      raid10 near-2: the role^1 mirror partner must remain healthy
+      raid0/linear : never
+    """
+    arrays = load_md_layout()
+    if arrays is None:
+        note("may_detach(%s): no md-layout.map -- refusing" % serial)
+        return False
+    gone = load_detached()
+    for name, a in arrays.items():
+        if serial not in a["members"]:
+            continue
+        role, target_healthy = a["members"][serial]
+        lost = {s for s, (r, h) in a["members"].items()
+                if not h or s in gone}
+        if serial in lost:
+            continue                      # already contributes nothing
+        lost.add(serial)
+        lvl, nd = a["level"], a["nd"]
+        if lvl == "raid1":
+            ok = nd - len(lost) >= 1
+        elif lvl == "raid5":
+            ok = len(lost) <= 1
+        elif lvl == "raid6":
+            ok = len(lost) <= 2
+        elif lvl == "raid10" and a["layout"] == 258 and nd % 2 == 0:
+            partner = role ^ 1
+            ok = any(r == partner and h and s not in gone and s != serial
+                     for s, (r, h) in a["members"].items())
+        else:
+            ok = False                    # raid0/linear/unknown: never
+        note("may_detach(%s): %s %s role=%s lost=%s -> %s"
+             % (serial, name, lvl, role, sorted(lost), "YES" if ok else "NO"))
+        if not ok:
+            return False
+    return True
+
+
+def single_disk_recover(conn, serial, livelock):
+    """One disk is failing while the rest are healthy. Wait briefly for it to
+    come back (the 2026-08-20 single-disk drop DID return -- a fast reattach
+    beats a kicked member every time); if it stays gone and the policy allows,
+    hot-detach it so the guest runs DEGRADED and keeps recording. Returns True
+    if the situation was resolved either way."""
+    global escalated
+    wait_s = 5 if livelock else int(os.environ.get("DISK_SINGLE_WAIT_S", "120"))
+    allow = may_detach(serial)
+    argv = ["sudo", "-n", reattach_helper, "--map", disk_map,
+            "--serial", serial, "--window", str(wait_s)]
+    if allow:
+        argv.append("--detach")
+    note("single-disk fault on %s (livelock=%s): reattach window %ds, "
+         "detach %s" % (serial, livelock, wait_s,
+                        "ALLOWED" if allow else "refused by policy"))
+    try:
+        with open(io_log_path, "a") as lg:
+            rc = subprocess.call(argv, stdout=lg, stderr=lg)
+    except Exception as exc:
+        note("single-disk helper did not run: %r" % exc)
+        return False
+    if rc == 0:
+        note("disk %s reattached -- array clean, recording resumed" % serial)
+        pushover("UNVR DAS: disk recovered",
+                 "%s dropped and was reattached live; no resync." % serial)
+        with lock:
+            escalated = False
+            del pauses[:]
+        return True
+    if rc == 5:
+        note("disk %s DETACHED -- guest now runs DEGRADED and keeps "
+             "recording. Reinsert/replace the disk, then: "
+             "qmp-das-reattach.py --serial %s --readd" % (serial, serial))
+        pushover("UNVR DAS: running DEGRADED",
+                 "%s did not return in %ds and was hot-detached so recording "
+                 "continues. Array degraded until the disk is re-added."
+                 % (serial, wait_s), priority=1)
+        with lock:
+            escalated = False
+            del pauses[:]
+        return True
+    note("single-disk path failed (rc=%s) -- trying the full-bus path" % rc)
+    return False
+
+
+def reattach_or_halt(conn):
+    """Escalation: reattach the re-enumerated disks to the PAUSED guest.
+
+    The old escalation asked the guest to halt and relaunched. That can never
+    end cleanly -- marking md clean is itself a write to the disks that went
+    away, so every bus event cost a multi-day resync (five for five before the
+    fdset work; a sixth on 2026-08-20 while this was still unwired). With the
+    drives fdset-backed, qmp-das-reattach.py hands the still-paused QEMU fresh
+    descriptors for wherever the disks came back (add-fd + blockdev-reopen,
+    filename unchanged) and resumes it: no restart, no dirty array, no resync.
+
+    The helper waits up to its --window for the bus to return; the guest is
+    frozen and timeless meanwhile, so the wait is free. On any failure -- no
+    fdset nodes (DISK_FDSET=0), disks truly gone, stock unpatched QEMU -- fall
+    back to exactly the old halt+relaunch path.
+    """
+    global escalated
+    now = time.time()
+    esc_hist.append(now)
+    livelock = len([t for t in esc_hist if now - t < 900]) >= 3
+    serials = recent_error_serials()
+    if (len(serials) == 1 and os.environ.get("DISK_DEGRADE", "1") != "0"
+            and disk_map and reattach_helper
+            and os.path.exists(reattach_helper)):
+        if single_disk_recover(conn, serials[0], livelock):
+            return
+    rc = 1
+    if disk_map and reattach_helper and os.path.exists(reattach_helper):
+        note("attempting live reattach via %s" % reattach_helper)
+        pushover("UNVR DAS fault",
+                 "Bus event on %s; VM paused, attempting live reattach."
+                 % (", ".join(serials) or "multiple disks"))
+        try:
+            with open(io_log_path, "a") as lg:
+                # WAIT LONG. A paused guest loses NOTHING -- the vCPU is
+                # frozen, dirty pages sit intact in RAM, the array stays
+                # clean, and no SCSI timeouts accrue. Force-quitting loses
+                # ~24s of dirty pages, may leave the array needing a resync,
+                # and then the launcher REFUSES TO START on a missing serial
+                # anyway -- so the VM is down either way. Force-quit buys
+                # nothing when the disks are gone, and costs everything when
+                # they were about to come back. Between 2026-08-17 and 08-26
+                # this path force-quit 4 times and reattached live 0 times.
+                # Recovery after a long pause is handled in the guest by
+                # vm-resume-watch.service (RTC-drift detection -> clock step
+                # -> media-stack restart -> verify recording actually resumed).
+                rc = subprocess.call(
+                    ["sudo", "-n", reattach_helper, "--map", disk_map,
+                     "--window", os.environ.get("DISK_WAIT_S", "3600")],
+                    stdout=lg, stderr=lg)
+        except Exception as exc:
+            note("reattach helper did not run: %r" % exc)
+    else:
+        note("no reattach helper available (map=%r helper=%r)"
+             % (disk_map, reattach_helper))
+    if rc == 0:
+        note("LIVE REATTACH SUCCEEDED -- array clean, no resync, recording "
+             "resumed. Re-arming fault handling.")
+        pushover("UNVR DAS: recovered",
+                 "All disks reattached live; array clean, no resync.")
+        with lock:
+            escalated = False
+            del pauses[:]
+        return
+    note("reattach failed (rc=%s) after the full wait -- the disks did not "
+         "come back. Falling back to halt + relaunch; note the launcher will "
+         "refuse to start while a serial is missing, so the VM stays down "
+         "until the enclosure is restored." % rc)
+    pushover("UNVR DAS: disks did not return",
+             "Waited the full window and the disks never came back. The VM is "
+             "being halted and will stay down until the enclosure is restored.",
+             priority=1)
+    send(conn, "cont")                       # guest must run to halt
+    time.sleep(2)
+    send(conn, "system_powerdown")
+    force_quit_later(conn)                   # already on a daemon thread
+
+
+def force_quit_later(conn):
+    """Backstop: if the guest will not halt, stop QEMU so the loop relaunches."""
+    time.sleep(SHUTDOWN_BUDGET)
+    with lock:
+        still_going = escalated
+    if still_going:
+        note("clean halt did not finish in %ds -- forcing quit so the launcher "
+             "can relaunch and reopen the disks" % SHUTDOWN_BUDGET)
+        send(conn, "quit")
+
+
 try:
     os.unlink(sock_path)
 except OSError:
@@ -861,8 +1389,60 @@ for line in rx:
         msg = json.loads(line)
     except ValueError:
         continue
-    if msg.get("event") == "SHUTDOWN":
+    ev = msg.get("event")
+
+    if ev == "BLOCK_IO_ERROR":
+        d = msg.get("data", {})
+        _n = d.get("node-name") or d.get("device") or ""
+        if _n.startswith("disk_"):
+            err_events.append((time.time(), _n[5:]))
+            del err_events[:-400]
+        note("BLOCK_IO_ERROR device=%s node=%s op=%s action=%s"
+             % (d.get("device", "?"), d.get("node-name", "?"),
+                d.get("operation", "?"), d.get("action", "?")))
+        continue
+
+    if ev == "STOP":
+        now = time.time()
+        with lock:
+            if escalated:
+                continue                         # already halting; ignore
+            pauses.append(now)
+            pauses[:] = [t for t in pauses if now - t < PAUSE_WINDOW]
+            n = len(pauses)
+        if n <= MAX_RESUMES:
+            note("VM PAUSED by werror/rerror (attempt %d/%d). The array is "
+                 "intact -- that is what the pause bought. Waiting %ds, then "
+                 "resuming." % (n, MAX_RESUMES, RESUME_BACKOFF))
+            time.sleep(RESUME_BACKOFF)
+            if send(conn, "cont"):
+                note("sent cont")
+        else:
+            with lock:
+                escalated = True
+            note("VM paused %d times in %d minutes -- the disks have almost "
+                 "certainly re-enumerated onto new /dev/diskN, so resuming "
+                 "cannot work (QEMU holds the old fds). Asking the guest to "
+                 "halt cleanly, then relaunching to reopen them by serial."
+                 % (n, PAUSE_WINDOW // 60))
+            threading.Thread(target=reattach_or_halt, args=(conn,),
+                             daemon=True).start()
+        continue
+
+    if ev == "RESUME":
+        note("VM resumed -- recording continues.")
+        continue
+
+    if ev == "SHUTDOWN":
         reason = msg.get("data", {}).get("reason", "")
+        with lock:
+            if escalated:
+                # Our own recovery halt. Use a distinct token so the launcher
+                # loop cold-restarts instead of treating it as a user poweroff
+                # and exiting.
+                reason = "das-recovery"
+                note("guest halted for DAS recovery -- launcher will relaunch "
+                     "and re-resolve the disks by serial.")
         try:
             with open(out_path, "w") as f:
                 f.write(reason)
@@ -888,7 +1468,14 @@ PYEOF
         || echo "WARNING: qmpevt socket not up yet — QEMU may abort" >&2
 
     qemu_rc=0
-    sudo "$QEMU_BIN" \
+    # With DISK_FDSET=1, QEMU is exec'd by the fdset wrapper, which opens the
+    # devices AFTER sudo -- sudo closes every descriptor >= 3, so anything
+    # opened before the privilege change never arrives.
+    QEMU_LAUNCH=()
+    if [ "$DISK_FDSET" = "1" ]; then
+        QEMU_LAUNCH=("$FDSET_EXEC" "${FDSET_SPECS[@]}" --)
+    fi
+    sudo ${QEMU_LAUNCH[@]+"${QEMU_LAUNCH[@]}"} "$QEMU_BIN" \
         -machine virt,accel=hvf \
         -cpu host \
         -smp "$VM_CPUS" \
@@ -897,12 +1484,14 @@ PYEOF
         -drive if=pflash,format=raw,unit=0,file="$EFI_CODE",readonly=on \
         -drive if=pflash,format=raw,unit=1,file="$EFI_VARS" \
         -drive if=virtio,file="$VM_DISK",format=qcow2,discard="$VM_DISK_DISCARD" \
-        -device virtio-scsi-pci,id=scsi0 \
+        -object iothread,id=iothread0 \
+        -device virtio-scsi-pci,id=scsi0,iothread=iothread0,num_queues=4 \
         "${DISK_ARGS[@]}" \
         "${IMG_ARGS[@]}" \
         "${CDROM_ARGS[@]}" \
         -netdev "vmnet-bridged,id=net0,ifname=$EN" \
         -device "virtio-net-pci,netdev=net0,mac=$VM_MAC" \
+        "${SSD_ARGS[@]}" \
         "${CONSOLE_ARGS[@]}" \
         "${QMP_ARGS[@]}" \
         "${CONTROL_ARGS[@]}" || qemu_rc=$?
@@ -924,6 +1513,21 @@ PYEOF
             echo ">>> VM rebooted — cold-restarting QEMU."
             echo ""
             sleep 2                              # throttle a reboot loop
+            continue
+            ;;
+        das-recovery)
+            # The QMP reader halted the guest after repeated werror/rerror
+            # pauses -- the DAS almost certainly re-enumerated onto new
+            # /dev/diskN nodes and QEMU was holding the old fds. Restarting is
+            # the ONLY fix: the next pass through this loop re-runs
+            # resolve_disk_by_serial and reopens the real devices. md then
+            # reassembles from its bitmap. This is the recovery that worked by
+            # hand on 2026-08-03 -- clean 4/4 assemble, no rebuild.
+            echo ""
+            echo ">>> DAS fault recovery — cold-restarting QEMU so the disks"
+            echo "    are re-resolved by ATA serial."
+            echo ""
+            sleep 5                              # let the bus finish settling
             continue
             ;;
         guest-shutdown)
