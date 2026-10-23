@@ -110,6 +110,21 @@ if [ ! -f "$CONF_FILE" ]; then
     exit 1
 fi
 
+# snapshot.sh writes this marker before reverting the qcow2 images and removes
+# it once every image is reverted. If it is still here, a restore was cut
+# short and the root image and /ssd1 (the Protect database) may be at
+# different points in time: booting that would run one Protect against
+# another's database. Stay down until the restore is run again. Exit 0 so
+# launchd (KeepAlive SuccessfulExit=false) does not relaunch us in a loop;
+# the recording watchdog reports the VM as down.
+_restore_marker="$(dirname "$CONF_FILE")/.snapshot-restore-in-progress"
+if [ -f "$_restore_marker" ]; then
+    echo "ERROR: a snapshot restore to '$(cat "$_restore_marker" 2>/dev/null)' did not finish;" >&2
+    echo "       the disk images may be at different points in time. Not starting" >&2
+    echo "       the VM. Run snapshot.sh restore <name> again, then start it." >&2
+    exit 0
+fi
+
 # shellcheck source=/dev/null
 source "$CONF_FILE"
 
