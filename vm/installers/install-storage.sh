@@ -25,6 +25,9 @@
 #
 # BOOT ORDER (systemd):
 #   provision-storage  ->  ustated-shim + unifi-core-storage-patch  ->  unifi-core
+#   provision-storage sits in usd's slot: after local-fs-pre.target, before
+#   local-fs.target, so /volume1 and /srv are ready before sysinit.target and
+#   every media service (ms, mst, msr, msp), as on a real UNVR.
 #
 # storage-nuke.service is installed but NOT enabled — it runs on demand only,
 # triggered by `ustorage space nuke` (the Storage UI "Erase" button).
@@ -116,8 +119,11 @@ say "applying unifi-core service.js patch"
 # it runs on demand only (the Storage UI "Erase" button via ustorage).
 # provision-on-setup.path watches /etc/ustd/storage.conf and provisions the
 # array when the operator completes the storage wizard.
-systemctl enable provision-storage.service \
-                 ustated-shim.service \
+# provision-storage runs in usd's slot (WantedBy=local-fs.target). reenable,
+# not enable: it also removes the multi-user.target.wants link that units
+# installed before 2026-10 created, and it is a plain enable on a fresh box.
+systemctl reenable provision-storage.service >/dev/null 2>&1
+systemctl enable ustated-shim.service \
                  unifi-core-storage-patch.service \
                  seed-anonid.service \
                  protect-backup-to-array.timer \

@@ -53,7 +53,12 @@
 #
 #   install -m 0755 provision-storage.sh /usr/local/sbin/provision-storage.sh
 #   install -m 0644 provision-storage.service /etc/systemd/system/
-#   systemctl daemon-reload && systemctl enable provision-storage.service
+#   systemctl daemon-reload && systemctl reenable provision-storage.service
+#
+# provision-storage.service runs `boot` in usd's slot (after
+# local-fs-pre.target, before local-fs.target), i.e. before sysinit.target:
+# no network and none of the UniFi stack is running yet. Keep the boot path
+# short and limited to what /, /proc, /sys, /dev and /run provide.
 #
 # USAGE
 #
@@ -195,7 +200,31 @@ part_dev() {
     esac
 }
 
-# Every present whole data disk (SATA / virtio / NVMe), OS disk excluded.
+# True if the running system uses disk $1 directly: the disk or one of its
+# partitions is mounted, is active swap, or is named in /etc/fstab by
+# UUID/PARTUUID/LABEL or device path. On the VM that is /ssd1 (vdb, whole-disk
+# ext4 holding Protect's database). Array members do not count: what is
+# mounted or swapped there is the md device, not the disk.
+is_system_disk() {
+    local disk=$1 d t v
+    for d in "/dev/$disk" /dev/"$disk"[0-9]* /dev/"$disk"p[0-9]*; do
+        [ -b "$d" ] || continue
+        awk -v d="$d" '$1 == d { f = 1 } END { exit !f }' /proc/self/mounts && return 0
+        awk -v d="$d" 'NR > 1 && $1 == d { f = 1 } END { exit !f }' /proc/swaps && return 0
+        grep -Eq "^[[:space:]]*$d[[:space:]]" /etc/fstab 2>/dev/null && return 0
+        for t in UUID PARTUUID LABEL; do
+            v=$(blkid -o value -s "$t" "$d" 2>/dev/null)
+            [ -n "$v" ] || continue
+            grep -Fq "$t=$v" /etc/fstab 2>/dev/null && return 0
+        done
+    done
+    return 1
+}
+
+# Every present whole data disk (SATA / virtio / NVMe): not the OS disk, and
+# not a disk the system uses directly (is_system_disk). The nuke path wipes
+# every disk listed here, and provisioning may partition any blank one, so a
+# mounted disk such as /ssd1 must never appear.
 data_disks() {
     local os n sz
     os=$(os_disk)
@@ -205,6 +234,7 @@ data_disks() {
             *) continue ;;
         esac
         [ "$n" = "$os" ] && continue
+        is_system_disk "$n" && continue
         sz=$(cat "/sys/block/$n/size" 2>/dev/null || echo 0)
         [ "$sz" -gt 0 ] && echo "$n"
     done

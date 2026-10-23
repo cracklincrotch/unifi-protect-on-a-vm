@@ -1159,8 +1159,11 @@ systemctl daemon-reload
 # it runs on demand only, triggered by the web UI "Erase" button.
 # provision-on-setup.path provisions the array when the operator finishes
 # the storage wizard (it watches /etc/ustd/storage.conf).
-systemctl enable provision-storage.service \
-                 ustated-shim.service \
+# provision-storage runs in usd's slot (WantedBy=local-fs.target). reenable,
+# not enable: it also removes the multi-user.target.wants link that units
+# installed before 2026-10 created, and it is a plain enable on a fresh box.
+systemctl reenable provision-storage.service >/dev/null 2>&1
+systemctl enable ustated-shim.service \
                  unifi-core-storage-patch.service \
                  seed-anonid.service \
                  protect-backup-to-array.timer \

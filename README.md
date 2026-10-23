@@ -1070,7 +1070,7 @@ See "Repository layout" near the top for the directory tree. The detail:
 - **`usr/local/sbin/provision-storage.sh`** — boot-time disk provisioner + `space nuke` teardown/reprovision worker.
 - **`usr/local/bin/ustated-shim.js`** — storage-API gRPC shim. Serves `unifi.firmware.storage.v1` on `127.0.0.1:11052` so the Storage Manager panel renders.
 - **`usr/local/bin/unifi-core-storage-patch.sh`** — idempotent re-apply guard for the `unifi-core` `service.js` disk-list patch.
-- **`etc/systemd/system/provision-storage.service`** — runs the provisioner at boot, before `ustated-shim` and `unifi-core`.
+- **`etc/systemd/system/provision-storage.service`** - runs the provisioner in `usd`'s slot (after `local-fs-pre.target`, before `local-fs.target`), so `/volume1` and `/srv` are ready before `sysinit.target` and every media service, as on a real UNVR.
 - **`etc/systemd/system/ustated-shim.service`** — runs `ustated-shim.js` at boot.
 - **`etc/systemd/system/unifi-core-storage-patch.service`** — runs the patch guard before `unifi-core` starts.
 - **`etc/systemd/system/storage-nuke.service`** — on-demand teardown worker, triggered by `ustorage space nuke` (not enabled at boot).

@@ -1,35 +1,88 @@
 ###############################################################################
-# provision-storage.service — usd-role storage provisioner for the Protect VM.
+# provision-storage.service - usd-role storage provisioner for the Protect VM.
 #
-# Runs provision-storage.sh once at boot, before anything that needs the
-# recording volume. It assembles an existing array and mounts /volume1, or
-# provisions blank disks from scratch (see provision-storage.sh header).
+# Runs provision-storage.sh once per boot. On this VM the md0 (swap) and md3
+# (data) arrays are already assembled by mdadm in the initramfs, so the
+# script mounts md3 at /volume1 and makes sure /srv points at /volume1/.srv.
+# On blank disks with AUTOMODE=true it provisions a fresh array instead (see
+# the provision-storage.sh header).
 #
-# Ordered before the storage shim and unifi-core so /volume1 and the md
-# devices exist before they are consumed. This is the VM's equivalent of
-# usd.service on a real UNVR.
+# WHERE IT RUNS: usd's slot.
+# A real UNVR brings its array up with Ubiquiti's usd.service:
+# DefaultDependencies=no, After=local-fs-pre.target, Before=local-fs.target,
+# WantedBy=local-fs.target. Ubiquiti's media services (ms and mst; msr and
+# msp also wait for postgresql@14-protect) only order after sysinit.target,
+# which comes after local-fs.target, so on the NVR /volume1 and /srv are
+# ready before any of them starts. usd is masked here and this unit takes
+# its place with the same anchors.
+#
+# Until October 2026 this unit ran after local-fs.target (about 15.6 s into
+# boot), after ms and mst had already started (about 14 s), and they logged
+# to a local fallback until restarted. The RequiresMountsFor=/volume1
+# drop-ins on ms/mst/msr/msp cannot prevent that on their own: /volume1 is
+# not in fstab, so volume1.mount does not exist until this script mounts it.
+#
+# Where this differs from usd.service, and why:
+#   - Type=oneshot + RemainAfterExit=yes, no Restart=: the script is not a
+#     daemon. Unlike usd it cannot pick up an array that appears later.
+#   - No Requires=usdbd.service / Wants=uhwd.service: those Ubiquiti daemons
+#     are masked on the VM, as usd is.
+#   - After=swap.target (VM only): /etc/fstab owns the md0 swap (pri=1,
+#     nofail). Ordering after swap.target lets the fstab swap unit activate
+#     md0 first, so the script's own swapon stays the harmless "already on"
+#     path it was when this unit ran after sysinit.target. Without it they
+#     race, and the swap unit won by only about 0.4 s on 2026-10-23. No cost
+#     on a normal boot: md0 swap is active before local-fs-pre.target, and
+#     sysinit.target already waits for swap.target.
+#   - TimeoutStartSec=600 instead of usd's TimeoutSec=600: the same start
+#     limit. The stop limit stays at the default; there is no ExecStop.
+#   - Before= ustated-shim, unifi-core, unifi-protect, postgresql: kept from
+#     the previous unit. Redundant now (they all follow sysinit.target) but
+#     harmless, and it names the consumers.
+#
+# Deliberately NOT here:
+#   - systemd-udev-settle: deprecated (the journal asks for it to be dropped
+#     from this unit), usd does not use it, and the arrays exist before PID 1
+#     starts. local-fs-pre.target already includes Ubiquiti's
+#     uscsi-disk-ready wait, the same position usd has.
+#   - After=dev-md3.device: with the DAS absent, boot would sit out the 90 s
+#     device timeout.
+#   - RequiredBy=local-fs.target, or an fstab line for /volume1 without
+#     nofail: local-fs.target has OnFailure=emergency.target, and emergency
+#     mode on this VM has no network and no SSH (serial console only). With
+#     WantedBy=, as usd has it, a failed run leaves this unit failed and the
+#     boot carries on.
+#
+# Known cost of the early slot: a HANG here holds local-fs.target, and with
+# it sysinit.target, networking and ssh, for up to TimeoutStartSec plus the
+# stop timeout. A real UNVR accepts the same exposure with usd. Keep boot mode
+# short: it only assembles and mounts unless AUTOMODE=true.
 #
 # INSTALL (inside the VM, as root)
 #   install -m 0755 provision-storage.sh /usr/local/sbin/provision-storage.sh
 #   install -m 0644 provision-storage.service /etc/systemd/system/
 #   systemctl daemon-reload
-#   systemctl enable provision-storage.service
+#   systemctl reenable provision-storage.service
+# Use reenable, not enable: it removes the multi-user.target.wants link left
+# by the older unit and creates local-fs.target.wants.
 ###############################################################################
 [Unit]
 Description=UniFi Protect VM storage provisioner (usd-role)
-DefaultDependencies=yes
-After=local-fs.target systemd-udev-settle.service
-Wants=systemd-udev-settle.service
+DefaultDependencies=no
+Conflicts=shutdown.target
+After=local-fs-pre.target
+After=swap.target
+Before=local-fs.target
 Before=ustated-shim.service unifi-core.service
-# Recordings live on /volume1; make sure nothing storage-dependent races us.
 Before=unifi-protect.service postgresql.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/sbin/provision-storage.sh boot
-# Provisioning a fresh array (mkfs on a large volume) can take a while.
+# usd's limit. Boot mode normally takes about 1.5 s; only AUTOMODE=true on
+# blank disks (mkfs on a large array) comes anywhere near it.
 TimeoutStartSec=600
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=local-fs.target
