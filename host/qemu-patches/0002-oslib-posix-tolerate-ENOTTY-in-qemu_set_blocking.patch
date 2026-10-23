@@ -1,0 +1,30 @@
+util/oslib-posix.c: tolerate ENOTTY in qemu_set_blocking()
+
+Same Darwin behaviour: resetting O_NONBLOCK on a raw disk descriptor received
+over SCM_RIGHTS fails with ENOTTY, the read is reported as an error and the
+QMP connection is dropped, which kills add-fd for device descriptors.
+
+Applies to QEMU 11.1.0 and 11.1.2 unchanged.
+
+--- a/util/oslib-posix.c	2026-10-23 13:08:36
++++ b/util/oslib-posix.c	2026-10-23 13:08:36
+@@ -255,6 +255,19 @@
+     g_autoptr(GError) err = NULL;
+ 
+     if (!g_unix_set_fd_nonblocking(fd, !block, &err)) {
++        /*
++         * Darwin rejects F_SETFL on a raw disk device node with ENOTTY for
++         * every value, including the flags the descriptor already carries, so
++         * there is nothing this could have changed. Treating it as fatal makes
++         * SCM_RIGHTS unusable for device descriptors: the O_NONBLOCK reset in
++         * qio_channel_socket_copy_fds() fails, the read is reported as an
++         * error, and the monitor connection is dropped -- which takes add-fd
++         * with it, and with it any way to hand a running QEMU a fresh
++         * descriptor for a device that has re-enumerated.
++         */
++        if (errno == ENOTTY) {
++            return true;
++        }
+         error_setg_errno(errp, errno,
+                          "Can't set file descriptor %d %s: %s", fd,
+                          block ? "blocking" : "non-blocking",

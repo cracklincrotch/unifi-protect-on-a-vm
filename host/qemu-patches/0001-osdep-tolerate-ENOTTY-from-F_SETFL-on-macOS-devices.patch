@@ -1,0 +1,30 @@
+util/osdep.c: tolerate ENOTTY from F_SETFL in qemu_dup_flags()
+
+Darwin rejects fcntl(F_SETFL) on a raw disk device node with ENOTTY for
+every flags value, so an fdset (-add-fd, /dev/fdset/N) could never open a
+host block device on macOS: "Failed to dup() given file descriptor".
+Nothing needed changing in that case; ignore it.
+
+Applies to QEMU 11.1.0 and 11.1.2 unchanged.
+
+--- a/util/osdep.c	2026-10-23 13:08:36
++++ b/util/osdep.c	2026-10-23 13:08:36
+@@ -146,8 +146,16 @@
+         goto fail;
+     }
+ 
+-    /* Set/unset flags that we can with fcntl */
+-    if (fcntl(ret, F_SETFL, flags) == -1) {
++    /* Set/unset flags that we can with fcntl.
++     *
++     * Darwin rejects F_SETFL on a raw disk device node with ENOTTY for EVERY
++     * value of flags -- including 0, and including the flags the descriptor
++     * already carries. Regular files accept it. Treating that as fatal makes
++     * /dev/fdset/N unusable for any host block device on macOS: the fdset
++     * lookup in monitor_fdset_dup_fd_add() finds a matching descriptor, then
++     * this call kills it. Nothing needed changing in that case, so ignore it.
++     */
++    if (fcntl(ret, F_SETFL, flags) == -1 && errno != ENOTTY) {
+         goto fail;
+     }
+ 
