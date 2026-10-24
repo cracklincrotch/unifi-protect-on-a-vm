@@ -55,6 +55,22 @@ udevadm()   { :; }
 sleep()     { :; }
 hostname()  { echo testhost; }
 mountpoint() { return 1; }
+# systemctl is-active <unit>: from UNIT_STATES ("unit=state ...").
+# systemctl --no-block start: fails when START_FAILS is set.
+UNIT_STATES=""; START_FAILS=""
+systemctl() {
+    rec systemctl "$@"
+    case "$1" in
+        is-active)
+            local s
+            for s in $UNIT_STATES; do
+                [ "${s%%=*}" = "$2" ] && { echo "${s#*=}"; return 0; }
+            done
+            echo inactive; return 3 ;;
+        --no-block) [ "$2" = start ] && [ -n "$START_FAILS" ] && return 5 ;;
+    esac
+    return 0
+}
 # mount_arrays mounts, swaps on and relinks /srv: never run it here.
 mount_arrays() { rec mount_arrays "$DATA_MD" "$SWAP_MD"; }
 # blkid -U <uuid>: found when <uuid> is in $PRESENT.
@@ -166,7 +182,6 @@ check "fstab is never written" '[ "$(cksum < "$FSTAB")" = "$sum" ]' ""
 
 data_disks() { echo sdx; echo sdy; }   # names /sys/block will not have
 is_blank()   { return 0; }
-stop_volume_users() { :; }
 
 reset; out=$( (provision "sdx sdy" "$MD0_SWAP") 2>&1 ); rc=$?
 check "provision with a UUID: mkswap -U <it> /dev/md0" '[ $rc = 0 ] && calls | grep -qx "mkswap -U $MD0_SWAP /dev/md0"' "$out
@@ -219,22 +234,6 @@ AUTOMODE=false
 
 RETRY_SECS=20; RETRY_EVERY=5
 sleep() { rec sleep "$@"; }
-# systemctl is-active <unit>: from UNIT_STATES ("unit=state ...").
-# systemctl --no-block start: fails when START_FAILS is set.
-UNIT_STATES=""; START_FAILS=""
-systemctl() {
-    rec systemctl "$@"
-    case "$1" in
-        is-active)
-            local s
-            for s in $UNIT_STATES; do
-                [ "${s%%=*}" = "$2" ] && { echo "${s#*=}"; return 0; }
-            done
-            echo inactive; return 3 ;;
-        --no-block) [ "$2" = start ] && [ -n "$START_FAILS" ] && return 5 ;;
-    esac
-    return 0
-}
 DEGRADED=0
 md_degraded() { echo "$DEGRADED"; }
 # What provisioning or an Erase would write. (Boot mode's `mdadm --run` of
@@ -403,6 +402,55 @@ if command -v flock >/dev/null 2>&1; then
 else
     echo "SKIP  lock checks (no flock)"
 fi
+
+###############################################################################
+# 4. An Erase stops the users of /volume1 only while it is mounted
+###############################################################################
+
+# fuser -m: FUSER_PIDS on the first FUSER_ROUNDS calls, then nothing (their
+# units are stopped by then). unit_of_pid: from PID_UNITS ("pid=unit ...");
+# 104 is not in a service. umount: recorded.
+FUSER_PIDS="101 102 103 104"; FUSER_ROUNDS=1
+PID_UNITS="101=msr.service 102=unifi-core.service 103=postgresql.service"
+fuser() { rec fuser "$@"; [ "$(calls | grep -c ^fuser)" -gt "$FUSER_ROUNDS" ] || echo " $FUSER_PIDS"; }
+unit_of_pid() {
+    local s
+    for s in $PID_UNITS; do [ "${s%%=*}" = "$1" ] && echo "${s#*=}"; done
+    return 0
+}
+umount() { rec umount "$@"; }
+SWAP_DEV=/dev/md0; SWAP_DEV_UUID=$MD0_SWAP; fstab "$md0_line"
+UNIT_STATES="ms.service=active msr.service=active mst.service=activating msp.service=failed"
+at() { calls | grep -n "$1" | head -1 | cut -d: -f1; }   # first line matching
+
+# Not mounted: the data array failed to start, md0 runs. /volume1 is then a
+# plain directory on /, where the real fuser -m names nearly every process.
+mountpoint() { return 1; }
+scan_arrays() { rec scan; DATA_MD=""; SWAP_MD=/dev/md0; }
+reset; out=$( (do_nuke) </dev/null 2>&1 ); rc=$?
+check "Erase with /volume1 not mounted: no fuser, no systemctl stop, no umount" '[ $rc = 0 ] && ! calls | grep -q "^fuser" && ! calls | grep -q "^systemctl stop" && ! calls | grep -q "^umount"' "$out
+$(calls)"
+check "... still wipes and reprovisions" 'calls | grep -q "^wipefs" && calls | grep -qx "mount_arrays /dev/md3 /dev/md0"' "$(calls)"
+check "... then restarts the media services that are up, starting or failed, after the mount" '[ -n "$(at "^systemctl --no-block restart")" ] && [ "$(at "^mount_arrays")" -lt "$(at "^systemctl --no-block restart")" ] && calls | grep -qx "systemctl reset-failed ms.service msp.service msr.service mst.service" && calls | grep -qx "systemctl --no-block restart ms.service msp.service msr.service mst.service"' "$(calls)"
+
+# Mounted: as before. The units of fuser's PIDs, less NEVER_STOP, are stopped
+# before the teardown and started again after the new array is mounted.
+mountpoint() { return 0; }
+scan_arrays() { rec scan; DATA_MD=/dev/md3; SWAP_MD=/dev/md0; }
+reset; out=$( (do_nuke) </dev/null 2>&1 ); rc=$?
+check "Erase with /volume1 mounted: stops the units fuser -m names, less NEVER_STOP, before the wipe" '[ $rc = 0 ] && calls | grep -qx "fuser -m $STORAGE_VOLUME" && calls | grep -qx "systemctl stop msr.service postgresql.service" && [ "$(calls | grep -c "^systemctl stop")" = 1 ] && [ "$(at "^systemctl stop")" -lt "$(at "^umount")" ] && [ "$(at "^umount")" -lt "$(at "^wipefs")" ]' "$out
+$(calls)"
+check "... starts exactly those again after the mount (not the log line stop_volume_users printed), and restarts no media service on top" 'calls | grep -qx "systemctl start msr.service postgresql.service" && [ "$(at "^mount_arrays")" -lt "$(at "^systemctl start")" ] && grep -q "stopping volume users:msr.service postgresql.service" <<<"$out" && ! calls | grep -q "^systemctl --no-block restart" && ! calls | grep -q "^systemctl is-active"' "$out
+$(calls)"
+
+# Mounted at the start, gone by the second round, fuser still busy: the next
+# round must not run fuser -m on a plain directory.
+FUSER_ROUNDS=3
+mountpoint() { [ "$(calls | grep -c ^fuser)" -lt 1 ]; }
+reset; out=$( (do_nuke) </dev/null 2>&1 ); rc=$?
+check "... and stops looking once /volume1 is no longer mounted (1 fuser, not 3)" '[ $rc = 0 ] && [ "$(calls | grep -c ^fuser)" = 1 ] && [ "$(calls | grep -c "^systemctl stop")" = 1 ]' "$out
+$(calls)"
+mountpoint() { return 1; }; FUSER_ROUNDS=1; UNIT_STATES=""
 
 check "no real tool was reached" '[ ! -s "$T/guard.log" ]' "$(cat "$T/guard.log" 2>/dev/null)"
 echo; echo "$pass passed, $fail failed"

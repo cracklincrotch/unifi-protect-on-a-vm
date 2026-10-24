@@ -575,9 +575,17 @@ unit_of_pid() {
 # Stop every service holding a file open under /volume1; echo the units
 # stopped so the caller can restart them. Three rounds, since stopping one
 # service can release another's grip.
+#
+# Only while /volume1 is mounted. `fuser -m` lists every process using the
+# filesystem that holds the path, and with nothing mounted there (no array,
+# one that failed to start, or one not mounted yet) /volume1 is a plain
+# directory on /, so that is nearly every process on the box: sshd, journald,
+# udevd, postgres. Unmounted, nothing can be using it. Checked every round,
+# so a volume unmounted in between cannot turn the next round into that.
 stop_volume_users() {
     local round pids pid unit units all=""
     for round in 1 2 3; do
+        mountpoint -q "$STORAGE_VOLUME" || break
         pids=$(fuser -m "$STORAGE_VOLUME" 2>/dev/null | tr -s ' ' '\n' \
                | grep -E '^[0-9]+$' || true)
         [ -z "$pids" ] && break
@@ -590,7 +598,8 @@ stop_volume_users() {
         done
         units=$(echo "$units" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
         [ -n "${units// /}" ] || break
-        log "stopping volume users:$units"
+        # To stderr: the caller captures stdout as the list of units.
+        log "stopping volume users:$units" >&2
         # shellcheck disable=SC2086
         systemctl stop $units 2>/dev/null
         all="$all $units"
@@ -611,7 +620,10 @@ do_nuke() {
     fi
     log "space nuke: tearing down $STORAGE_VOLUME"
 
-    local stopped d p md swap_uuid
+    local stopped d p md swap_uuid mounted=""
+    # Not mounted: stop_volume_users stops nothing, and the media services
+    # are restarted at the end instead (see there).
+    mountpoint -q "$STORAGE_VOLUME" && mounted=1
     stopped=$(stop_volume_users)
 
     # Release the volume + swap.
@@ -660,6 +672,15 @@ do_nuke() {
         # shellcheck disable=SC2086
         systemctl start $stopped 2>/dev/null
     fi
+    # An Erase that began with /volume1 unmounted stopped nothing, so the
+    # media services that started without it are still running without it:
+    # they read /srv only at start, and msr records nothing until restarted.
+    # A waiting provision-storage-retry would now find /volume1 mounted and
+    # leave them be. Where /srv was still the pre-array directory,
+    # mount_arrays has just restarted the running ones for its migration, so
+    # those restart twice: a wasted restart, simpler than telling the cases
+    # apart.
+    [ -n "$mounted" ] || restart_media_services
     log "space nuke complete"
 }
 
