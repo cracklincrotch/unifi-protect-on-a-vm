@@ -77,9 +77,26 @@
 set -u
 
 STORAGE_VOLUME=/volume1
-CONFIG=/etc/default/unifi-storage
+# The tests (vm/storage/tests/) point this at a scratch file.
+CONFIG=${PROVISION_STORAGE_CONFIG:-/etc/default/unifi-storage}
+FSTAB=/etc/fstab
 
 log()  { echo "[provision-storage] $*"; }
+# warn: for what needs the operator. Under systemd the <3> prefix files the
+# line at priority "err" (sd-daemon(3)), so it stands out in journalctl.
+# Only when stdout really is the journal stream JOURNAL_STREAM names
+# ("dev:ino"): a child that inherited the variable may be writing elsewhere.
+TO_JOURNAL=""
+[ -n "${JOURNAL_STREAM:-}" ] \
+    && [ "$(stat -L -c %d:%i "/proc/$$/fd/1" 2>/dev/null)" = "$JOURNAL_STREAM" ] \
+    && TO_JOURNAL=1
+warn() {
+    if [ -n "$TO_JOURNAL" ]; then
+        echo "<3>[provision-storage] $*"
+    else
+        echo "[provision-storage] WARNING: $*"
+    fi
+}
 die()  { echo "[provision-storage] FATAL: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -211,11 +228,11 @@ is_system_disk() {
         [ -b "$d" ] || continue
         awk -v d="$d" '$1 == d { f = 1 } END { exit !f }' /proc/self/mounts && return 0
         awk -v d="$d" 'NR > 1 && $1 == d { f = 1 } END { exit !f }' /proc/swaps && return 0
-        grep -Eq "^[[:space:]]*$d[[:space:]]" /etc/fstab 2>/dev/null && return 0
+        grep -Eq "^[[:space:]]*$d[[:space:]]" "$FSTAB" 2>/dev/null && return 0
         for t in UUID PARTUUID LABEL; do
             v=$(blkid -o value -s "$t" "$d" 2>/dev/null)
             [ -n "$v" ] || continue
-            grep -Fq "$t=$v" /etc/fstab 2>/dev/null && return 0
+            grep -Fq "$t=$v" "$FSTAB" 2>/dev/null && return 0
         done
     done
     return 1
@@ -342,8 +359,58 @@ mount_arrays() {
 # Fresh provision of blank disks
 ###############################################################################
 
+# The swap UUID /etc/fstab names for md0, so that a re-provision gives the new
+# md0 the same one (mkswap -U) and fstab keeps matching it. Plain mkswap picks
+# a random UUID, and after an Erase every boot then waited about 90 s for the
+# swap device fstab named, which no longer existed.
+#
+# fstab_swap_uuid [UUID], where UUID is that of the md swap array about to be
+# replaced (empty or absent when there is none), prints:
+#   1. UUID, if a swap line in fstab names it: that line is md0's.
+#   2. Otherwise the UUID of the one swap line that no present device carries
+#      and that has pri=1, the md0 swap line as this project lays fstab out.
+#      That is md0's line after its disks were wiped or swapped, including an
+#      fstab an older Erase left out of step. pri=1 is required so md0 can
+#      never pick up another line's priority (e.g. pri=100, the NVMe swap's).
+#   3. Nothing otherwise: several candidates (a warning, no guess), none, or a
+#      missing, unreadable or malformed fstab. md0 then gets a new UUID.
+# It never edits fstab. Only swap lines whose first field is UUID=<lowercase
+# UUID> count: the form blkid prints and systemd looks up in
+# /dev/disk/by-uuid. Comments and malformed lines do not match.
+fstab_swap_uuid() {
+    local re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    local cur="${1:-}" u p seen="" orphans="" others="" n=0
+    while read -r u p; do
+        [[ $u =~ $re ]] || continue
+        if [ -n "$cur" ] && [ "$u" = "$cur" ]; then
+            echo "$u"; return 0
+        fi
+        case "$seen " in *" $u "*) continue ;; esac      # listed twice
+        seen="$seen $u"
+        blkid -U "$u" >/dev/null 2>&1 && continue          # a present device has it
+        if [ "$p" = pri1 ]; then
+            orphans="$orphans $u"; n=$((n + 1))
+        else
+            others="$others $u"
+        fi
+    done < <(awk '$1 ~ /^UUID=/ && $3 == "swap" {
+                     u = substr($1, 6); gsub(/"/, "", u)
+                     print u, ($4 ~ /(^|,)pri=1(,|$)/ ? "pri1" : "-") }' "$FSTAB" 2>/dev/null)
+    if [ "$n" -eq 1 ]; then
+        echo "${orphans# }"
+    elif [ "$n" -gt 1 ]; then
+        warn "$FSTAB names $n pri=1 swap UUIDs that no disk carries:$orphans" >&2
+        warn "  cannot tell which one is md0's, so md0 gets a new UUID; fix $FSTAB by hand" >&2
+    elif [ -n "$others" ]; then
+        warn "$FSTAB names swap UUID(s) that no disk carries:$others" >&2
+        warn "  not given to md0: without pri=1 they would change its swap priority" >&2
+    fi
+}
+
+# provision "<disks>" "<swap UUID or empty>": the UUID comes from
+# fstab_swap_uuid, worked out by the caller before anything is wiped.
 provision() {
-    local disks="$1" host n active spare members p2list p5list
+    local disks="$1" swap_uuid="$2" host n active spare members p2list p5list
     host=$(hostname -s 2>/dev/null || hostname)
 
     n=$(echo "$disks" | wc -w)
@@ -428,9 +495,14 @@ provision() {
           --name="$host:3" $assume_clean $p5list >/dev/null 2>&1 \
         || die "mdadm create md3 failed"
 
-    # 3. Filesystems.
-    log "mkswap /dev/md0"
-    mkswap /dev/md0 >/dev/null 2>&1 || die "mkswap md0 failed"
+    # 3. Filesystems. md0 keeps the swap UUID fstab names for it, if any.
+    if [ -n "$swap_uuid" ]; then
+        log "mkswap /dev/md0 (UUID $swap_uuid, as $FSTAB names it)"
+        mkswap -U "$swap_uuid" /dev/md0 >/dev/null 2>&1 || die "mkswap md0 failed"
+    else
+        log "mkswap /dev/md0 (new UUID; $FSTAB has no md0 swap line to keep, left alone)"
+        mkswap /dev/md0 >/dev/null 2>&1 || die "mkswap md0 failed"
+    fi
     log "mkfs.ext4 /dev/md3"
     mkfs.ext4 -F -L volume1 /dev/md3 >/dev/null 2>&1 || die "mkfs.ext4 md3 failed"
 
@@ -492,11 +564,16 @@ do_nuke() {
     fi
     log "space nuke: tearing down $STORAGE_VOLUME"
 
-    local stopped d p md
+    local stopped d p md swap_uuid
     stopped=$(stop_volume_users)
 
     # Release the volume + swap.
     scan_arrays
+    # The new md0 keeps the swap UUID fstab names for the old one. Read it
+    # now: the wipe below destroys it.
+    swap_uuid=""
+    [ -n "$SWAP_MD" ] && swap_uuid=$(blkid -o value -s UUID "$SWAP_MD" 2>/dev/null)
+    swap_uuid=$(fstab_swap_uuid "$swap_uuid")
     [ -n "$SWAP_MD" ] && swapoff "$SWAP_MD" 2>/dev/null && log "swapoff $SWAP_MD"
     if mountpoint -q "$STORAGE_VOLUME"; then
         umount "$STORAGE_VOLUME" 2>/dev/null || umount -l "$STORAGE_VOLUME" 2>/dev/null
@@ -528,7 +605,7 @@ do_nuke() {
     local blank=""
     for d in $(data_disks); do is_blank "$d" && blank="$blank $d"; done
     [ -n "${blank// /}" ] || die "no blank disks after wipe — aborting"
-    provision "${blank# }" || die "reprovision failed"
+    provision "${blank# }" "$swap_uuid" || die "reprovision failed"
 
     # Restart the services we stopped — they come up against the fresh volume.
     if [ -n "${stopped// /}" ]; then
@@ -597,8 +674,11 @@ do_boot() {
         exit 0
     fi
 
-    provision "${blank# }"
+    provision "${blank# }" "$(fstab_swap_uuid)"
 }
+
+# Sourced (the tests in vm/storage/tests/ do that): define, do not run.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
 
 case "${1:-boot}" in
     boot)      do_boot ;;
@@ -608,7 +688,7 @@ case "${1:-boot}" in
         disks=""
         for d in $(data_disks); do is_blank "$d" && disks="$disks $d"; done
         [ -n "${disks// /}" ] || die "no blank disks to provision"
-        provision "${disks# }"
+        provision "${disks# }" "$(fstab_swap_uuid)"
         ;;
     nuke)      do_nuke ;;
     status)    do_status ;;
