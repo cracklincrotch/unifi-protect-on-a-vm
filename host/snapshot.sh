@@ -169,11 +169,15 @@ QEMU_IMG="$(find_tool qemu-img "${QEMU_IMG:-}")" || {
     echo "ERROR: qemu-img not found (brew install qemu, or set QEMU_IMG)" >&2
     exit 1
 }
-# The QMP helper is standard-library Python: prefer Homebrew's python3 (the
-# current release) over the command-line tools' /usr/bin/python3.
+# The QMP helper is standard-library Python. Prefer Homebrew's python3.14 by
+# name: it is the Python this host runs the project under, while
+# /opt/homebrew/bin/python3 follows Homebrew upgrades (3.15 by October 2026;
+# see host/qemu-patches/README.md on what a Python upgrade breaks). Then any
+# Homebrew python3, then the command-line tools' /usr/bin/python3. Move the
+# first entry, or set SNAPSHOT_PYTHON in the config, when the host moves on.
 SNAPSHOT_PYTHON="${SNAPSHOT_PYTHON:-}"
 if [ -z "$SNAPSHOT_PYTHON" ]; then
-    for p in /opt/homebrew/bin/python3 /usr/bin/python3; do
+    for p in /opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3 /usr/bin/python3; do
         if [ -x "$p" ]; then SNAPSHOT_PYTHON="$p"; break; fi
     done
 fi
