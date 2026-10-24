@@ -175,4 +175,38 @@ else
         cp -a /usr/sbin/smartctl.real /usr/sbin/smartctl
 fi
 
+# --- /usr/bin/ubntnas (refuse the console's firmware update) ---
+# ubnt-systool fwupdate (the console UI's Update) runs `ubntnas system
+# upgrade`, which writes a real UNVR's boot layout (/dev/sda1/2/5/7,
+# mtdblocks, the uboot environment); here /dev/sd* are the recording disks.
+# The guard refuses that call and passes everything else to the real binary.
+# dpkg-divert moves the packaged binary to ubntnas.real for good, so a
+# --sync-os reinstall of the ubntnas package lands there and never replaces
+# the guard, not even between apt and this script. Only where ubntnas is
+# installed: elsewhere ubnt-systool takes its non-ubntnas paths.
+UBNTNAS_GUARD="${VM_TREE:+$VM_TREE/wrappers/rootfs/usr/bin/ubntnas}"
+if dpkg-divert --list /usr/bin/ubntnas 2>/dev/null | grep -q 'ubntnas\.real' \
+   || [ -e /usr/bin/ubntnas ]; then
+    if [ -n "$UBNTNAS_GUARD" ] && [ -f "$UBNTNAS_GUARD" ]; then
+        if ! dpkg-divert --list /usr/bin/ubntnas 2>/dev/null | grep -q 'ubntnas\.real'; then
+            # --rename moves the real binary aside; but if a guard copied by
+            # hand already sits there, moving it would make it its own target.
+            if head -3 /usr/bin/ubntnas 2>/dev/null | grep -q 'ubntnas-vm-guard'; then
+                dpkg-divert --local --divert /usr/bin/ubntnas.real \
+                    --add /usr/bin/ubntnas >/dev/null
+            else
+                dpkg-divert --local --rename --divert /usr/bin/ubntnas.real \
+                    --add /usr/bin/ubntnas >/dev/null
+            fi
+        fi
+        # temp file + rename, as for ubnt-tools: never truncate in place
+        install -m 0755 "$UBNTNAS_GUARD" /usr/bin/ubntnas.new
+        mv -f /usr/bin/ubntnas.new /usr/bin/ubntnas
+        echo "    installed ubntnas firmware-update guard (real binary: /usr/bin/ubntnas.real)"
+    else
+        echo "    WARNING: ubntnas guard not found in the vm/ tree: the console"
+        echo "             UI's Update would reach the real ubntnas"
+    fi
+fi
+
 echo ">>> Hardware-spoofing shims installed."

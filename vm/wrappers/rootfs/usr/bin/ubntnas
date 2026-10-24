@@ -1,0 +1,54 @@
+#!/bin/bash
+###############################################################################
+# ubntnas  (ubntnas-vm-guard: VM-side guard for the console firmware update)
+#
+# In the repo this file lives at vm/wrappers/rootfs/usr/bin/ubntnas, the
+# path it installs to. install-shims.sh installs it and moves the packaged
+# binary aside with dpkg-divert, to /usr/bin/ubntnas.real.
+#
+# WHY
+#
+# The console UI's Update (and its auto-update) runs `ubnt-systool fwupdate`,
+# which hands the downloaded firmware to
+#
+#   ubntnas system upgrade <file> -f --no-reboot
+#
+# whenever ubntnas is on PATH, as it is here. ubntnas writes a real UNVR's
+# boot layout: /dev/sda1, sda2, sda5 and sda7, the mtdblock partitions and the
+# uboot environment. On this VM /dev/sd* are the recording array's disks.
+# This guard refuses that one call and passes everything else (ubnt-systool
+# also runs `ubntnas system reset` for reset2defaults) to the real binary.
+# Firmware on this VM moves with update-unifi.sh, never through the UI.
+#
+# ubnt-systool shows ubntnas's stdout as the failure reason, so the refusal
+# is printed there; it is also logged.
+#
+# UBNTNAS_REAL overrides the real binary's path (vm/tests/ only).
+###############################################################################
+
+REAL="${UBNTNAS_REAL:-/usr/bin/ubntnas.real}"
+
+# The first two words that are not flags name the command, so a global flag
+# in front (`ubntnas -v system upgrade ...`) does not slip past.
+words=()
+for arg in "$@"; do
+    case "$arg" in -*) ;; *) words+=("$arg") ;; esac
+    [ "${#words[@]}" -ge 2 ] && break
+done
+
+if [ "${words[0]:-}" = system ] && [ "${words[1]:-}" = upgrade ]; then
+    msg="Firmware update from the console is disabled on this VM: ubntnas would"
+    msg="$msg write a UNVR boot layout onto /dev/sd*, which here are the recording"
+    msg="$msg disks. Update with update-unifi.sh --sync-os instead."
+    echo "$msg"
+    logger -t ubntnas-vm-guard -p daemon.warning "refused: ubntnas $*" 2>/dev/null || true
+    exit 1
+fi
+
+if [ ! -x "$REAL" ] || head -3 "$REAL" 2>/dev/null | grep -q 'ubntnas-vm-guard'; then
+    echo "ubntnas guard: no real ubntnas at $REAL" >&2
+    echo "  reinstall the ubntnas package, then re-run vm/installers/install-shims.sh" >&2
+    exit 1
+fi
+
+exec "$REAL" "$@"
