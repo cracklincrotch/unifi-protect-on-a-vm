@@ -107,6 +107,8 @@ do_snapshot() {
     [ -n "$label" ] || { echo "snapshot: missing label"; return 64; }
     [ "${#label}" -le "$MAX_ARG_LEN" ] || { echo "snapshot: label too long"; return 64; }
     case "$label" in
+        # A leading "-" would reach snapshot.sh and qemu-img as an option.
+        -*)                echo "snapshot: label must not start with -"; return 64 ;;
         *[!A-Za-z0-9._-]*) echo "snapshot: bad label characters"; return 64 ;;
     esac
     [ -x "$SNAPSHOT_SH" ] || { echo "snapshot: $SNAPSHOT_SH not found"; return 69; }

@@ -102,7 +102,8 @@ check "snapshot.sh does not read the channel: the next requests still arrive" '[
 $(cat "$T/snap.log" 2>/dev/null)"
 
 long=$(printf 'a%.0s' $(seq 1 65))
-for req in "snapshot" "snapshot a;b" 'snapshot $(id)' "snapshot ../x" "snapshot a/b" "snapshot $long"; do
+for req in "snapshot" "snapshot a;b" 'snapshot $(id)' "snapshot ../x" "snapshot a/b" "snapshot $long" \
+           "snapshot -x" "snapshot --help"; do
     reset; out=$(serve "$H" "$req")
     check "refused before sudo: '${req:0:30}'" '[ "$(rc_of "$out")" = 64 ] && [ ! -e "$T/sudo.log" ]' "$out"
 done
