@@ -60,6 +60,7 @@ host/                       Runs on the macOS host
   das-marker-format.sh      Format the DAS marker partitions, mark them noauto
   protect-on-mac.conf.example   Config template (copy to protect-on-mac.conf)
   com.protect-on-mac.vm.plist   launchd plist template
+  tests/                    Tests for snapshot.sh and control-host-helper.sh
 
 vm/                         Copied into the VM and run there
   installers/               Run once, from /root, to set the VM up

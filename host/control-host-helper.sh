@@ -92,13 +92,16 @@ log() { echo "[control-host-helper] $*" >&2; }
 # ping — liveness check, lets the guest confirm the channel works.
 do_ping() { echo "pong"; return 0; }
 
-# snapshot <label> — create a live qcow2 snapshot via snapshot.sh.
+# snapshot <label> - create a live qcow2 snapshot via `snapshot.sh create`.
 #
-# Idempotent: if a snapshot with this label already exists it is left
-# as-is and reported as success. That makes named checkpoints (e.g.
-# fresh-debian) safe to request repeatedly — a re-run of an installer
-# won't error or clobber the original. Timestamped labels never collide,
-# so this only matters for fixed names.
+# Idempotent: a snapshot that already exists on every image is left as-is
+# and reported as success, so named checkpoints (e.g. fresh-debian) are safe
+# to request repeatedly: a re-run of an installer won't error or clobber the
+# original. Timestamped labels never collide, so this only matters for fixed
+# names. snapshot.sh decides all of it, per image: it snapshots every
+# configured qcow2 (root, /ssd1 where the database lives, STORAGE_IMAGES) in
+# one QMP job, reports that it "already exists" and leaves it only when the
+# name is on all of them, and refuses a name that is on some but not all.
 do_snapshot() {
     local label="$1"
     [ -n "$label" ] || { echo "snapshot: missing label"; return 64; }
@@ -107,24 +110,23 @@ do_snapshot() {
         *[!A-Za-z0-9._-]*) echo "snapshot: bad label characters"; return 64 ;;
     esac
     [ -x "$SNAPSHOT_SH" ] || { echo "snapshot: $SNAPSHOT_SH not found"; return 69; }
+    [ -f "$CONF_FILE" ] || { echo "snapshot: config $CONF_FILE not found"; return 69; }
+    # snapshot.sh takes its first argument as the config only if it ends in
+    # .conf (or is a directory holding protect-on-mac.conf).
+    case "$CONF_FILE" in
+        *.conf) ;;
+        *) echo "snapshot: config $CONF_FILE does not end in .conf"; return 69 ;;
+    esac
     # snapshot.sh needs root for the QMP socket and qemu-img. This listener
-    # runs unprivileged, so invoke it with `sudo -n` — that requires a
+    # runs unprivileged, so invoke it with `sudo -n`, which requires a
     # NOPASSWD sudoers rule for snapshot.sh (see the README control-channel
-    # section). sudo strips the environment, so PROTECT_ON_MAC_CONF would
-    # be lost; pass the conf path as snapshot.sh's first argument instead.
-    # vm-snapshot.py, not snapshot.sh: snapshot.sh's bare qemu-img fails
-    # under sudo's stripped PATH (its list reported "image unreadable" on an
-    # image holding six snapshots, so this existence check was blind), and it
-    # only ever covered the root image. vm-snapshot.py snapshots EVERY qcow2
-    # image in one atomic job -- root and /ssd1, where the database lives --
-    # so a rollback actually rolls back. Needs no conf: it discovers the
-    # images from QEMU itself.
-    local snap="$SCRIPT_DIR/../vm-snapshot.py"
-    if sudo -n python3 "$snap" 2>/dev/null | grep -Fqw -- "$label"; then
-        echo "snapshot '$label' already exists — left as-is"
-        return 0
-    fi
-    sudo -n python3 "$snap" "$label" </dev/null 2>&1
+    # section; stand-up.sh offers to add it). sudo strips the environment,
+    # so PROTECT_ON_MAC_CONF would be lost: pass the conf path as
+    # snapshot.sh's first argument instead. The empty PROTECT_ON_MAC_CONF=''
+    # keeps that working where sudo is set to keep the environment, since
+    # snapshot.sh only reads its first argument as the conf when the
+    # variable is empty. stdin is /dev/null: it must not read the channel.
+    PROTECT_ON_MAC_CONF='' sudo -n "$SNAPSHOT_SH" "$CONF_FILE" create "$label" </dev/null 2>&1
 }
 
 # smartctl <serial> <flags...> — delegate to the smartctl proxy helper,
