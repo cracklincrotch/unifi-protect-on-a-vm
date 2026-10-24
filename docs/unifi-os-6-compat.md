@@ -41,13 +41,16 @@ result below can be reproduced with the commands in [Method](#method).
 | 4 | New `ufcd.service` (UI fan control, package `ustd`): `WantedBy=local-fs.target`, `Wants/After=usdbd.service`, `Restart=always`; on a VM it has no fans to drive and can only fail and be restarted (the binary itself was not run) | unit file in 6.0 `ustd` | Masked in both installers' lists (harmless on 5.x) |
 | 5 | Storage Patch A anchor gone: 6.0's unifi-core never calls `ustorage space inspect`, so the patch script would raise its anchor alert (journal error + Pushover) on every unifi-core start | real 6.0.11 `service.js`: 0 matches | Fixed: recognised as not needed, exits 0 quietly; 5.1 path unchanged |
 | 6 | App debs are per Debian base: `uos-deb11-arm64` and `uos-deb13-arm64` (no deb12) | API queries for unifi-protect, unifi-access, ai-feature-console, ms, msr, ds, protect-verify | Fixed: platform derived from `/etc/os-release` (11 -> deb11, so unchanged today) |
+| 7 | The console UI's Update reaches `ubntnas`: `ubnt-systool fwupdate` runs `ubntnas system upgrade <file> -f --no-reboot` whenever `ubntnas` is on PATH (it is), and `ubntnas` writes a real UNVR's boot layout: it hardcodes `/dev/sda1`, `sda2`, `sda5`, `sda7`, the mtdblock partitions and the uboot environment. On the VM `/dev/sd*` are the recording disks. Not new in 6.0, but 6.0.11 being the API's latest makes the console's own update offer likely | `ubnt-systool` `do_fwupdate` and `strings ubntnas`, identical in 5.1.33 and 6.0.11; found by the operator's review | Fixed: `ubntnas` guard (`vm/wrappers/rootfs/usr/bin/ubntnas`), installed by `install-shims.sh` with `dpkg-divert` |
 
 Also fixed here, pre-existing but in the same path: the `--sync-os` version
 diff counted the firmware's bundled `unifi-protect` and `ai-feature-*`
 packages, which the script never installs. On a guest with Protect 7.3.70 a
 sync of the release already installed therefore listed phantom downgrades
 (`unifi-protect 7.3.70 -> 7.1.87`, `ai-feature-controller 2.1.5 -> 2.0.17`)
-and stopped and restarted the whole stack for nothing.
+and stopped and restarted the whole stack for nothing. And `--access`
+compared `v4.3.22+12152` (API) with `4.3.22+12152` (dpkg), so it reinstalled
+Access on every run.
 
 Everything else checked is unchanged or changed harmlessly; details follow.
 
@@ -177,22 +180,30 @@ old behaviour was the bug:
     major built on the guest's Debian release (bullseye -> 5, trixie -> 6,
     unknown -> latest). On the current guest it resolves to 5.1.33, so
     `--check` reads "up to date" and names 6.0.11 as outside the track. A
-    non-JSON API answer is a clear error.
+    track asks `firmware-latest` with the version filters first (the
+    server's own pick, staged rollouts included); the sorted `/api/firmware`
+    listing is the fallback, ties broken by creation time. A non-JSON API
+    answer is a clear error. A missing or bad track is fatal only for
+    `--sync-os` and `--all`; `--check`, `--protect` and `--access` carry on.
+  - `--sync-os` and `--all` refuse a firmware outside the line built on the
+    guest's Debian before the pre-update snapshot and the download
+    (`fw_line_matches_debian`).
+  - `--check` warns when Protect or Access is newer on `uos-deb13-arm64`
+    than on deb11: the deadline signal for the Debian 13 move.
   - `--check` warns when the selected firmware is not the line built on the
     guest's Debian (e.g. `OS_TRACK=6` or `latest` on bullseye) and when a
     pinned release is older than the installed one (`--allow-downgrades`
     would apply it).
   - Debian guard in `sync_os_packages`, right after extraction and before any
-    service is stopped: refuses a firmware whose `VERSION_CODENAME` differs from
-    the guest's, cleans the work dir, exits non-zero. By then the script has
-    asked for a snapshot and downloaded and unpacked the image; nothing is
-    stopped or installed.
-  - `/usr/lib/version` is copied only when the installed unifi-core equals the
-    firmware's and dpkg has it as `ii`; otherwise an ERROR, the stack is still
+    service is stopped, as the backstop for the line check above: refuses a
+    firmware whose `VERSION_CODENAME` differs from the guest's, cleans the
+    work dir, exits non-zero.
+  - `/usr/lib/version` is copied only when every package offered to apt is
+    `ii` at the firmware's version (excluded packages and failed repacks do
+    not count); otherwise an ERROR naming each package, the stack is still
     re-masked, re-shimmed and restarted as before, and the script exits 1
     after cleanup. With `--all` the Protect and Access upgrades are skipped in
-    that case. unifi-core is the marker: a firmware that kept unifi-core's
-    version would pass even if other packages failed.
+    that case.
   - The version diff skips the firmware's bundled app packages
     (`unifi-protect`, `ai-feature-*`, `unifi-access`), which the script never
     installs; this removes the phantom-change restart described above.
@@ -201,7 +212,11 @@ old behaviour was the bug:
   - `ufcd` added to the mask loop; `--verify` checks it when the unit exists and
     accepts "Patch A not needed" on a bundle with neither the
     `ustorage space inspect` call nor its snapshot.
-  - `--check` compares OS versions as X.Y.Z.
+  - `--check` compares OS versions as X.Y.Z, and app versions without the
+    API's leading `v`; `--access` likewise, so it no longer reinstalls
+    Access on every run.
+  - `--verify` checks the `ubntnas` guard; `--help` prints the whole header,
+    usage and `OS_TRACK` included.
   - The helpers sit above a "sourced: return" guard so tests can load them.
 - `vm/installers/install-protect-baremetal.sh`: the same `OS_TRACK` default for
   Phase 4 (`FW_URL` still wins), the Debian guard before `/usr/lib/version` is
@@ -216,25 +231,34 @@ old behaviour was the bug:
   A 5.1 bundle keeps the patch and the drift alert. `SVC`/`PUSH_CONF` can be
   set for tests.
 - `vm/storage/rootfs/usr/bin/ustorage`: `worm check [--details]`.
-- `vm/tests/test_unifi_os6_compat.sh`: 71 stubbed checks (no root, no VM, no
-  network), covering the helpers, the guard and version-stamp wiring, the
-  installer's track block and guard (run against fixtures), the patch script
-  on 5.1, 6.0 and drifted bundles, and ustorage. It first checks statically
+- `vm/wrappers/rootfs/usr/bin/ubntnas` (new) and `vm/installers/install-shims.sh`:
+  the guard refuses `system upgrade` (also behind a leading flag), prints the
+  reason `ubnt-systool` shows in the UI, logs it, and passes everything else
+  to the real binary. `install-shims.sh` diverts the packaged binary to
+  `/usr/bin/ubntnas.real` with `dpkg-divert`, so a `--sync-os` reinstall of
+  the `ubntnas` package lands there and never replaces the guard.
+- `vm/tests/test_unifi_os6_compat.sh`: 91 stubbed checks (no root, no VM, no
+  network; Linux, and macOS with python3 and jq, where the dpkg-only checks
+  are skipped), covering the helpers, the guard and version-stamp wiring,
+  the installer's track block and guard (run against fixtures), the patch
+  script on 5.1, 6.0 and drifted bundles, ustorage, and the `ubntnas` guard. It first checks statically
   that the update script has its sourced-return guard and refuses to source
   it otherwise, so against the code before this PR it stops at that check.
   With `FW_ROOT_51`/`FW_ROOT_60` pointing at unpacked images it adds 4 checks
   against the real firmware.
 
-Not changed, on purpose: `ustated-shim.js`, `install-shims.sh`,
-`seed-anonid.sh`, the ms/msr/msp/mst and postgres drop-ins,
+Not changed, on purpose: `ustated-shim.js`, the `ubnt-tools` and smartctl
+parts of `install-shims.sh`, `seed-anonid.sh`, the ms/msr/msp/mst and postgres drop-ins,
 `provision-storage.service` (all verified unchanged or compatible above), and
 `critical-services-watch.sh` (14-apps is left out until a booted 6.0 shows it
 always runs; adding it now would alert on 5.1.33 where it does not exist).
 
 ## Route to 6.0 (proposal, untested)
 
-6.0 needs the guest on Debian 13 first. Two ways, both to be proven on an
-isolated clone:
+6.0 needs the guest on Debian 13 first. Two ways were weighed. **Decided
+(operator, in review): option 2**, a fresh trixie guest built alongside the
+live one. Option 1 stays below for the record; it is not for the production
+NVR, whose array is outside the snapshot.
 
 1. **In-place** (keeps `/data`: identity, databases, the anonid store):
    `apt full-upgrade` bullseye -> bookworm -> trixie, switching the pgdg and
@@ -274,6 +298,11 @@ isolated clone:
 - Whether `ubnt-systool network-fec` and the systemd-mode WebRTC worker behave
   on a VM.
 - When Ubiquiti stops publishing `uos-deb11-arm64` app builds.
+- Whether the `ubntnas` guard should also refuse `system reset`:
+  reset2defaults (the UI's Reset, with "format" optional) runs `ubntnas system
+  reset --no-reboot [--do-format] ...` the same way, and on a VM that is the
+  same UNVR-layout code facing the recording disks. Left passing through
+  until decided.
 - Pre-existing, not 6.0: the installer downloads the firmware without a
   SHA256 check; a Debian `mdadm` update replaces the `/sbin/mdadm` wrapper;
   the `ustorage` shim has no `disk clean`, so the UI's per-disk erase reports
@@ -350,7 +379,7 @@ or host-side state.
    `/etc/default/unifi-storage` for one boot). Until then `--verify` reports
    `md array [UUUU]` as FAIL, which is expected.
 5. **Deliver the branch** (scripts ISO) and run
-   `bash vm/tests/test_unifi_os6_compat.sh`: 71 passed, 0 failed.
+   `bash vm/tests/test_unifi_os6_compat.sh`: 91 passed, 0 failed.
 6. **Re-lay on 5.1.33**: `install-storage.sh`, then `systemctl restart unifi-core`;
    `journalctl -u unifi-core-storage-patch -b` shows "already applied" or
    "Patch A applied", not "not needed". `update-unifi.sh --verify`: all OK.
@@ -361,23 +390,37 @@ or host-side state.
    "OS track: 5 (Debian bullseye, apps from uos-deb11-arm64)", and the note
    naming v6.0.11 as outside the track. `--os-track 6 --check` adds the
    "not the 5.x line" warning; `--os-track 5.1.31 --check` adds the downgrade
-   note; `--os-track bogus` is refused.
+   note; `--os-track bogus --check` warns and shows UniFi OS "not
+   compared", and `OS_TRACK=bogus update-unifi.sh --sync-os` stops at once.
+   `--access` says "Already at latest version" (it reinstalled Access on
+   every run before).
 8. **`update-unifi.sh --sync-os --yes`** (track 5): downloads 5.1.33, verifies
    it, prints "No package changes detected" and stops nothing (before this
    PR it listed Protect and its AI package as downgrades and restarted the
    stack). A no-change sync never reaches the mask loop, so `ufcd` is not
    masked by it; on 5.x that is fine, the unit does not exist.
-9. **The guard**: `OS_TRACK=6 update-unifi.sh --sync-os --yes`. Expect the
-   download and extraction, then `ERROR: UNVR firmware v6.0.11+dd9ab55 is built
-   on Debian 'trixie'; this system runs Debian 'bullseye'.`, exit 1, and the
-   downloads in `/opt/unifi-update` removed. Throughout, `unifi-protect` stays
-   active (watch `systemctl is-active unifi-protect` in a second shell) and
-   `/usr/lib/version` is unchanged.
+9. **The guard**: `OS_TRACK=6 update-unifi.sh --sync-os --yes`. Expect at
+   once, before any snapshot request or download: `ERROR: UniFi OS 6.0.11 is
+   not the 5.x line built on Debian 'bullseye'`, exit 1. `unifi-protect`
+   stays active and `/usr/lib/version` is unchanged. (The check on the
+   unpacked image behind it is covered by the unit tests.)
+9a. **The console update guard.** After step 6 (or any `install-shims.sh`
+   run): `head -3 /usr/bin/ubntnas` shows `ubntnas-vm-guard`,
+   `dpkg-divert --list /usr/bin/ubntnas` names `/usr/bin/ubntnas.real`, and
+   `ubntnas system upgrade /nonexistent -f --no-reboot` prints the refusal
+   and exits 1 (`journalctl -t ubntnas-vm-guard` logs it). Only once those
+   hold, and on the clone only, the full UI path:
+   `ubnt-systool fwupdate <any .bin>` must end with the same refusal as its
+   reason. `ubntnas --help` still reaches the real binary through the
+   guard.
 10. **The install path, both ways (optional; it downgrades the clone):**
     `OS_TRACK=5.1.31 update-unifi.sh --sync-os --yes`, then
     `OS_TRACK=5 update-unifi.sh --sync-os --yes`. Each run must install,
     stamp `/usr/lib/version` with its release, mask `ufcd`
-    (`systemctl is-enabled ufcd.service` -> `masked`) and pass `--verify`.
+    (`systemctl is-enabled ufcd.service` -> `masked`) and pass `--verify`;
+    afterwards the `ubntnas` guard is still in place and
+    `/usr/bin/ubntnas.real` is the reinstalled package's binary (the
+    diversion at work).
 11. **Reboot the clone**: `--verify` all OK; `systemd-analyze critical-chain
     local-fs.target` shows `provision-storage.service` before it;
     ms/msr/msp/mst active; `ubnt-systool anonid` equals

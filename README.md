@@ -181,6 +181,7 @@ The Ubiquiti software expects certain UNVR-specific hardware interfaces (storage
 - **`ubnt-tools id`**: a binary that reports board ID, serial number, hardware revision. Some Protect features check this. We wrap it with a script that returns sensible defaults.
 - **`/sbin/ustorage`**: the UNVR has a storage daemon (`usd`) that reports disk topology. It crashes in a VM. We provide a fake script that returns the size of `/srv` instead, and mask the real services.
 - **`/sbin/mdadm`**: the real `unifi-core` runs an `mdadm --detail` check on its storage array roughly every minute. We wrap `mdadm` so this check returns success even when the storage looks different from what `unifi-core` expects. On a real UNVR the array is typically `/dev/md3`; on the VM, the array may have a different device number depending on whether you imported existing disks or let the VM create a fresh array.
+- **`ubntnas`**: the console UI's Update hands the firmware to `ubntnas system upgrade`, which writes a real UNVR's boot partitions (`/dev/sda1/2/5/7`, flash, uboot) - on the VM those `/dev/sd*` are the recording disks. A guard (`vm/wrappers/rootfs/usr/bin/ubntnas`, diverted into place by `install-shims.sh`) refuses that one call and passes everything else to the real binary. Update with `update-unifi.sh` instead.
 - **Storage array existence**: the install script creates a small array so `unifi-core` and the storage stack have something to look at. See **Storage layout** below for what this means for multi-disk setups.
 
 ### Services we disable
