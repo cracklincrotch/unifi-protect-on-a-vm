@@ -337,8 +337,8 @@ or host-side state.
 3. **Network allowlist.** The proxy permits only `fw-update.ubnt.com`,
    `fw-update.ui.com` and `fw-download.ubnt.com` (add `deb.debian.org`,
    `security.debian.org`, `apt.postgresql.org`, `nginx.org`,
-   `apt.artifacts.ui.com` for step 10, plus `www.postgresql.org` and
-   `github.com` for step 11). Export `https_proxy`/`http_proxy` only in the
+   `apt.artifacts.ui.com` for step 12; those plus `www.postgresql.org` and
+   `github.com` for step 13). Export `https_proxy`/`http_proxy` only in the
    root shell that runs the scripts; systemd services, unifi-core included,
    get no proxy and so no way out. Check before going on: `ip route` shows only
    the user-mode route; `getent hosts api.ui.com` and
