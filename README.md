@@ -668,7 +668,7 @@ Once running, updates are handled by `update-unifi.sh`:
 ```bash
 ./update-unifi.sh              # Show what's available
 ./update-unifi.sh --check      # Same as default
-./update-unifi.sh --sync-os    # Update UniFi OS packages from latest UNVR firmware
+./update-unifi.sh --sync-os    # Update UniFi OS packages from the newest UNVR firmware on OS_TRACK
 ./update-unifi.sh --protect    # Update Protect to latest stable
 ./update-unifi.sh --access     # Update Access to latest stable
 ./update-unifi.sh --all        # Sync OS + upgrade Protect + Access

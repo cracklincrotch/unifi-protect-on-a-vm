@@ -4,11 +4,17 @@
 # could reach is a stub on PATH, and the firmware is replaced by fixtures.
 #
 #   update-unifi.sh               version / track / platform helpers, the
-#                                 firmware pick, the Debian guard, the
-#                                 install-landed check, the ufcd mask
-#   install-protect-baremetal.sh  fw_api_href, the ufcd mask, the platform
+#                                 firmware pick, the Debian line and image
+#                                 guards, the install-landed check, the ufcd
+#                                 mask, the deb11/deb13 lag note, --help
+#   install-protect-baremetal.sh  fw_api_href, the track block, its guard,
+#                                 the ufcd mask, the platform
 #   unifi-core-storage-patch.sh   5.1 patch, 6.0 no-op, anchor-drift alert
 #   ustorage                      worm check, unknown verbs
+#   ubntnas guard                 refuses `system upgrade`, passes the rest
+#
+# Needs bash, python3 and jq. Written for Linux; it also runs on macOS
+# (checks that need dpkg are skipped there).
 #
 # usage: vm/tests/test_unifi_os6_compat.sh
 #        FW_ROOT_51=<5.1.33 squashfs-root> FW_ROOT_60=<6.0.11 squashfs-root> \
@@ -23,6 +29,8 @@ UPD="$VM/installers/update-unifi.sh"
 INST="$VM/installers/install-protect-baremetal.sh"
 PATCH="$VM/storage/rootfs/usr/local/bin/unifi-core-storage-patch.sh"
 UST="$VM/storage/rootfs/usr/bin/ustorage"
+GUARD="$VM/wrappers/rootfs/usr/bin/ubntnas"
+SHIMS="$VM/installers/install-shims.sh"
 T=$(mktemp -d /tmp/os6test.XXXX)
 trap 'rm -rf "$T"' EXIT
 pass=0; fail=0
@@ -143,30 +151,64 @@ check "pick_newest_firmware: a higher major wins" '[ "$(jq -r .version <<<"$out"
 out=$(upd pick_newest_firmware < "$T/list-empty.json"; echo "rc=$?")
 check "pick_newest_firmware: empty listing -> nothing" '[ "$out" = "rc=0" ]' "$out"
 
-# get_os_firmware with api_get / get_latest_version stubbed.
-gof() {  # gof <track> <listing file> [FW_API_LIMIT]
+# get_os_firmware with api_get / get_latest_version stubbed. The stub answers
+# firmware-latest from $LATEST (default: the same file) and the listing
+# from $LISTING.
+gof() {  # gof <track> <listing file> [FW_API_LIMIT] [firmware-latest file]
     ( source "$UPD"
       [ -n "${3:-}" ] && FW_API_LIMIT=$3
-      api_get() { echo "$1" >> "$T/urls"; cat "$LISTING"; }
+      api_get() {
+          echo "$1" >> "$T/urls"
+          case "$1" in *firmware-latest*) cat "$LATEST" ;; *) cat "$LISTING" ;; esac
+      }
       get_latest_version() { echo "get_latest_version $*" >> "$T/urls"; echo '{"version":"vLATEST"}'; }
-      LISTING="$2" get_os_firmware "$1" )
+      LISTING="$2" LATEST="${4:-$2}" get_os_firmware "$1" )
 }
-: > "$T/urls"; out=$(gof 5.1 "$T/list-5.json" 2>&1)
+listing "$(fwent 5 1 33)" > "$T/latest-5.json"
+: > "$T/urls"; out=$(gof 5.1 "$T/list-5.json" "" "$T/latest-5.json" 2>&1)
 u=$(cat "$T/urls")
-check "get_os_firmware 5.1 queries the listing, filtered and with a limit" \
-    'grep -q "/api/firmware?" <<<"$u" && grep -q "product~~unifi-nvr" <<<"$u" && grep -q "channel~~release" <<<"$u" && grep -q "platform~~UNVR" <<<"$u" && grep -q "version_major~~5&filter=eq~~version_minor~~1&limit=500" <<<"$u"' "$u"
-check "get_os_firmware 5.1 returns 5.1.33" '[ "$(jq -r .version <<<"$out")" = v5.1.33+abc ]' "$out"
+check "get_os_firmware 5.1 asks firmware-latest with the version filters first" \
+    '[ "$(grep -c . <<<"$u")" = 1 ] && grep -q "/api/firmware-latest?filter=eq~~product~~unifi-nvr&filter=eq~~channel~~release&filter=eq~~platform~~UNVR&filter=eq~~version_major~~5&filter=eq~~version_minor~~1$" <<<"$u"' "$u"
+check "get_os_firmware 5.1 returns the server's pick (5.1.33)" '[ "$(jq -r .version <<<"$out")" = v5.1.33+abc ]' "$out"
+: > "$T/urls"; out=$(gof 5.1 "$T/list-5.json" "" "$T/list-empty.json" 2>&1)
+u=$(cat "$T/urls")
+check "get_os_firmware falls back to the listing, filtered and with a limit" \
+    'grep -q "/api/firmware?.*version_major~~5&filter=eq~~version_minor~~1&limit=500" <<<"$u" && [ "$(jq -r .version <<<"$out")" = v5.1.33+abc ]' "$u
+$out"
 : > "$T/urls"; out=$(gof latest "$T/list-5.json" 2>&1)
 check "get_os_firmware latest keeps the firmware-latest query" \
     'grep -q "get_latest_version unifi-nvr release UNVR" "$T/urls" && [ "$(jq -r .version <<<"$out")" = vLATEST ]' "$(cat "$T/urls")"
 out=$(gof 6.x "$T/list-5.json" 2>&1); rc=$?
 check "get_os_firmware rejects a bad track" '[ $rc != 0 ] && grep -q "is not .latest." <<<"$out"' "$out"
-out=$(gof 5 "$T/list-5.json" 4 2>&1 >/dev/null)
+out=$(gof 5 "$T/list-5.json" 4 "$T/list-empty.json" 2>&1 >/dev/null)
 check "get_os_firmware warns when the listing fills its limit" 'grep -q "hit its limit" <<<"$out"' "$out"
 echo '<html>502 Bad Gateway</html>' > "$T/list-html.json"
 out=$(gof 5 "$T/list-html.json" 2>&1); rc=$?
 check "get_os_firmware: a non-JSON answer is a clear error" \
     '[ $rc != 0 ] && grep -q "unexpected answer from the firmware API" <<<"$out" && ! grep -q "integer expression" <<<"$out"' "$out"
+# Two builds of one version: the later one wins.
+twin() { fwent 5 1 33 | sed "s/sha-5.1.33/sha-$1/; s/\"file_size\"/\"created\":\"$2\",\"file_size\"/"; }
+listing "$(twin new 2026-09-11T00:00:00Z)" "$(twin old 2026-09-10T00:00:00Z)" > "$T/list-twins.json"
+check "pick_newest_firmware: a tie on version goes to the newer build" \
+    '[ "$(upd pick_newest_firmware < "$T/list-twins.json" | jq -r .sha256)" = sha-new ]' "$(upd pick_newest_firmware < "$T/list-twins.json")"
+
+# The Debian line check that refuses before the snapshot and the download.
+out=$(upd fw_line_matches_debian v6.0.11+dd9ab55 bullseye 2>&1); rc=$?
+check "fw_line_matches_debian: 6.0.11 on bullseye -> refused, nothing downloaded" \
+    '[ $rc != 0 ] && grep -q "UniFi OS 6.0.11 is not the 5.x line built on Debian .bullseye." <<<"$out" && grep -q "Nothing was downloaded" <<<"$out"' "$out"
+check "fw_line_matches_debian: 5.1.33 on bullseye, 6.0.11 on trixie -> fine" \
+    'upd fw_line_matches_debian v5.1.33+44ce47b bullseye && upd fw_line_matches_debian v6.0.11+dd9ab55 trixie' ""
+check "fw_line_matches_debian: unknown Debian or version -> no opinion" \
+    'upd fw_line_matches_debian v6.0.11+dd9ab55 bookworm && upd fw_line_matches_debian "" bullseye' ""
+
+# The deb11/deb13 lag note (dpkg --compare-versions; skipped without dpkg).
+if command -v dpkg >/dev/null 2>&1; then
+    out=$(upd platform_lag_note unifi-protect v7.3.70 v7.4.1)
+    check "platform_lag_note: newer on deb13 -> warning" \
+        'grep -q "unifi-protect 7.4.1 is out for uos-deb13-arm64, deb11 has only 7.3.70" <<<"$out"' "$out"
+    check "platform_lag_note: same, older or unknown -> silent" \
+        '[ -z "$(upd platform_lag_note unifi-access v4.3.22+12152 v4.3.22+12152)$(upd platform_lag_note a v2 v1)$(upd platform_lag_note a v2 null)$(upd platform_lag_note a v2 "")" ]' ""
+fi
 
 ###############################################################################
 # update-unifi.sh: the Debian guard and the install-landed check
@@ -182,27 +224,43 @@ mkdir -p "$T/fwnone"
 out=$(upd fw_debian_matches "$T/fwnone" bullseye 2>&1); rc=$?
 check "fw_debian_matches refuses a root without os-release" '[ $rc != 0 ] && grep -q "Debian .unknown." <<<"$out"' "$out"
 
-# dpkg-query stub: --admindir answers for the firmware, otherwise the system
-# (version, or the db:Status-Abbrev the guest's dpkg would print).
+# dpkg-query stub: --admindir answers from $T/fwdb, otherwise from $T/sysdb
+# ("<package> <version> <status>" lines; the status is what the guest's
+# dpkg prints for ${db:Status-Abbrev}).
 cat > "$T/bin/dpkg-query" <<EOF
 #!/bin/sh
+for last; do :; done
+case "\$*" in *--admindir*) db="$T/fwdb" ;; *) db="$T/sysdb" ;; esac
+line=\$(grep "^\$last " "\$db") || exit 1
 case "\$*" in
-    *--admindir*)    [ -n "\$FW_CORE" ] && printf '%s' "\$FW_CORE" && exit 0; exit 1 ;;
-    *Status-Abbrev*) [ -n "\$SYS_CORE" ] && printf '%s' "\${SYS_STATUS:-ii }" && exit 0; exit 1 ;;
-    *)               [ -n "\$SYS_CORE" ] && printf '%s' "\$SYS_CORE" && exit 0; exit 1 ;;
+    *Status-Abbrev*) printf '%s ' "\$(echo "\$line" | cut -d' ' -f3)" ;;
+    *)               printf '%s' "\$(echo "\$line" | cut -d' ' -f2)" ;;
 esac
 EOF
 chmod +x "$T/bin/dpkg-query"
-out=$(FW_CORE=6.0.123 SYS_CORE=6.0.123 upd fw_install_landed "$T/fw60" 2>&1); rc=$?
-check "fw_install_landed: unifi-core at the firmware's version" '[ $rc = 0 ]' "$out"
-out=$(FW_CORE=6.0.123 SYS_CORE=5.1.132 upd fw_install_landed "$T/fw60" 2>&1); rc=$?
-check "fw_install_landed: unifi-core left behind -> refuse to stamp" \
-    '[ $rc != 0 ] && grep -q "unifi-core is .5.1.132. (dpkg status .ii.), the firmware carries .6.0.123." <<<"$out"' "$out"
-out=$(FW_CORE=6.0.123 SYS_CORE=6.0.123 SYS_STATUS="iF " upd fw_install_landed "$T/fw60" 2>&1); rc=$?
+mkdir -p "$T/debs"
+printf 'unifi-core\nustd \nubnt-tools\nunvr-al324-base-files\nunifi-protect\nlinux-image-4.19.152-alpine-unvr\n' > "$T/packages.txt"
+for d in unifi-core_6.0.123 ustd_6.0.9 ubnt-tools_6.0.20 unifi-protect_7.2.105; do : > "$T/debs/${d}_arm64.deb"; done
+printf 'unifi-core 6.0.123 ii\nustd 6.0.9 ii\nubnt-tools 6.0.20 ii\nunvr-al324-base-files 6.0.102 ii\nunifi-protect 7.2.105 ii\n' > "$T/fwdb"
+landed() { upd fw_install_landed "$T/fw60" "$T/packages.txt" "$T/debs" 2>&1; }
+printf 'unifi-core 6.0.123 ii\nustd 6.0.9 ii\nubnt-tools 6.0.20 ii\nunvr-al324-base-files 5.1.144 ii\nunifi-protect 7.3.70 ii\n' > "$T/sysdb"
+out=$(landed); rc=$?
+check "fw_install_landed: every repacked package at the firmware's version -> landed" \
+    '[ $rc = 0 ] && [ -z "$out" ]' "$out"
+check "fw_install_landed: a failed repack and the skipped packages are not counted" \
+    '[ $rc = 0 ]' "$out"
+printf 'unifi-core 6.0.123 ii\nustd 5.1.18 ii\nubnt-tools 6.0.20 ii\n' > "$T/sysdb"
+out=$(landed); rc=$?
+check "fw_install_landed: one package left behind -> refuse, and name it" \
+    '[ $rc != 0 ] && grep -q "ustd is .5.1.18. (dpkg status .ii.), the firmware carries .6.0.9." <<<"$out" && grep -q "the install did not complete" <<<"$out" && ! grep -q "unifi-core is" <<<"$out"' "$out"
+printf 'unifi-core 6.0.123 ii\nustd 6.0.9 ii\nubnt-tools 6.0.20 iF\n' > "$T/sysdb"
+out=$(landed); rc=$?
 check "fw_install_landed: right version but half-configured -> refuse" \
-    '[ $rc != 0 ] && grep -q "dpkg status .iF." <<<"$out"' "$out"
-out=$(FW_CORE= SYS_CORE=5.1.132 upd fw_install_landed "$T/fw60" 2>&1); rc=$?
-check "fw_install_landed: firmware without unifi-core -> refuse" '[ $rc != 0 ]' "$out"
+    '[ $rc != 0 ] && grep -q "ubnt-tools is .6.0.20. (dpkg status .iF.)" <<<"$out"' "$out"
+printf 'ustd 6.0.9 ii\nubnt-tools 6.0.20 ii\n' > "$T/sysdb"
+out=$(landed); rc=$?
+check "fw_install_landed: a package missing on the system -> refuse" \
+    '[ $rc != 0 ] && grep -q "unifi-core is .not installed." <<<"$out"' "$out"
 rm -f "$T/bin/dpkg-query"
 
 # How sync_os_packages and the action dispatch use them (order, not runs).
@@ -212,7 +270,14 @@ check "sync_os_packages: Debian guard comes before services are stopped" \
 check "sync_os_packages: /usr/lib/version is copied only after fw_install_landed" \
     'grep -A1 "if fw_install_landed" "$UPD" | grep -qF "cp \"\$sqfs_root/usr/lib/version\" /usr/lib/version" && [ "$(grep -cF "/usr/lib/version\" /usr/lib/version" "$UPD")" = 1 ]' ""
 check "sync_os_packages: the version diff skips the bundled app packages" \
-    'grep -qF "linux-image-*|unvr-initramfs|unifi-protect|ai-feature-*|unifi-access)" "$UPD"' ""
+    'upd sync_skips_package unifi-protect && upd sync_skips_package ai-feature-controller && upd sync_skips_package unifi-access && upd sync_skips_package linux-image-4.19.152-alpine-unvr && upd sync_skips_package unvr-initramfs && ! upd sync_skips_package unifi-core && [ "$(grep -c "sync_skips_package \"\$pkg\" && continue" "$UPD")" = 2 ]' ""
+check "sync-os and --all refuse another Debian's line before the snapshot" \
+    '[ "$(grep -B1 "recommend_snapshot \"sync UniFi OS" "$UPD" | grep -c "fw_line_matches_debian \"\$FW_VERSION\" \"\$SYSTEM_DEBIAN\" || exit 1")" = 2 ]' "$(grep -B1 "recommend_snapshot \"sync UniFi OS" "$UPD")"
+check "a bad or empty OS_TRACK is fatal only for --sync-os and --all" \
+    'grep -A3 "if ! FW_INFO=\$(get_os_firmware" "$UPD" | grep -q "sync-os|all)"' ""
+out=$(bash "$UPD" --help 2>&1); rc=$?
+check "--help shows the usage and OS_TRACK" \
+    '[ $rc = 0 ] && grep -q -- "--os-track 5.1" <<<"$out" && grep -q "OS_TRACK            - Which UNVR firmware" <<<"$out"' "$out"
 check "--all skips the app upgrades when the OS sync is incomplete" \
     'grep -A3 "sync_os_packages$" "$UPD" | grep -q "SYNC_INCOMPLETE"' ""
 
@@ -324,6 +389,38 @@ check "patch: call with extra arguments + drifted anchor -> still alerts" 'grep 
 printf '%s\n' '/* fixture */abc={space:e,disks:[],sdcards:[]};' > "$T/svcshape.js"
 out=$(runpatch "$T/svcshape.js")
 check "patch: snapshot shape without the call -> anchor check, alert" 'grep -q "ALERT" <<<"$out"' "$out"
+
+###############################################################################
+# ubntnas guard: the console UI's Update must not reach ubntnas
+###############################################################################
+# A fake real binary that records how it was called.
+cat > "$T/ubntnas.real" <<EOF
+#!/bin/sh
+echo "real \$*" >> "$T/real.calls"
+exit 7
+EOF
+chmod +x "$T/ubntnas.real"
+guard() { : > "$T/real.calls"; reset_calls; UBNTNAS_REAL="$T/ubntnas.real" bash "$GUARD" "$@"; }
+out=$(guard system upgrade /tmp/fwupdate.abc -f --no-reboot); rc=$?
+check "ubntnas guard: ubnt-systool's 'system upgrade <file> -f --no-reboot' is refused" \
+    '[ $rc = 1 ] && grep -q "disabled on this VM" <<<"$out" && grep -q "update-unifi.sh --sync-os" <<<"$out" && [ ! -s "$T/real.calls" ]' "$out"
+check "ubntnas guard: the refusal is logged" \
+    'grep -q "logger -t ubntnas-vm-guard -p daemon.warning refused: ubntnas system upgrade /tmp/fwupdate.abc -f --no-reboot" <<<"$(calls)"' "$(calls)"
+out=$(guard -v system upgrade /tmp/f); rc=$?
+check "ubntnas guard: a global flag in front does not get past" '[ $rc = 1 ] && [ ! -s "$T/real.calls" ]' "$out"
+out=$(guard system reset --no-reboot --do-format); rc=$?
+check "ubntnas guard: everything else (system reset ...) runs the real binary, args and rc intact" \
+    '[ $rc = 7 ] && [ "$(cat "$T/real.calls")" = "real system reset --no-reboot --do-format" ]' "$out
+$(cat "$T/real.calls")"
+out=$(UBNTNAS_REAL="$T/missing" bash "$GUARD" system reset 2>&1); rc=$?
+check "ubntnas guard: no real binary -> clear error, not a loop" '[ $rc = 1 ] && grep -q "no real ubntnas" <<<"$out"' "$out"
+cp "$GUARD" "$T/guard-as-real"
+to=(); command -v timeout >/dev/null 2>&1 && to=(timeout 10)   # none on macOS
+out=$(UBNTNAS_REAL="$T/guard-as-real" "${to[@]}" bash "$GUARD" system reset 2>&1); rc=$?
+check "ubntnas guard: refuses to exec itself as the real binary" '[ $rc = 1 ] && grep -q "no real ubntnas" <<<"$out"' "$out"
+check "install-shims.sh diverts ubntnas to ubntnas.real and installs the guard" \
+    'grep -q "dpkg-divert --local --rename --divert /usr/bin/ubntnas.real" "$SHIMS" && grep -qF "wrappers/rootfs/usr/bin/ubntnas" "$SHIMS" && grep -q "mv -f /usr/bin/ubntnas.new /usr/bin/ubntnas" "$SHIMS"' ""
+check "--verify checks the ubntnas guard" 'grep -q "ubntnas firmware-update guard" "$UPD"' ""
 
 ###############################################################################
 # ustorage: worm check (new in 6.0) and unknown verbs

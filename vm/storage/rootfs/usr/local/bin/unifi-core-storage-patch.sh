@@ -90,7 +90,7 @@ if ! grep -qF '"ustorage",["space","inspect"' "$SVC" &&
     exit 0
 fi
 
-n=$(grep -oF "$ANCHOR" "$SVC" 2>/dev/null | wc -l)
+n=$(grep -oF "$ANCHOR" "$SVC" 2>/dev/null | wc -l | tr -d "[:space:]")  # BSD wc pads
 if [ "$n" != "1" ]; then
     alert "Patch A anchor not found (count=$n) in service.js — the Storage disk LIST will be empty. A unifi-core update likely renamed the minified identifiers; re-derive the anchor for this version."
     exit 0

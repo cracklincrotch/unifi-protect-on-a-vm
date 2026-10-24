@@ -35,7 +35,7 @@
 # Usage:
 #   ./update-unifi.sh                # Show what would be updated, no changes
 #   ./update-unifi.sh --check        # Same as default
-#   ./update-unifi.sh --sync-os      # Sync UniFi OS packages to latest firmware
+#   ./update-unifi.sh --sync-os      # Sync UniFi OS packages to the newest firmware on OS_TRACK
 #   ./update-unifi.sh --protect      # Upgrade Protect to latest stable
 #   ./update-unifi.sh --protect-edge # Upgrade Protect to latest edge
 #   ./update-unifi.sh --access       # Upgrade Access to latest stable
@@ -166,12 +166,13 @@ os_track_filters() {
     return 0
 }
 
-# Newest build in an /api/firmware listing (stdin), printed the way
-# get_latest_version prints one; nothing if the listing is empty. Sorted
-# numerically here because the API returns the list unordered.
+# Newest build in a firmware-latest answer or an /api/firmware listing
+# (stdin), printed the way get_latest_version prints one; nothing if there
+# is none. Sorted numerically (the listing comes unordered), ties broken by
+# creation time.
 pick_newest_firmware() {
     jq -r '[._embedded.firmware[]? | select(.version_major != null)]
-        | sort_by(.version_major, .version_minor, .version_patch) | last
+        | sort_by(.version_major, .version_minor, .version_patch, .created) | last
         | if . == null then empty else {
             version: .version,
             url: ._links.data.href,
@@ -181,10 +182,12 @@ pick_newest_firmware() {
 }
 
 # The newest UNVR release on OS_TRACK ($1), printed like get_latest_version.
-# 'latest' is the firmware-latest query this script always used. Uses
-# api_get and get_latest_version from HELPERS below, at call time.
+# 'latest' is the firmware-latest query this script always used. A track
+# asks firmware-latest with the version filters first, so the server's own
+# pick (staged rollouts included) wins; the full listing is the fallback.
+# Uses api_get and get_latest_version from HELPERS below, at call time.
 get_os_firmware() {
-    local track="$1" filters url response n
+    local track="$1" filters query response picked n
     if [ "$track" = latest ]; then
         get_latest_version "unifi-nvr" "release" "$PLATFORM"
         return
@@ -193,9 +196,15 @@ get_os_firmware() {
         echo "ERROR: OS_TRACK '$track' is not 'latest', 5, 5.1 or 5.1.33" >&2
         return 1
     fi
-    url="${FW_API_LIST}?filter=eq~~product~~unifi-nvr&filter=eq~~channel~~release"
-    url="${url}&filter=eq~~platform~~${PLATFORM}${filters}&limit=${FW_API_LIMIT}"
-    response=$(api_get "$url")
+    query="filter=eq~~product~~unifi-nvr&filter=eq~~channel~~release"
+    query="${query}&filter=eq~~platform~~${PLATFORM}${filters}"
+    response=$(api_get "${FW_API}?${query}" || true)
+    picked=$(echo "$response" | pick_newest_firmware 2>/dev/null || true)
+    if [ -n "$picked" ]; then
+        echo "$picked"
+        return 0
+    fi
+    response=$(api_get "${FW_API_LIST}?${query}&limit=${FW_API_LIMIT}")
     if [ -z "$response" ]; then
         echo "ERROR: Failed to query API for unifi-nvr on track $track" >&2
         return 1
@@ -209,6 +218,23 @@ get_os_firmware() {
              "the newest build may be missing" >&2
     fi
     echo "$response" | pick_newest_firmware
+}
+
+# 0 if firmware version $1 belongs to the UniFi OS line built on Debian
+# codename $2 (bullseye: 5.x, trixie: 6.x), or if that is unknown either way.
+# Otherwise say so and return 1. Lets --sync-os refuse before the snapshot
+# and the download; fw_debian_matches stays as the check on the image itself.
+fw_line_matches_debian() {
+    local short line
+    short="$(os_version_of "${1:-}")"
+    line="$(os_track_for_debian "${2:-}")"
+    if [ -z "$short" ] || [ "$line" = latest ] || [ "${short%%.*}" = "$line" ]; then
+        return 0
+    fi
+    echo "ERROR: UniFi OS $short is not the $line.x line built on Debian" \
+         "'${2:-}': its packages cannot be installed here. Nothing was" \
+         "downloaded. See docs/unifi-os-6-compat.md." >&2
+    return 1
 }
 
 # 0 if the unpacked firmware root $1 is built on Debian codename $2 (this
@@ -228,23 +254,53 @@ fw_debian_matches() {
     return 1
 }
 
-# 0 if unifi-core is installed and configured ("ii") at the version the
-# firmware root $1 carries: the sign that --sync-os really installed the
-# firmware's packages. unifi-core is the marker; a firmware that kept
-# unifi-core's version would pass even if other packages failed.
-fw_install_landed() {
-    local want have status
-    want="$(dpkg-query --admindir="$1/var/lib/dpkg/" -W -f='${Version}' \
-        unifi-core 2>/dev/null || true)"
-    have="$(dpkg-query -W -f='${Version}' unifi-core 2>/dev/null || true)"
-    status="$(dpkg-query -W -f='${db:Status-Abbrev}' unifi-core 2>/dev/null || true)"
-    if [ -n "$want" ] && [ "$have" = "$want" ] && [ "${status%% *}" = ii ]; then
-        return 0
-    fi
-    echo "ERROR: unifi-core is '${have:-not installed}' (dpkg status" \
-         "'${status%% *}'), the firmware carries '${want:-unknown}':" \
-         "the install did not complete." >&2
+# Firmware packages --sync-os never installs: the UNVR kernel and initramfs,
+# and the bundled apps that upgrade_protect / upgrade_access own.
+sync_skips_package() {
+    case "$1" in
+        linux-image-*|unvr-initramfs|unifi-protect|ai-feature-*|unifi-access) return 0 ;;
+    esac
     return 1
+}
+
+# 0 if every package --sync-os offered to apt is installed and configured
+# ("ii") at the version the firmware root $1 carries. $2 lists the
+# firmware's Ubiquiti packages (packages.txt); $3 is the repack directory:
+# a package without a deb there failed to repack and was never offered.
+fw_install_landed() {
+    local root="$1" list="$2" debs="$3" pkg want have status bad=0
+    while read -r pkg; do
+        [ -n "$pkg" ] || continue
+        sync_skips_package "$pkg" && continue
+        compgen -G "$debs/${pkg}_*.deb" >/dev/null || continue
+        want="$(dpkg-query --admindir="$root/var/lib/dpkg/" -W -f='${Version}' \
+            "$pkg" 2>/dev/null || true)"
+        have="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+        status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$pkg" 2>/dev/null || true)"
+        if [ -n "$want" ] && [ "$have" = "$want" ] && [ "${status%% *}" = ii ]; then
+            continue
+        fi
+        echo "ERROR: $pkg is '${have:-not installed}' (dpkg status" \
+             "'${status%% *}'), the firmware carries '${want:-unknown}'." >&2
+        bad=1
+    done < "$list"
+    if [ "$bad" = 1 ]; then
+        echo "ERROR: the install did not complete." >&2
+        return 1
+    fi
+    return 0
+}
+
+# A note when app $1 is newer for Debian 13 ($3) than for Debian 11 ($2):
+# the sign that the deb11 line is falling behind. Silent otherwise.
+platform_lag_note() {
+    local a="${2#v}" b="${3#v}"
+    [ -n "$a" ] && [ "$a" != null ] && [ -n "$b" ] && [ "$b" != null ] || return 0
+    if dpkg --compare-versions "$b" gt "$a" 2>/dev/null; then
+        echo "    WARNING: $1 $b is out for uos-deb13-arm64, deb11 has only $a."
+        echo "    The Debian 11 line is falling behind; see docs/unifi-os-6-compat.md."
+    fi
+    return 0
 }
 
 DEB_PLATFORM="${DEB_PLATFORM:-$(uos_deb_platform "$(os_release_field /etc/os-release VERSION_ID)")}"
@@ -321,6 +377,10 @@ verify_shims() {
     if [ -e /lib/systemd/system/ufcd.service ] || [ -e /usr/lib/systemd/system/ufcd.service ]; then
         [ "$(systemctl is-enabled ufcd.service 2>/dev/null)" = masked ]; _ck $? "ufcd masked"
     fi
+    if dpkg-query -W -f='${Status}' ubntnas 2>/dev/null | grep -q 'install ok installed'; then
+        head -3 /usr/bin/ubntnas 2>/dev/null | grep -q 'ubntnas-vm-guard' &&
+            [ -x /usr/bin/ubntnas.real ]; _ck $? "ubntnas firmware-update guard (UI Update refused)"
+    fi
     grep -q 'UUUU' /proc/mdstat 2>/dev/null;                      _ck $? "md array [UUUU]"
     [ -s /var/run/anonymous_device_id ];                          _ck $? "anonymous_device_id present"
     printf "    versions: unifi-core=%s unifi-protect=%s node=%s\n" \
@@ -357,7 +417,8 @@ while [ $# -gt 0 ]; do
         --yes|-y)       ASSUME_YES=1 ;;
         --verify)       ACTION="verify" ;;
         --help|-h)
-            sed -n '2,32p' "$0" | sed 's/^# \?//'
+            # The whole header: what it does, usage, environment (OS_TRACK ...).
+            sed -n '2,/^# Run as root\./p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -700,18 +761,33 @@ echo ">>> Fetching firmware metadata from Ubiquiti..."
 
 SYSTEM_DEBIAN="$(os_release_field /etc/os-release VERSION_CODENAME)"
 OS_TRACK="${OS_TRACK:-$(os_track_for_debian "$SYSTEM_DEBIAN")}"
-FW_INFO=$(get_os_firmware "$OS_TRACK")
-if [ -z "$FW_INFO" ]; then
-    echo "ERROR: no UNVR release on OS_TRACK=$OS_TRACK" >&2
-    exit 1
+# Fatal only where the firmware is used: --protect, --access and --check
+# carry on with the OS line unknown.
+if ! FW_INFO=$(get_os_firmware "$OS_TRACK") || [ -z "$FW_INFO" ]; then
+    case "$ACTION" in
+        sync-os|all)
+            echo "ERROR: no UNVR release on OS_TRACK=$OS_TRACK" >&2
+            exit 1 ;;
+    esac
+    echo "WARNING: no UNVR release on OS_TRACK=$OS_TRACK; UniFi OS is not compared." >&2
+    FW_INFO='{}'
 fi
 # The API's newest build, any major, to say so when the track excludes it.
 FW_NEWEST_VERSION=$(get_latest_version "unifi-nvr" "release" "$PLATFORM" \
     2>/dev/null | jq -r '.version' 2>/dev/null || true)
 PROTECT_INFO=$(get_latest_version "unifi-protect" "$PROTECT_CHANNEL" "$DEB_PLATFORM")
 ACCESS_INFO=$(get_latest_version "unifi-access" "$PROTECT_CHANNEL" "$DEB_PLATFORM")
+# On deb11, the same apps' deb13 builds: the day Debian 13 gets a newer
+# Protect or Access than Debian 11, the deb11 line is ending.
+PROTECT_DEB13_VERSION="" ACCESS_DEB13_VERSION=""
+if [ "$DEB_PLATFORM" = uos-deb11-arm64 ]; then
+    PROTECT_DEB13_VERSION=$(get_latest_version "unifi-protect" "$PROTECT_CHANNEL" \
+        uos-deb13-arm64 2>/dev/null | jq -r '.version' 2>/dev/null || true)
+    ACCESS_DEB13_VERSION=$(get_latest_version "unifi-access" "$PROTECT_CHANNEL" \
+        uos-deb13-arm64 2>/dev/null | jq -r '.version' 2>/dev/null || true)
+fi
 
-FW_VERSION=$(echo "$FW_INFO" | jq -r '.version')
+FW_VERSION=$(echo "$FW_INFO" | jq -r '.version // empty')
 FW_DOWNLOAD_URL=$(echo "$FW_INFO" | jq -r '.url')
 FW_SHA=$(echo "$FW_INFO" | jq -r '.sha256')
 
@@ -749,8 +825,13 @@ CURRENT_OS_SHORT="$(os_version_of "$CURRENT_OS_VERSION")"
 
 echo ""
 echo "Current versions:"
-print_version "UniFi OS"          "${CURRENT_OS_SHORT:-$CURRENT_OS_VERSION}" \
-                                  "$(os_version_of "$FW_VERSION")"
+FW_SHORT="$(os_version_of "$FW_VERSION")"
+if [ -n "$FW_SHORT" ]; then
+    print_version "UniFi OS"      "${CURRENT_OS_SHORT:-$CURRENT_OS_VERSION}" "$FW_SHORT"
+else
+    printf "    %-30s %s (not compared: no firmware on this track)\n" \
+        "UniFi OS" "${CURRENT_OS_SHORT:-$CURRENT_OS_VERSION}"
+fi
 print_version "unifi-protect"     "$CURRENT_PROTECT"    "$PROTECT_VERSION"
 print_version "unifi-access"      "$CURRENT_ACCESS"     "$ACCESS_VERSION"
 echo "    ai-feature package         resolved from Protect at install"
@@ -764,13 +845,13 @@ if [ -n "$FW_NEWEST_VERSION" ] && [ "$FW_NEWEST_VERSION" != "null" ] &&
     echo "    not installed unless OS_TRACK allows it. A different major can"
     echo "    need a different Debian base (6.x does: docs/unifi-os-6-compat.md)."
 fi
-FW_SHORT="$(os_version_of "$FW_VERSION")"
 TRACK_FOR_DEBIAN="$(os_track_for_debian "$SYSTEM_DEBIAN")"
-if [ "$TRACK_FOR_DEBIAN" != latest ] && [ -n "$FW_SHORT" ] &&
-   [ "${FW_SHORT%%.*}" != "$TRACK_FOR_DEBIAN" ]; then
+if ! fw_line_matches_debian "$FW_VERSION" "$SYSTEM_DEBIAN" 2>/dev/null; then
     echo "    WARNING: UniFi OS $FW_SHORT is not the $TRACK_FOR_DEBIAN.x line built on"
-    echo "    Debian $SYSTEM_DEBIAN; --sync-os will refuse it after the download."
+    echo "    Debian $SYSTEM_DEBIAN; --sync-os and --all will refuse it."
 fi
+platform_lag_note unifi-protect "$PROTECT_VERSION" "$PROTECT_DEB13_VERSION"
+platform_lag_note unifi-access "$ACCESS_VERSION" "$ACCESS_DEB13_VERSION"
 if [ -n "$CURRENT_OS_SHORT" ] && [ -n "$FW_SHORT" ] &&
    dpkg --compare-versions "$FW_SHORT" lt "$CURRENT_OS_SHORT" 2>/dev/null; then
     echo "    NOTE: $FW_SHORT is older than the installed $CURRENT_OS_SHORT;"
@@ -854,11 +935,7 @@ sync_os_packages() {
         # own them). Counting those made every sync of the release already
         # installed list phantom "downgrades" of Protect and its AI package
         # and restart the whole stack for nothing.
-        case "$pkg" in
-            linux-image-*|unvr-initramfs|unifi-protect|ai-feature-*|unifi-access)
-                continue
-                ;;
-        esac
+        sync_skips_package "$pkg" && continue
         local current latest
         current=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo "not installed")
         latest=$(dpkg-query --admindir="$sqfs_root/var/lib/dpkg/" -W -f='${Version}' "$pkg" 2>/dev/null || echo "N/A")
@@ -924,10 +1001,10 @@ sync_os_packages() {
     echo ""
     echo ">>> Updating /usr/lib/version..."
     # Only when the install landed. apt's exit code cannot tell (the
-    # mtd-utils hook error above fails good runs too); unifi-core at the
-    # firmware's version can. unifi-core and the stack read this file and
-    # report it as the console's firmware version.
-    if fw_install_landed "$sqfs_root"; then
+    # mtd-utils hook error above fails good runs too); every repacked
+    # package installed at the firmware's version can. unifi-core and the
+    # stack read this file and report it as the console's firmware version.
+    if fw_install_landed "$sqfs_root" "$WORKDIR/packages.txt" "$WORKDIR/debs"; then
         cp "$sqfs_root/usr/lib/version" /usr/lib/version
         echo "    System version is now: $(cat /usr/lib/version)"
     else
@@ -1154,6 +1231,7 @@ upgrade_access() {
 
 case "$ACTION" in
     sync-os)
+        fw_line_matches_debian "$FW_VERSION" "$SYSTEM_DEBIAN" || exit 1
         recommend_snapshot "sync UniFi OS packages to $FW_VERSION"
         sync_os_packages
         ;;
@@ -1166,6 +1244,7 @@ case "$ACTION" in
         upgrade_access
         ;;
     all)
+        fw_line_matches_debian "$FW_VERSION" "$SYSTEM_DEBIAN" || exit 1
         recommend_snapshot "sync UniFi OS + upgrade Protect + upgrade Access"
         sync_os_packages
         # Apps on a half-synced OS would only compound it: report and stop.
