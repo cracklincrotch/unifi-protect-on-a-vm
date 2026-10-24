@@ -129,11 +129,47 @@ FW_URL="${FW_URL:-}"
 # feature package (name and all) from the downloaded Protect deb instead.
 AIFC_STABLE_URL="${AIFC_STABLE_URL:-https://fw-download.ubnt.com/data/ai-feature-console/f3c8-uos-deb11-arm64-1.9.15-3316d322-b5da-4f44-84a3-e823dfef82be.deb}"
 
+# Which UNVR firmware Phase 4 installs when FW_URL is empty. UniFi OS 6.0
+# rebased the firmware on Debian 13 (trixie); 5.x is Debian 11 (bullseye),
+# and the firmware's packages only install on the release they were built
+# for. So the default is the newest release of the major built on THIS
+# system's Debian release (bullseye -> 5), as in update-unifi.sh. Set
+# OS_TRACK=latest for the API's newest of any major (the old behaviour), or
+# 5.1 / 5.1.33 to pin a line or a release. See docs/unifi-os-6-compat.md.
+OS_TRACK="${OS_TRACK:-}"
+# shellcheck disable=SC1091
+OS_CODENAME="$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-}")"
+# shellcheck disable=SC1091
+OS_VERSION_ID="$(. /etc/os-release 2>/dev/null; echo "${VERSION_ID:-}")"
+if [ -z "$OS_TRACK" ]; then
+    case "$OS_CODENAME" in
+        bullseye) OS_TRACK=5 ;;
+        trixie)   OS_TRACK=6 ;;
+        *)        OS_TRACK=latest ;;
+    esac
+fi
+# App debs (Protect, its AI packages) are published per Debian base:
+# uos-deb11-arm64 for 5.x, uos-deb13-arm64 for 6.x.
+case "$OS_VERSION_ID" in ''|*[!0-9]*) OS_VERSION_ID=11 ;; esac
+DEB_PLATFORM="${DEB_PLATFORM:-uos-deb${OS_VERSION_ID}-arm64}"
+
 # Ubiquiti's firmware-update API. Same endpoint the UNVR queries for
 # update notifications. The AI feature package has no fixed endpoint here:
 # its product name comes from Protect's own dependency metadata (Phase 5).
-FW_UPDATE_URL="https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-nvr&filter=eq~~channel~~release&filter=eq~~platform~~${DEVICE}"
-PROTECT_UPDATE_URL="https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-protect&filter=eq~~channel~~release&filter=eq~~platform~~uos-deb11-arm64"
+# firmware-latest returns the newest build of any major; /api/firmware
+# lists builds, filtered here to OS_TRACK (fw_api_href picks the newest).
+if [ "$OS_TRACK" = latest ]; then
+    FW_UPDATE_URL="https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-nvr&filter=eq~~channel~~release&filter=eq~~platform~~${DEVICE}"
+elif [[ "$OS_TRACK" =~ ^([0-9]+)(\.([0-9]+))?(\.([0-9]+))?$ ]]; then
+    FW_UPDATE_URL="https://fw-update.ubnt.com/api/firmware?filter=eq~~product~~unifi-nvr&filter=eq~~channel~~release&filter=eq~~platform~~${DEVICE}&filter=eq~~version_major~~${BASH_REMATCH[1]}"
+    [ -z "${BASH_REMATCH[3]:-}" ] || FW_UPDATE_URL="${FW_UPDATE_URL}&filter=eq~~version_minor~~${BASH_REMATCH[3]:-}"
+    [ -z "${BASH_REMATCH[5]:-}" ] || FW_UPDATE_URL="${FW_UPDATE_URL}&filter=eq~~version_patch~~${BASH_REMATCH[5]:-}"
+    FW_UPDATE_URL="${FW_UPDATE_URL}&limit=500"
+else
+    echo "ERROR: OS_TRACK '$OS_TRACK' is not 'latest', 5, 5.1 or 5.1.33" >&2
+    exit 1
+fi
+PROTECT_UPDATE_URL="https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~unifi-protect&filter=eq~~channel~~release&filter=eq~~platform~~${DEB_PLATFORM}"
 
 # Verbose output during installation
 DEBUG="${DEBUG:-false}"
@@ -196,10 +232,17 @@ cd "$WORKDIR"
 # python3 is already a dependency, so the installer parses the JSON with it
 # and never installs jq — no conflict to resolve.
 ###############################################################################
+# The newest build in the response: firmware-latest holds one, an
+# /api/firmware listing holds several in no particular order.
 fw_api_href() {
     python3 -c 'import json,sys
 try:
-    print(json.load(sys.stdin)["_embedded"]["firmware"][0]["_links"]["data"]["href"] or "")
+    fw = json.load(sys.stdin)["_embedded"]["firmware"]
+    if len(fw) > 1:
+        fw = sorted(fw, key=lambda f: (f.get("version_major") or 0,
+                                       f.get("version_minor") or 0,
+                                       f.get("version_patch") or 0))
+    print(fw[-1]["_links"]["data"]["href"] or "")
 except Exception:
     print("")'
 }
@@ -466,6 +509,21 @@ if [ -z "$SQFS_ROOT" ]; then
     exit 1
 fi
 
+# The firmware's packages only install on the Debian release they were
+# built for (6.0.x is trixie, 5.x bullseye); Phase 5 would fail on every
+# library. Stop before anything is written, /usr/lib/version included.
+FW_OS_RELEASE="$SQFS_ROOT/usr/lib/os-release"
+[ -f "$FW_OS_RELEASE" ] || FW_OS_RELEASE="$SQFS_ROOT/etc/os-release"
+FW_CODENAME="$(sed -n 's/^VERSION_CODENAME=//p' "$FW_OS_RELEASE" 2>/dev/null \
+    | head -1 | tr -d "\"'" || true)"
+if [ -z "$FW_CODENAME" ] || [ "$FW_CODENAME" != "$OS_CODENAME" ]; then
+    echo "ERROR: this firmware is built on Debian '${FW_CODENAME:-unknown}';" >&2
+    echo "  this system runs Debian '${OS_CODENAME:-unknown}'. Its packages" >&2
+    echo "  cannot be installed here. Leave FW_URL and OS_TRACK unset to get" >&2
+    echo "  the newest release for this Debian; see docs/unifi-os-6-compat.md." >&2
+    exit 1
+fi
+
 # Copy firmware version
 cp "$SQFS_ROOT/usr/lib/version" "$WORKDIR/version"
 cp "$WORKDIR/version" /usr/lib/version
@@ -587,7 +645,7 @@ else
     # Query the firmware API for each, download to /opt.
     AI_DEBS=()
     for AI_PKG in "${AI_PKGS[@]}"; do
-        AI_API="https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~${AI_PKG}&filter=eq~~channel~~release&filter=eq~~platform~~uos-deb11-arm64"
+        AI_API="https://fw-update.ubnt.com/api/firmware-latest?filter=eq~~product~~${AI_PKG}&filter=eq~~channel~~release&filter=eq~~platform~~${DEB_PLATFORM}"
         AI_URL="$(wget -q --output-document - "$AI_API" | fw_api_href)"
         if [ -z "$AI_URL" ] || [ "$AI_URL" = "null" ]; then
             echo "ERROR: firmware API has no product '$AI_PKG'" >&2
@@ -1000,7 +1058,10 @@ chown -R postgres:postgres /srv/postgresql 2>/dev/null || true
 #             health. Nothing to monitor on a VM.
 #   sfp/sfpd  Small Form-factor Pluggable daemon. Manages the UNVR's SFP+
 #             optical ports. VM doesn't have any.
-for svc in usd usdbd rpsd uhwd sfp sfpd; do
+#   ufcd      Fan control daemon, new in UniFi OS 6.0 (ustd). Wants usdbd
+#             and the UNVR fans; restarts forever without them. Masking
+#             it on 5.x, where it does not exist, is harmless.
+for svc in usd usdbd rpsd uhwd sfp sfpd ufcd; do
     systemctl stop "${svc}.service" 2>/dev/null || true
     systemctl mask "${svc}.service" 2>/dev/null || true
 done
