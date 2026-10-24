@@ -27,7 +27,7 @@
 #     daemon. Boot mode starts an array that is assembled but not running
 #     because a member is missing (degraded). One that cannot start yet (too
 #     few members) is handed to provision-storage-retry.service, which
-#     mounts it if it starts later and restarts the media services.
+#     mounts it if it starts later and restarts Protect's media stack.
 #   - No Requires=usdbd.service / Wants=uhwd.service: those Ubiquiti daemons
 #     are masked on the VM, as usd is.
 #   - After=swap.target (VM only): /etc/fstab owns the md0 swap (pri=1,

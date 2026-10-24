@@ -9,9 +9,11 @@
 # media services are up by then. `provision-storage.sh retry` looks for a
 # running data array every 5 s for up to 10 minutes (usd's own start limit),
 # mounts it at /volume1 (logging loudly that it is late, and degraded), then
-# restarts ms, msp, msr and mst: msr, started without the array, records
-# nothing until it is restarted. It never assembles, starts, creates or wipes
-# an array, and takes provision-storage.sh's lock so it cannot overlap an
+# runs vm-resume-recover.sh: the media services started without the array
+# (msr records nothing until restarted), and that script restarts them in the
+# only order that works and checks that recording really resumed. It never
+# assembles, starts, creates or wipes an array, and takes
+# provision-storage.sh's lock (not while recovering) so it cannot overlap an
 # Erase.
 #
 # Why a separate unit, not a retry loop inside boot mode: boot mode holds

@@ -18,6 +18,10 @@
 # Order is load-bearing: ms and msr MUST restart together. Restarting ms alone
 # leaves the recorder holding stale state and it logs
 # "BaseOutStream::UnLink ... _pInStream is NULL" while recording nothing.
+#
+# provision-storage.sh (retry) runs this too, after it mounts /volume1 late:
+# the media services started without the array and record nothing until
+# restarted. $1 is then the reason in words instead of a clock gap.
 ###############################################################################
 set -u
 LOG=/var/log/vm-resume-recover.log
@@ -36,7 +40,14 @@ notify() {   # notify <title> <message> [priority]
 }
 
 GAP="${1:-unknown}"
-say "=== resume recovery starting (clock gap ${GAP}s) ==="
+case "$GAP" in
+    ''|*[!0-9]*) WHY="$GAP" ;;                              # a reason in words
+    *)           WHY="VM was paused ${GAP}s, clock stepped" ;;
+esac
+# The array behind /volume1: md3, unless an imported array is mounted there.
+MD=$(awk '$2 == "/volume1" { print $1; exit }' /proc/self/mounts)
+MD=${MD##*/}; MD=${MD:-md3}
+say "=== recovery starting: $WHY ==="
 
 # 1. The accessory API must be served or Protect 7.2 blocks on the peripheral
 #    state stream and records NOTHING no matter how often we restart it.
@@ -65,20 +76,20 @@ systemctl start unifi-protect
 ok=0
 for i in $(seq 1 12); do
     sleep 15
-    a=$(awk '$3=="md3"{print $10}' /proc/diskstats)
+    a=$(awk -v d="$MD" '$3==d{print $10}' /proc/diskstats)
     sleep 10
-    b=$(awk '$3=="md3"{print $10}' /proc/diskstats)
+    b=$(awk -v d="$MD" '$3==d{print $10}' /proc/diskstats)
     mbs=$(( (b-a)*512/10/1024/1024 ))
     n=$(find /volume1/.srv/unifi-protect/video -name '*.ubv' -newermt '-2 minutes' 2>/dev/null | wc -l)
-    say "verify pass $i: md3 ${mbs} MB/s, ${n} .ubv touched in 2 min"
+    say "verify pass $i: $MD ${mbs} MB/s, ${n} .ubv touched in 2 min"
     if [ "$mbs" -ge 5 ] && [ "$n" -ge 5 ]; then ok=1; break; fi
 done
 
 if [ "$ok" = 1 ]; then
     say "=== recovery OK: recording confirmed ==="
-    notify "UNVR recovered" "VM was paused ${GAP}s. Clock stepped, media stack restarted, recording confirmed at ${mbs} MB/s."
+    notify "UNVR recovered" "$WHY. Media stack restarted, recording confirmed at ${mbs} MB/s."
 else
     say "=== recovery FAILED: no recording after restart ==="
-    notify "UNVR recovery FAILED" "VM paused ${GAP}s. Stack restarted but NOTHING is recording after 5 minutes. Needs hands." 1
+    notify "UNVR recovery FAILED" "$WHY. Stack restarted but NOTHING is recording after 5 minutes. Needs hands." 1
     exit 1
 fi
