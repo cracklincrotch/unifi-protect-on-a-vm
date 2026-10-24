@@ -394,7 +394,8 @@ or host-side state.
    compared", and `OS_TRACK=bogus update-unifi.sh --sync-os` stops at once.
    `--access` says "Already at latest version" (it reinstalled Access on
    every run before).
-8. **`update-unifi.sh --sync-os --yes`** (track 5): downloads 5.1.33, verifies
+8. **`KEEP_WORKDIR=1 update-unifi.sh --sync-os --yes`** (track 5; the kept
+   `/opt/unifi-update/fwupdate.bin` is used in step 9a): downloads 5.1.33, verifies
    it, prints "No package changes detected" and stops nothing (before this
    PR it listed Protect and its AI package as downgrades and restarted the
    stack). A no-change sync never reaches the mask loop, so `ufcd` is not
@@ -409,10 +410,12 @@ or host-side state.
    `dpkg-divert --list /usr/bin/ubntnas` names `/usr/bin/ubntnas.real`, and
    `ubntnas system upgrade /nonexistent -f --no-reboot` prints the refusal
    and exits 1 (`journalctl -t ubntnas-vm-guard` logs it). Only once those
-   hold, and on the clone only, the full UI path:
-   `ubnt-systool fwupdate <any .bin>` must end with the same refusal as its
-   reason. `ubntnas --help` still reaches the real binary through the
-   guard.
+   hold, and on the clone only, the full UI path with a valid image (it
+   checks the file with `fwinfo` before calling `ubntnas`):
+   `ubnt-systool fwupdate /opt/unifi-update/fwupdate.bin` from step 8 must
+   end with the same refusal as its reason. A harmless subcommand such as
+   `ubntnas --help` still reaches the real binary through the guard. Then
+   remove `/opt/unifi-update`.
 10. **The install path, both ways (optional; it downgrades the clone):**
     `OS_TRACK=5.1.31 update-unifi.sh --sync-os --yes`, then
     `OS_TRACK=5 update-unifi.sh --sync-os --yes`. Each run must install,
@@ -425,14 +428,15 @@ or host-side state.
     local-fs.target` shows `provision-storage.service` before it;
     ms/msr/msp/mst active; `ubnt-systool anonid` equals
     `/data/protect-on-mac/anonid`.
-12. **Optional, exploratory: the 6.0 route** on a fresh snapshot of the clone,
-    following "Route to 6.0" option 1, with the step 3 Debian hosts added.
-    Record: whether the held Ubiquiti packages survive both dist-upgrades;
-    the `OS_TRACK=6 update-unifi.sh --sync-os` result; unifi-core 6.0.123
-    active; the Storage panel lists the clone's disks; the patch journal says
+12. **Deferred: the 6.0 stack itself**, on the fresh trixie guest of "Route to
+    6.0" option 2 (the chosen one), once `install-protect-baremetal.sh` is
+    ported to trixie, isolated the same way with the step 3 Debian hosts
+    added. Record: the install's firmware pick (6.0.x on trixie);
+    unifi-core 6.0.123
+    active; the Storage panel lists the guest's disks; the patch journal says
     "not needed"; `ufcd` masked and inactive; 14-main, 14-protect, 14-access
-    up and whether 14-apps exists and runs; whether the deb11 Protect build
-    ran before the deb13 reinstall; `head -3 /sbin/mdadm` still the wrapper;
+    up and whether 14-apps exists and runs; Protect from
+    `uos-deb13-arm64`; `head -3 /sbin/mdadm` is the wrapper;
     the collation of every cluster
     (`for p in 5432 5433 5434 5435; do psql -p $p -U postgres -Atc 'select datname, datcollate from pg_database'; done`);
     unifi-core log lines about `network-fec`, the WebRTC worker and
