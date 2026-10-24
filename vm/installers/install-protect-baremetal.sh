@@ -1156,7 +1156,8 @@ systemctl daemon-reload
     || echo "    WARNING: storage patch returned non-zero — check it"
 
 # Enable the boot-time units. storage-nuke is intentionally NOT enabled —
-# it runs on demand only, triggered by the web UI "Erase" button.
+# it runs on demand only, triggered by the web UI "Erase" button. Neither is
+# provision-storage-retry: provision-storage starts it when needed.
 # provision-on-setup.path provisions the array when the operator finishes
 # the storage wizard (it watches /etc/ustd/storage.conf).
 # provision-storage runs in usd's slot (WantedBy=local-fs.target). reenable,

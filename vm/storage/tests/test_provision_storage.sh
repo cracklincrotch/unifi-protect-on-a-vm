@@ -31,12 +31,20 @@ export PROVISION_STORAGE_CONFIG="$T/unifi-storage"
 . "$PS" >/dev/null || { echo "FAIL  could not source $PS"; exit 1; }
 set +u
 FSTAB="$T/fstab"
+MDSTAT="$T/mdstat"      # absent until a test writes it: never the real one
+LOCK="$T/lock"
 STORAGE_VOLUME="$T/volume1"
 
 rec()   { echo "$*" >> "$T/calls"; }
 calls() { cat "$T/calls" 2>/dev/null; }
 reset() { : > "$T/calls"; }
-mdadm()     { rec mdadm "$@"; }
+# mdadm --run <md>: starts only the arrays listed in RUN_OK.
+RUN_OK=""
+mdadm() {
+    rec mdadm "$@"
+    if [ "$1" = --run ]; then case " $RUN_OK " in *" $2 "*) return 0 ;; esac; return 1; fi
+    return 0
+}
 mkswap()    { rec mkswap "$@"; }
 mkfs.ext4() { rec mkfs.ext4 "$@"; }
 sgdisk()    { rec sgdisk "$@"; }
@@ -204,6 +212,197 @@ reset; out=$( (do_boot) 2>&1 ); rc=$?
 check "boot auto-provision of blank disks: the orphan md0 line's UUID" '[ $rc = 0 ] && calls | grep -qx "mkswap -U $MD0_SWAP /dev/md0"' "$out
 $(calls)"
 AUTOMODE=false
+
+###############################################################################
+# 3. A data array assembled but not running at boot (a member missing)
+###############################################################################
+
+RETRY_SECS=20; RETRY_EVERY=5
+sleep() { rec sleep "$@"; }
+# systemctl is-active <unit>: from UNIT_STATES ("unit=state ...").
+# systemctl --no-block start: fails when START_FAILS is set.
+UNIT_STATES=""; START_FAILS=""
+systemctl() {
+    rec systemctl "$@"
+    case "$1" in
+        is-active)
+            local s
+            for s in $UNIT_STATES; do
+                [ "${s%%=*}" = "$2" ] && { echo "${s#*=}"; return 0; }
+            done
+            echo inactive; return 3 ;;
+        --no-block) [ "$2" = start ] && [ -n "$START_FAILS" ] && return 5 ;;
+    esac
+    return 0
+}
+DEGRADED=0
+md_degraded() { echo "$DEGRADED"; }
+# What provisioning or an Erase would write. (Boot mode's `mdadm --run` of
+# an existing array is checked for separately.)
+writes() { calls | grep -E '^(mdadm --create|mdadm --zero|mdadm --stop|sgdisk|wipefs|mkswap|mkfs\.ext4|swapoff)'; }
+
+# A DAS disk missing at boot: md0 and md3 both short a member, left
+# inactive by the initramfs.
+cat > "$T/mdstat.inactive" <<'EOF'
+Personalities : [raid1] [raid10]
+md3 : inactive sdc5[1](S) sdb5[0](S)
+      7804333056 blocks super 1.2
+
+md0 : inactive sdc2[1](S) sdb2[0](S)
+      2095104 blocks super 1.2
+
+unused devices: <none>
+EOF
+cat > "$T/mdstat.ok" <<'EOF'
+Personalities : [raid1] [raid10]
+md3 : active raid10 sdd5[2] sdc5[1] sdb5[0]
+      7804333056 blocks super 1.2 512K chunks 2 near-copies [3/3] [UUU]
+
+md0 : active raid1 sdd2[2] sdc2[1] sdb2[0]
+      2095104 blocks super 1.2 [3/3] [UUU]
+
+unused devices: <none>
+EOF
+cat > "$T/mdstat.external" <<'EOF'
+Personalities : [raid1]
+md127 : inactive sdb[0](S)
+      5288 blocks super external:imsm
+
+unused devices: <none>
+EOF
+cp "$T/mdstat.inactive" "$MDSTAT"; out=$(inactive_arrays 2>&1 | tr '\n' ' ')
+check "inactive_arrays: md3 and md0" '[ "$out" = "/dev/md3 /dev/md0 " ]' "$out"
+cp "$T/mdstat.ok" "$MDSTAT"; out=$(inactive_arrays 2>&1)
+check "inactive_arrays: nothing when all run" '[ -z "$out" ]' "$out"
+cp "$T/mdstat.external" "$MDSTAT"; out=$(inactive_arrays 2>&1)
+check "inactive_arrays: an external-metadata container (always inactive) is left out" '[ -z "$out" ]' "$out"
+printf 'md3 : inactive sdc5[1](S)' > "$MDSTAT"; out=$(inactive_arrays 2>&1)
+check "inactive_arrays: a last line without its blocks line still counts" '[ "$out" = /dev/md3 ]' "$out"
+rm -f "$MDSTAT"; out=$(inactive_arrays 2>&1)
+check "inactive_arrays: nothing, quietly, without /proc/mdstat" '[ -z "$out" ]' "$out"
+
+# warn: the journal prefix only when stdout is the stream JOURNAL_STREAM names.
+: > "$T/journal"; js=$(stat -L -c %d:%i "$T/journal")
+warn_in() {  # warn_in <JOURNAL_STREAM>: source in a fresh bash, warn, to $T/journal
+    JOURNAL_STREAM="$1" bash -c 'id() { echo 0; }; . "$1"; warn hello' _ "$PS" > "$T/journal" 2>/dev/null
+}
+warn_in "$js"; out=$(grep hello "$T/journal")
+warn_in "1:2"; out2=$(grep hello "$T/journal")
+check "warn: priority err when stdout is the journal, plain WARNING when JOURNAL_STREAM is someone else's" '[ "$out" = "<3>[provision-storage] hello" ] && [ "$out2" = "[provision-storage] WARNING: hello" ]' "$out / $out2"
+out=$(warn hello)
+check "warn: plain WARNING without JOURNAL_STREAM" '[ "$out" = "[provision-storage] WARNING: hello" ]' "$out"
+
+# Boot: a DAS disk missing, md0 and md3 inactive; blank disks present and
+# AUTOMODE on. scan_arrays finds an array once `mdadm --run` started it.
+scan_arrays() {
+    rec scan; DATA_MD=""; SWAP_MD=""
+    calls | grep -qx "mdadm --run /dev/md3" && [ -z "${RUN_OK##*/dev/md3*}" ] && DATA_MD=/dev/md3
+    calls | grep -qx "mdadm --run /dev/md0" && [ -z "${RUN_OK##*/dev/md0*}" ] && SWAP_MD=/dev/md0
+    [ -n "$LATE_START" ] && DATA_MD=/dev/md3
+    return 0
+}
+LATE_START=""
+cp "$T/mdstat.inactive" "$MDSTAT"; AUTOMODE=true; RUN_OK="/dev/md0 /dev/md3"; DEGRADED=1
+reset; out=$( (do_boot) 2>&1 ); rc=$?
+check "boot: arrays assembled but not running are started (mdadm --run), loudly" '[ $rc = 0 ] && calls | grep -qx "mdadm --run /dev/md3" && calls | grep -qx "mdadm --run /dev/md0" && grep -q "WARNING: /dev/md3 was assembled but not running (a member is missing): started it DEGRADED" <<<"$out"' "$out
+$(calls)"
+check "... then mounted in boot mode, reported degraded, no retry unit" 'calls | grep -qx "mount_arrays /dev/md3 /dev/md0" && grep -q "WARNING: data array /dev/md3 is DEGRADED" <<<"$out" && ! calls | grep -q provision-storage-retry' "$out
+$(calls)"
+check "... and nothing is provisioned or wiped, AUTOMODE and blank disks notwithstanding" '[ -z "$(writes)" ]' "$(calls)"
+check "... the inactive list is read before the scan" '[ "$(calls | grep -n "^mdadm --run" | head -1 | cut -d: -f1)" -lt "$(calls | grep -n "^scan" | head -1 | cut -d: -f1)" ]' "$(calls)"
+
+RUN_OK="/dev/md0"   # md3 has too few members to start
+reset; out=$( (do_boot) 2>&1 ); rc=$?
+check "boot: an array that cannot start goes to the retry unit, loudly" '[ $rc = 0 ] && grep -q "WARNING: /dev/md3 is assembled but cannot start: too few members" <<<"$out" && grep -q "WARNING: no data array is running" <<<"$out" && calls | grep -qx "systemctl --no-block start provision-storage-retry.service"' "$out
+$(calls)"
+check "... with nothing provisioned, wiped or mounted" '[ -z "$(writes)" ] && ! calls | grep -q "^mount_arrays"' "$(calls)"
+START_FAILS=1
+reset; out=$( (do_boot) 2>&1 ); rc=$?
+check "boot: retry unit cannot start: still exit 0, and says how to retry by hand" '[ $rc = 0 ] && grep -q "once the array runs: .* retry" <<<"$out" && [ -z "$(writes)" ]' "$out"
+START_FAILS=""
+RUN_OK=""; LATE_START=1
+reset; out=$( (do_boot) 2>&1 ); rc=$?
+check "boot: md3 starts on its own between the mdstat read and the scan: mounted, no retry" '[ $rc = 0 ] && calls | grep -q "^mount_arrays /dev/md3" && ! calls | grep -q provision-storage-retry' "$out
+$(calls)"
+LATE_START=""; AUTOMODE=false; DEGRADED=0
+
+cp "$T/mdstat.external" "$MDSTAT"; is_blank() { return 1; }
+reset; out=$( (do_boot) 2>&1 ); rc=$?
+check "boot: an external-metadata container is not started, and no retry unit" '[ $rc = 0 ] && ! calls | grep -q "mdadm --run" && ! calls | grep -q provision-storage-retry' "$out
+$(calls)"
+
+# Boot: nothing inactive, disks with data: the old path, no retry.
+rm -f "$MDSTAT"
+reset; out=$( (do_boot) 2>&1 ); rc=$?
+check "boot: disks with data but no array: left alone as before, no retry unit" '[ $rc = 0 ] && grep -q "NOT touched" <<<"$out" && ! calls | grep -q "provision-storage-retry" && ! calls | grep -q "mdadm --run" && [ -z "$(writes)" ]' "$out
+$(calls)"
+is_blank() { return 0; }
+
+# Boot: the data array runs, degraded or not.
+scan_arrays() { rec scan; DATA_MD=/dev/md3; SWAP_MD=/dev/md0; }
+DEGRADED=1
+reset; out=$( (do_boot) 2>&1 ); rc=$?
+check "boot: a running but degraded array is mounted and reported loudly" '[ $rc = 0 ] && calls | grep -qx "mount_arrays /dev/md3 /dev/md0" && grep -q "WARNING: data array /dev/md3 is DEGRADED: running with 1 member(s) missing" <<<"$out" && ! calls | grep -q "provision-storage-retry"' "$out
+$(calls)"
+DEGRADED=0
+reset; out=$( (do_boot) 2>&1 ); rc=$?
+check "boot: a healthy array is mounted without a warning" '[ $rc = 0 ] && calls | grep -qx "mount_arrays /dev/md3 /dev/md0" && ! grep -q WARNING <<<"$out"' "$out"
+
+# Retry: the array starts on the third look.
+scan_arrays() { rec scan; SWAP_MD=""; DATA_MD=""; [ "$(calls | grep -c ^scan)" -ge "$UP_AFTER" ] && DATA_MD=/dev/md3; }
+UP_AFTER=3; DEGRADED=1
+UNIT_STATES="ms.service=active msr.service=active mst.service=activating msp.service=failed"
+cp "$T/mdstat.inactive" "$MDSTAT"
+reset; out=$( (do_retry) 2>&1 ); rc=$?
+mount_at=$(calls | grep -n '^mount_arrays' | cut -d: -f1)
+restart_at=$(calls | grep -n '^systemctl --no-block restart' | cut -d: -f1)
+check "retry: mounts the array once it runs (3rd look, 2 sleeps)" '[ $rc = 0 ] && [ "$(calls | grep -c ^scan)" = 3 ] && [ "$(calls | grep -c "^sleep 5")" = 2 ] && calls | grep -qx "mount_arrays /dev/md3 "' "$out
+$(calls)"
+check "... then restarts the media services that are up, starting or failed" '[ -n "$restart_at" ] && [ "$mount_at" -lt "$restart_at" ] && calls | grep -qx "systemctl --no-block restart ms.service msp.service msr.service mst.service" && calls | grep -qx "systemctl reset-failed ms.service msp.service msr.service mst.service"' "$(calls)"
+check "... says loudly that the mount is late and the array degraded" 'grep -q "WARNING: data array /dev/md3 is running now; mounting it late" <<<"$out" && grep -q "WARNING: data array /dev/md3 is DEGRADED" <<<"$out"' "$out"
+check "... and never assembles, starts or writes to an array" '[ -z "$(writes)" ] && ! calls | grep -q "^mdadm"' "$(calls)"
+DEGRADED=0
+
+UNIT_STATES="msr.service=inactive"; UP_AFTER=1
+reset; out=$( (do_retry) 2>&1 ); rc=$?
+check "retry: no media service running yet: mounts, restarts nothing" '[ $rc = 0 ] && calls | grep -q "^mount_arrays" && ! calls | grep -q "restart" && grep -q "nothing to restart" <<<"$out"' "$out
+$(calls)"
+
+UP_AFTER=999
+reset; out=$( (do_retry) 2>&1 ); rc=$?
+check "retry: the array never runs: gives up after RETRY_SECS (5 looks, 4 sleeps), exit 1, loudly" '[ $rc = 1 ] && [ "$(calls | grep -c ^scan)" = 5 ] && [ "$(calls | grep -c ^sleep)" = 4 ] && grep -q "WARNING: gave up after 20s" <<<"$out" && grep -q "assembled but not running: /dev/md3" <<<"$out"' "$out
+$(calls)"
+check "... mounting and restarting nothing" '! calls | grep -q "^mount_arrays" && ! calls | grep -q restart && [ -z "$(writes)" ]' "$(calls)"
+
+mountpoint() { return 0; }
+reset; out=$( (do_retry) 2>&1 ); rc=$?
+check "retry: already mounted (by someone else): exit 0, touch nothing" '[ $rc = 0 ] && ! calls | grep -q "^scan" && ! calls | grep -q "^mount_arrays" && ! calls | grep -q restart' "$out
+$(calls)"
+mountpoint() { return 1; }
+
+# The lock: a retry attempt waits for a run in progress, and so does an
+# Erase. Real flock, real sleep.
+if command -v flock >/dev/null 2>&1; then
+    hold() { flock "$LOCK" bash -c 'touch "$1.held"; exec sleep 2' _ "$LOCK" & HOLDER=$!
+             while [ ! -e "$LOCK.held" ]; do command sleep 0.1; done; rm -f "$LOCK.held"; }
+    UP_AFTER=1; UNIT_STATES=""
+    hold; t0=$(date +%s%N)
+    reset; out=$( (do_retry) 2>&1 ); rc=$?
+    dt=$(( ($(date +%s%N) - t0) / 1000000 )); wait "$HOLDER"
+    check "retry waits for a run that holds the lock before it scans or mounts" '[ $rc = 0 ] && [ "$dt" -ge 1000 ] && calls | grep -q "^mount_arrays"' "$out (waited ${dt} ms)"
+    scan_arrays() { rec scan; DATA_MD=/dev/md3; SWAP_MD=/dev/md0; }
+    SWAP_DEV=/dev/md0; SWAP_DEV_UUID=$MD0_SWAP; fstab "$md0_line"
+    hold; t0=$(date +%s%N)
+    reset; out=$( (main nuke) </dev/null 2>&1 ); rc=$?
+    dt=$(( ($(date +%s%N) - t0) / 1000000 )); wait "$HOLDER"
+    check "an Erase (main nuke) waits for the lock too" '[ $rc = 0 ] && [ "$dt" -ge 1000 ] && calls | grep -q "^wipefs"' "$out (waited ${dt} ms)"
+    hold; t0=$(date +%s%N)
+    reset; out=$( (main boot) 2>&1 ); rc=$?
+    dt=$(( ($(date +%s%N) - t0) / 1000000 )); wait "$HOLDER"
+    check "... and so does boot mode" '[ $rc = 0 ] && [ "$dt" -ge 1000 ] && calls | grep -q "^mount_arrays"' "$out (waited ${dt} ms)"
+else
+    echo "SKIP  lock checks (no flock)"
+fi
 
 check "no real tool was reached" '[ ! -s "$T/guard.log" ]' "$(cat "$T/guard.log" 2>/dev/null)"
 echo; echo "$pass passed, $fail failed"

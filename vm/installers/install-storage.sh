@@ -30,7 +30,8 @@
 #   every media service (ms, mst, msr, msp), as on a real UNVR.
 #
 # storage-nuke.service is installed but NOT enabled — it runs on demand only,
-# triggered by `ustorage space nuke` (the Storage UI "Erase" button).
+# triggered by `ustorage space nuke` (the Storage UI "Erase" button). So is
+# provision-storage-retry.service: boot mode starts it when an array is late.
 #
 # USAGE (inside the VM, as root) — only needed to re-apply the storage
 # layer on its own; a full install via install-protect-baremetal.sh
@@ -117,6 +118,7 @@ say "applying unifi-core service.js patch"
 
 # Enable the boot-time units. storage-nuke is intentionally NOT enabled —
 # it runs on demand only (the Storage UI "Erase" button via ustorage).
+# Neither is provision-storage-retry: provision-storage starts it when needed.
 # provision-on-setup.path watches /etc/ustd/storage.conf and provisions the
 # array when the operator completes the storage wizard.
 # provision-storage runs in usd's slot (WantedBy=local-fs.target). reenable,
