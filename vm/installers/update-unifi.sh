@@ -133,12 +133,14 @@ fw_os_release() {
     fi
 }
 
-# App deb platform for a Debian major version: 11 -> uos-deb11-arm64.
-# Unknown -> uos-deb11-arm64 (UniFi OS 5.x), the only one before 6.0.
+# App deb platform for a Debian major version. Only 11 and 13 are published
+# (uos-deb12-arm64 answers with nothing); anything else -> uos-deb11-arm64,
+# the platform of UniFi OS 5.x.
 uos_deb_platform() {
-    local v="${1:-}"
-    case "$v" in ''|*[!0-9]*) v=11 ;; esac
-    echo "uos-deb${v}-arm64"
+    case "${1:-}" in
+        13) echo uos-deb13-arm64 ;;
+        *)  echo uos-deb11-arm64 ;;
+    esac
 }
 
 # Default OS_TRACK for a Debian codename: the UniFi OS major built on it.
@@ -198,7 +200,10 @@ get_os_firmware() {
         echo "ERROR: Failed to query API for unifi-nvr on track $track" >&2
         return 1
     fi
-    n=$(echo "$response" | jq '._embedded.firmware | length')
+    if ! n=$(echo "$response" | jq -e '._embedded.firmware | length' 2>/dev/null); then
+        echo "ERROR: unexpected answer from the firmware API for track $track" >&2
+        return 1
+    fi
     if [ "$n" -ge "$FW_API_LIMIT" ]; then
         echo "WARNING: the firmware listing hit its limit ($n);" \
              "the newest build may be missing" >&2
@@ -216,24 +221,29 @@ fw_debian_matches() {
     fi
     echo "ERROR: UNVR firmware ${FW_VERSION:-} is built on Debian" \
          "'${fw_debian:-unknown}'; this system runs Debian '${2:-unknown}'." >&2
-    echo "       Its packages cannot be installed here. Nothing was changed." >&2
+    echo "       Its packages cannot be installed here; nothing was stopped" >&2
+    echo "       or installed." >&2
     echo "       Stay on this base with OS_TRACK (default: the major for" >&2
     echo "       this Debian release); see docs/unifi-os-6-compat.md." >&2
     return 1
 }
 
-# 0 if unifi-core is installed at the version the firmware root $1 carries:
-# the sign that --sync-os really installed the firmware's packages.
+# 0 if unifi-core is installed and configured ("ii") at the version the
+# firmware root $1 carries: the sign that --sync-os really installed the
+# firmware's packages. unifi-core is the marker; a firmware that kept
+# unifi-core's version would pass even if other packages failed.
 fw_install_landed() {
-    local want have
+    local want have status
     want="$(dpkg-query --admindir="$1/var/lib/dpkg/" -W -f='${Version}' \
         unifi-core 2>/dev/null || true)"
     have="$(dpkg-query -W -f='${Version}' unifi-core 2>/dev/null || true)"
-    if [ -n "$want" ] && [ "$have" = "$want" ]; then
+    status="$(dpkg-query -W -f='${db:Status-Abbrev}' unifi-core 2>/dev/null || true)"
+    if [ -n "$want" ] && [ "$have" = "$want" ] && [ "${status%% *}" = ii ]; then
         return 0
     fi
-    echo "ERROR: unifi-core is '${have:-not installed}', the firmware" \
-         "carries '${want:-unknown}': the install did not complete." >&2
+    echo "ERROR: unifi-core is '${have:-not installed}' (dpkg status" \
+         "'${status%% *}'), the firmware carries '${want:-unknown}':" \
+         "the install did not complete." >&2
     return 1
 }
 
@@ -288,14 +298,16 @@ verify_shims() {
     _ck() { if [ "$1" -eq 0 ]; then printf "    [ OK ] %s\n" "$2"; else printf "    [FAIL] %s\n" "$2"; fail=1; fi; }
     set +e
     # Patch A edits the snapshot unifi-core 5.1.x builds from `ustorage space
-    # inspect`. unifi-core 6.x has no such call (its disk list comes from the
-    # storage gRPC stream ustated-shim serves), so there is nothing to patch.
+    # inspect`. unifi-core 6.x has neither the call nor the snapshot (its disk
+    # list comes from the storage gRPC stream ustated-shim serves), so there
+    # is nothing to patch. Same test as unifi-core-storage-patch.sh.
     if [ ! -f "$sj" ]; then
         _ck 1 "service.js present"
-    elif grep -qF '"ustorage",["space","inspect"]' "$sj"; then
+    elif grep -qF '"ustorage",["space","inspect"' "$sj" ||
+         grep -qF 'disks:[],sdcards:[]}' "$sj"; then
         [ "$(grep -cF '["disk","inspect"]' "$sj" 2>/dev/null)" = 1 ]; _ck $? "service.js Patch A (disk list)"
     else
-        _ck 0 "service.js Patch A not needed (no ustorage space-inspect call)"
+        _ck 0 "service.js Patch A not needed (no ustorage space-inspect snapshot)"
     fi
     # Patch B (the 5.1.110-era drive-detect gate) is obsolete: 5.1.117
     # refactored that code path away and unifi-core-storage-patch.sh no
@@ -752,6 +764,18 @@ if [ -n "$FW_NEWEST_VERSION" ] && [ "$FW_NEWEST_VERSION" != "null" ] &&
     echo "    not installed unless OS_TRACK allows it. A different major can"
     echo "    need a different Debian base (6.x does: docs/unifi-os-6-compat.md)."
 fi
+FW_SHORT="$(os_version_of "$FW_VERSION")"
+TRACK_FOR_DEBIAN="$(os_track_for_debian "$SYSTEM_DEBIAN")"
+if [ "$TRACK_FOR_DEBIAN" != latest ] && [ -n "$FW_SHORT" ] &&
+   [ "${FW_SHORT%%.*}" != "$TRACK_FOR_DEBIAN" ]; then
+    echo "    WARNING: UniFi OS $FW_SHORT is not the $TRACK_FOR_DEBIAN.x line built on"
+    echo "    Debian $SYSTEM_DEBIAN; --sync-os will refuse it after the download."
+fi
+if [ -n "$CURRENT_OS_SHORT" ] && [ -n "$FW_SHORT" ] &&
+   dpkg --compare-versions "$FW_SHORT" lt "$CURRENT_OS_SHORT" 2>/dev/null; then
+    echo "    NOTE: $FW_SHORT is older than the installed $CURRENT_OS_SHORT;"
+    echo "    --sync-os would downgrade."
+fi
 echo ""
 
 if [ "$ACTION" = "check" ]; then
@@ -825,9 +849,13 @@ sync_os_packages() {
     echo "    Version diff (current -> firmware):"
     local has_changes=0
     while read -r pkg; do
-        # Skip packages we won't install on VMs
+        # Skip packages we won't install on VMs, and the app packages the
+        # firmware bundles (removed below; upgrade_protect/upgrade_access
+        # own them). Counting those made every sync of the release already
+        # installed list phantom "downgrades" of Protect and its AI package
+        # and restart the whole stack for nothing.
         case "$pkg" in
-            linux-image-*|unvr-initramfs)
+            linux-image-*|unvr-initramfs|unifi-protect|ai-feature-*|unifi-access)
                 continue
                 ;;
         esac
@@ -913,9 +941,9 @@ sync_os_packages() {
     # Mask (not just disable) because they're triggered as dependencies
     # of other services regardless of whether they're enabled. ustated is
     # masked too — the ustated-shim replaces it.
-    # ufcd (fan control, new in 6.0's ustd) wants usdbd and the UNVR fans and
-    # restarts forever without them; masking it where it does not exist yet
-    # (5.x) is harmless.
+    # ufcd (fan control, new in 6.0's ustd, Restart=always) wants usdbd and
+    # the UNVR fans; on a VM it can only fail and be restarted. Masking it
+    # where it does not exist yet (5.x) is harmless.
     for svc in usd usdbd rpsd uhwd sfp sfpd ustated ufcd; do
         systemctl stop "${svc}.service" 2>/dev/null || true
         systemctl mask "${svc}.service" 2>/dev/null || true
@@ -1140,8 +1168,14 @@ case "$ACTION" in
     all)
         recommend_snapshot "sync UniFi OS + upgrade Protect + upgrade Access"
         sync_os_packages
-        upgrade_protect
-        upgrade_access
+        # Apps on a half-synced OS would only compound it: report and stop.
+        if [ "$SYNC_INCOMPLETE" = "1" ]; then
+            echo ""
+            echo ">>> Skipping the Protect and Access upgrades: the OS sync is incomplete."
+        else
+            upgrade_protect
+            upgrade_access
+        fi
         ;;
 esac
 

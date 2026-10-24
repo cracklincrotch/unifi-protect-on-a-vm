@@ -81,9 +81,12 @@ fi
 # unifi-core 6.x (UniFi OS 6.0) has no `ustorage space inspect` snapshot left
 # to patch: the storage store takes the disk list from the gRPC DiskState
 # stream that ustated-shim serves. Nothing to do, and no anchor to alert on.
-# A 5.1.x bundle always carries this call, so its anchor check still runs.
-if ! grep -qF '"ustorage",["space","inspect"]' "$SVC"; then
-    echo "storage-patch: not needed (no ustorage space-inspect call in this unifi-core)"
+# Only when BOTH the call (with any arguments) and the snapshot's empty-list
+# shape are gone: a 5.1.x bundle that keeps either still gets the anchor
+# check, and its alert if the anchor drifted.
+if ! grep -qF '"ustorage",["space","inspect"' "$SVC" &&
+   ! grep -qF 'disks:[],sdcards:[]}' "$SVC"; then
+    echo "storage-patch: not needed (no ustorage space-inspect snapshot in this unifi-core)"
     exit 0
 fi
 

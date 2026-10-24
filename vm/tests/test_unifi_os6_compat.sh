@@ -15,6 +15,7 @@
 #            vm/tests/test_unifi_os6_compat.sh
 #   The second form also runs the patch script and the Debian guard against
 #   the real unpacked firmware (read-only: service.js is copied first).
+# shellcheck disable=SC1090,SC2034  # update-unifi.sh is sourced by path; it reads FW_API_LIMIT
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 VM="$(cd "$HERE/.." && pwd)"
@@ -47,6 +48,15 @@ upd() { ( source "$UPD" && "$@" ); }
 ###############################################################################
 # update-unifi.sh: sourcing
 ###############################################################################
+# Without its sourced-return guard, sourcing would run the real script (as
+# root it would reach the network and apt). Check the guard statically first.
+gl=$(grep -nF 'if [ "${BASH_SOURCE[0]}" != "$0" ]; then' "$UPD" | head -1 | cut -d: -f1)
+pl=$(grep -nF '# ARGUMENT PARSING' "$UPD" | head -1 | cut -d: -f1)
+if [ -z "$gl" ] || [ -z "$pl" ] || [ "$gl" -gt "$pl" ]; then
+    echo "FAIL  update-unifi.sh has no sourced-return guard before ARGUMENT PARSING;"
+    echo "      not sourcing it. Nothing else can run."
+    exit 1
+fi
 reset_calls
 out=$( ( source "$UPD"; echo "sourced rc=$?" ) 2>&1 )
 check "sourcing update-unifi.sh runs nothing and returns 0" \
@@ -93,6 +103,7 @@ check "uos_deb_platform 11 -> uos-deb11-arm64" '[ "$(upd uos_deb_platform 11)" =
 check "uos_deb_platform 13 -> uos-deb13-arm64" '[ "$(upd uos_deb_platform 13)" = uos-deb13-arm64 ]' ""
 check "uos_deb_platform unknown -> uos-deb11-arm64" \
     '[ "$(upd uos_deb_platform "")" = uos-deb11-arm64 ] && [ "$(upd uos_deb_platform x)" = uos-deb11-arm64 ]' ""
+check "uos_deb_platform 12 (unpublished) -> uos-deb11-arm64" '[ "$(upd uos_deb_platform 12)" = uos-deb11-arm64 ]' ""
 
 check "os_track_for_debian bullseye -> 5" '[ "$(upd os_track_for_debian bullseye)" = 5 ]' ""
 check "os_track_for_debian trixie -> 6" '[ "$(upd os_track_for_debian trixie)" = 6 ]' ""
@@ -152,6 +163,10 @@ out=$(gof 6.x "$T/list-5.json" 2>&1); rc=$?
 check "get_os_firmware rejects a bad track" '[ $rc != 0 ] && grep -q "is not .latest." <<<"$out"' "$out"
 out=$(gof 5 "$T/list-5.json" 4 2>&1 >/dev/null)
 check "get_os_firmware warns when the listing fills its limit" 'grep -q "hit its limit" <<<"$out"' "$out"
+echo '<html>502 Bad Gateway</html>' > "$T/list-html.json"
+out=$(gof 5 "$T/list-html.json" 2>&1); rc=$?
+check "get_os_firmware: a non-JSON answer is a clear error" \
+    '[ $rc != 0 ] && grep -q "unexpected answer from the firmware API" <<<"$out" && ! grep -q "integer expression" <<<"$out"' "$out"
 
 ###############################################################################
 # update-unifi.sh: the Debian guard and the install-landed check
@@ -167,12 +182,14 @@ mkdir -p "$T/fwnone"
 out=$(upd fw_debian_matches "$T/fwnone" bullseye 2>&1); rc=$?
 check "fw_debian_matches refuses a root without os-release" '[ $rc != 0 ] && grep -q "Debian .unknown." <<<"$out"' "$out"
 
-# dpkg-query stub: --admindir answers for the firmware, otherwise the system.
+# dpkg-query stub: --admindir answers for the firmware, otherwise the system
+# (version, or the db:Status-Abbrev the guest's dpkg would print).
 cat > "$T/bin/dpkg-query" <<EOF
 #!/bin/sh
 case "\$*" in
-    *--admindir*) [ -n "\$FW_CORE" ] && printf '%s' "\$FW_CORE" && exit 0; exit 1 ;;
-    *)            [ -n "\$SYS_CORE" ] && printf '%s' "\$SYS_CORE" && exit 0; exit 1 ;;
+    *--admindir*)    [ -n "\$FW_CORE" ] && printf '%s' "\$FW_CORE" && exit 0; exit 1 ;;
+    *Status-Abbrev*) [ -n "\$SYS_CORE" ] && printf '%s' "\${SYS_STATUS:-ii }" && exit 0; exit 1 ;;
+    *)               [ -n "\$SYS_CORE" ] && printf '%s' "\$SYS_CORE" && exit 0; exit 1 ;;
 esac
 EOF
 chmod +x "$T/bin/dpkg-query"
@@ -180,10 +197,24 @@ out=$(FW_CORE=6.0.123 SYS_CORE=6.0.123 upd fw_install_landed "$T/fw60" 2>&1); rc
 check "fw_install_landed: unifi-core at the firmware's version" '[ $rc = 0 ]' "$out"
 out=$(FW_CORE=6.0.123 SYS_CORE=5.1.132 upd fw_install_landed "$T/fw60" 2>&1); rc=$?
 check "fw_install_landed: unifi-core left behind -> refuse to stamp" \
-    '[ $rc != 0 ] && grep -q "unifi-core is .5.1.132., the firmware carries .6.0.123." <<<"$out"' "$out"
+    '[ $rc != 0 ] && grep -q "unifi-core is .5.1.132. (dpkg status .ii.), the firmware carries .6.0.123." <<<"$out"' "$out"
+out=$(FW_CORE=6.0.123 SYS_CORE=6.0.123 SYS_STATUS="iF " upd fw_install_landed "$T/fw60" 2>&1); rc=$?
+check "fw_install_landed: right version but half-configured -> refuse" \
+    '[ $rc != 0 ] && grep -q "dpkg status .iF." <<<"$out"' "$out"
 out=$(FW_CORE= SYS_CORE=5.1.132 upd fw_install_landed "$T/fw60" 2>&1); rc=$?
 check "fw_install_landed: firmware without unifi-core -> refuse" '[ $rc != 0 ]' "$out"
 rm -f "$T/bin/dpkg-query"
+
+# How sync_os_packages and the action dispatch use them (order, not runs).
+fn_line() { grep -nF "$1" "$UPD" | head -1 | cut -d: -f1; }
+check "sync_os_packages: Debian guard comes before services are stopped" \
+    '[ "$(fn_line "if ! fw_debian_matches")" -lt "$(fn_line ">>> Stopping services...")" ] && [ "$(fn_line "if ! fw_debian_matches")" -gt "$(fn_line "sync_os_packages() {")" ]' ""
+check "sync_os_packages: /usr/lib/version is copied only after fw_install_landed" \
+    'grep -A1 "if fw_install_landed" "$UPD" | grep -qF "cp \"\$sqfs_root/usr/lib/version\" /usr/lib/version" && [ "$(grep -cF "/usr/lib/version\" /usr/lib/version" "$UPD")" = 1 ]' ""
+check "sync_os_packages: the version diff skips the bundled app packages" \
+    'grep -qF "linux-image-*|unvr-initramfs|unifi-protect|ai-feature-*|unifi-access)" "$UPD"' ""
+check "--all skips the app upgrades when the OS sync is incomplete" \
+    'grep -A3 "sync_os_packages$" "$UPD" | grep -q "SYNC_INCOMPLETE"' ""
 
 ###############################################################################
 # Static checks on both installers
@@ -210,6 +241,49 @@ check "fw_api_href: unordered listing -> newest, numerically" \
     '[ "$(fw_api_href < "$T/list-5.json")" = https://fw-download.ubnt.com/data/unifi-nvr/5.1.33.bin ]' "$(fw_api_href < "$T/list-5.json")"
 check "fw_api_href: empty listing or bad JSON -> empty" \
     '[ -z "$(fw_api_href < "$T/list-empty.json")" ] && [ -z "$(echo nope | fw_api_href)" ]' ""
+
+# The installer's OS_TRACK / DEB_PLATFORM block, run under its own strict
+# mode against a fixture os-release instead of /etc/os-release.
+printf 'VERSION_ID="11"\nVERSION_CODENAME=bullseye\n' > "$T/os-release-11"
+printf 'VERSION_ID="12"\nVERSION_CODENAME=bookworm\n' > "$T/os-release-12"
+INST_CFG="$(sed -n '/^OS_TRACK="\${OS_TRACK:-}"$/,/^PROTECT_UPDATE_URL=/p' "$INST")"
+instcfg() {  # instcfg <os-release> [OS_TRACK]
+    ( set -euo pipefail; DEVICE=UNVR; OS_TRACK="${2:-}"; unset DEB_PLATFORM
+      eval "${INST_CFG//\/etc\/os-release/$1}"
+      echo "$OS_TRACK|$DEB_PLATFORM|$FW_UPDATE_URL|$PROTECT_UPDATE_URL" )
+}
+check "installer: the config block was found" '[ "$(grep -c . <<<"$INST_CFG")" -gt 10 ]' "$INST_CFG"
+out=$(instcfg "$T/os-release-11")
+check "installer on bullseye: track 5, deb11, a version_major~~5 listing" \
+    '[ "$(cut -d"|" -f1-2 <<<"$out")" = "5|uos-deb11-arm64" ] && grep -q "/api/firmware?.*platform~~UNVR&filter=eq~~version_major~~5&limit=500|" <<<"$out" && grep -q "platform~~uos-deb11-arm64$" <<<"$out"' "$out"
+out=$(instcfg "$T/os-release-13")
+check "installer on trixie: track 6, deb13" \
+    '[ "$(cut -d"|" -f1-2 <<<"$out")" = "6|uos-deb13-arm64" ] && grep -q "version_major~~6&limit=500" <<<"$out"' "$out"
+out=$(instcfg "$T/os-release-12")
+check "installer on bookworm: track latest (firmware-latest), deb11" \
+    '[ "$(cut -d"|" -f1-2 <<<"$out")" = "latest|uos-deb11-arm64" ] && grep -q "/api/firmware-latest?filter=eq~~product~~unifi-nvr" <<<"$out"' "$out"
+out=$(instcfg "$T/os-release-11" 5.1.33)
+check "installer: OS_TRACK=5.1.33 pins major, minor and patch" \
+    'grep -q "version_major~~5&filter=eq~~version_minor~~1&filter=eq~~version_patch~~33&limit=500" <<<"$out"' "$out"
+out=$(instcfg "$T/os-release-11" bogus 2>&1); rc=$?
+check "installer: a bad OS_TRACK stops the install" '[ $rc != 0 ] && grep -q "is not .latest." <<<"$out"' "$out"
+
+# The installer's Debian guard, in a scratch WORKDIR with a cached download.
+INST_GUARD="$(sed -n '/^FW_OS_RELEASE="\$SQFS_ROOT\/usr\/lib\/os-release"$/,/^fi$/p' "$INST")"
+instguard() {  # instguard <fw root> <system codename>
+    mkdir -p "$T/inst/firmware-build"; echo bin > "$T/inst/firmware-build/fwupdate.bin"
+    ( set -euo pipefail; WORKDIR="$T/inst"; SQFS_ROOT="$1"; OS_CODENAME="$2"
+      eval "$INST_GUARD"; echo "guard passed" ) 2>&1
+}
+check "installer: the guard block was found" 'grep -q "exit 1" <<<"$INST_GUARD"' "$INST_GUARD"
+out=$(instguard "$T/fw60" bullseye); rc=$?
+check "installer guard: trixie firmware on bullseye stops, cached fwupdate.bin removed" \
+    '[ $rc != 0 ] && grep -q "built on Debian .trixie." <<<"$out" && [ ! -e "$T/inst/firmware-build/fwupdate.bin" ]' "$out"
+out=$(instguard "$T/fw51" bullseye); rc=$?
+check "installer guard: bullseye firmware on bullseye passes, download kept" \
+    '[ $rc = 0 ] && grep -q "guard passed" <<<"$out" && [ -e "$T/inst/firmware-build/fwupdate.bin" ]' "$out"
+check "installer: the guard runs before /usr/lib/version is written" \
+    '[ "$(grep -nF "FW_OS_RELEASE=\"\$SQFS_ROOT/usr/lib/os-release\"" "$INST" | cut -d: -f1)" -lt "$(grep -nF "cp \"\$WORKDIR/version\" /usr/lib/version" "$INST" | cut -d: -f1)" ]' ""
 
 ###############################################################################
 # unifi-core-storage-patch.sh
@@ -238,6 +312,18 @@ out=$(runpatch "$T/svcdrift.js"); rc=$?
 check "patch: 5.1-style bundle with a renamed anchor still alerts" \
     '[ $rc = 0 ] && grep -q "ALERT: Patch A anchor not found" <<<"$out" && grep -q "logger -t unifi-core-storage-patch -p daemon.err" <<<"$(calls)" && cmp -s <(printf "%s\n" "$BDRIFT") "$T/svcdrift.js"' "$out
 $(calls)"
+
+# A 5.1.x whose call gains arguments, or loses the call but keeps the
+# snapshot shape, must not be mistaken for 6.0.
+printf '%s\n' "${B51//\"inspect\"\]/\"inspect\",\"--json\"]}" > "$T/svcargs.js"
+out=$(runpatch "$T/svcargs.js")
+check "patch: call with extra arguments + anchor -> still patched" 'grep -q "Patch A applied" <<<"$out"' "$out"
+printf '%s\n' "${BDRIFT//\"inspect\"\]/\"inspect\",\"--json\"]}" > "$T/svcargsdrift.js"
+out=$(runpatch "$T/svcargsdrift.js")
+check "patch: call with extra arguments + drifted anchor -> still alerts" 'grep -q "ALERT" <<<"$out"' "$out"
+printf '%s\n' '/* fixture */abc={space:e,disks:[],sdcards:[]};' > "$T/svcshape.js"
+out=$(runpatch "$T/svcshape.js")
+check "patch: snapshot shape without the call -> anchor check, alert" 'grep -q "ALERT" <<<"$out"' "$out"
 
 ###############################################################################
 # ustorage: worm check (new in 6.0) and unknown verbs

@@ -149,8 +149,9 @@ if [ -z "$OS_TRACK" ]; then
     esac
 fi
 # App debs (Protect, its AI packages) are published per Debian base:
-# uos-deb11-arm64 for 5.x, uos-deb13-arm64 for 6.x.
-case "$OS_VERSION_ID" in ''|*[!0-9]*) OS_VERSION_ID=11 ;; esac
+# uos-deb11-arm64 for 5.x, uos-deb13-arm64 for 6.x; nothing else is
+# published (deb12 answers empty), so any other release gets deb11.
+case "$OS_VERSION_ID" in 13) ;; *) OS_VERSION_ID=11 ;; esac
 DEB_PLATFORM="${DEB_PLATFORM:-uos-deb${OS_VERSION_ID}-arm64}"
 
 # Ubiquiti's firmware-update API. Same endpoint the UNVR queries for
@@ -512,15 +513,20 @@ fi
 # The firmware's packages only install on the Debian release they were
 # built for (6.0.x is trixie, 5.x bullseye); Phase 5 would fail on every
 # library. Stop before anything is written, /usr/lib/version included.
+# Phase 4 reuses a downloaded fwupdate.bin without asking the API again, so
+# a refused one (e.g. 6.0.11, fetched by this script before it had a track)
+# is deleted here; the next run then resolves OS_TRACK afresh.
 FW_OS_RELEASE="$SQFS_ROOT/usr/lib/os-release"
 [ -f "$FW_OS_RELEASE" ] || FW_OS_RELEASE="$SQFS_ROOT/etc/os-release"
 FW_CODENAME="$(sed -n 's/^VERSION_CODENAME=//p' "$FW_OS_RELEASE" 2>/dev/null \
     | head -1 | tr -d "\"'" || true)"
 if [ -z "$FW_CODENAME" ] || [ "$FW_CODENAME" != "$OS_CODENAME" ]; then
+    rm -f "$WORKDIR/firmware-build/fwupdate.bin"
     echo "ERROR: this firmware is built on Debian '${FW_CODENAME:-unknown}';" >&2
     echo "  this system runs Debian '${OS_CODENAME:-unknown}'. Its packages" >&2
-    echo "  cannot be installed here. Leave FW_URL and OS_TRACK unset to get" >&2
-    echo "  the newest release for this Debian; see docs/unifi-os-6-compat.md." >&2
+    echo "  cannot be installed here. The downloaded fwupdate.bin was removed." >&2
+    echo "  Re-run with FW_URL and OS_TRACK unset to get the newest release" >&2
+    echo "  for this Debian; see docs/unifi-os-6-compat.md." >&2
     exit 1
 fi
 
@@ -1058,9 +1064,10 @@ chown -R postgres:postgres /srv/postgresql 2>/dev/null || true
 #             health. Nothing to monitor on a VM.
 #   sfp/sfpd  Small Form-factor Pluggable daemon. Manages the UNVR's SFP+
 #             optical ports. VM doesn't have any.
-#   ufcd      Fan control daemon, new in UniFi OS 6.0 (ustd). Wants usdbd
-#             and the UNVR fans; restarts forever without them. Masking
-#             it on 5.x, where it does not exist, is harmless.
+#   ufcd      Fan control daemon, new in UniFi OS 6.0 (ustd), Restart=always.
+#             Wants usdbd and the UNVR fans; on a VM it can only fail and
+#             be restarted. Masking it on 5.x, where it does not exist, is
+#             harmless.
 for svc in usd usdbd rpsd uhwd sfp sfpd ufcd; do
     systemctl stop "${svc}.service" 2>/dev/null || true
     systemctl mask "${svc}.service" 2>/dev/null || true

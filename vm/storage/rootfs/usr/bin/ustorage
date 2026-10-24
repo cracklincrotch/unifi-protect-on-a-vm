@@ -604,8 +604,9 @@ def worm_check(details):
     """`worm check [--details]` - WORM (write-once) disk status, UniFi OS 6.0.
 
     unifi-core 6.0 asks only on models with storage.supportsWorm (not the
-    UNVR); ubnt-systool's reset2defaults gate asks with --details. A VM has
-    no WORM disks, so answer as the real 6.0 ustorage does without any."""
+    UNVR); ubnt-systool's reset2defaults WORM gate would ask with --details
+    (it is commented out in 6.0.11). A VM has no WORM disks, so answer as
+    the real 6.0 ustorage does without any."""
     counts = {"compliance": 0, "enterprise": 0}
     if details:
         return {"counts": counts, "devices": {}, "worm_found": False}
