@@ -421,6 +421,8 @@ check "ubntnas guard: refuses to exec itself as the real binary" '[ $rc = 1 ] &&
 check "install-shims.sh diverts ubntnas to ubntnas.real and installs the guard" \
     'grep -q "dpkg-divert --local --rename --divert /usr/bin/ubntnas.real" "$SHIMS" && grep -qF "wrappers/rootfs/usr/bin/ubntnas" "$SHIMS" && grep -q "mv -f /usr/bin/ubntnas.new /usr/bin/ubntnas" "$SHIMS"' ""
 check "--verify checks the ubntnas guard" 'grep -q "ubntnas firmware-update guard" "$UPD"' ""
+check "--access and --check compare app versions without the API's leading v" \
+    'grep -qF "if [ \"\$CURRENT_ACCESS\" = \"\${ACCESS_VERSION#v}\" ]; then" "$UPD" && grep -qF "\"\$CURRENT_PROTECT\"    \"\${PROTECT_VERSION#v}\"" "$UPD" && grep -qF "\"\$CURRENT_ACCESS\"     \"\${ACCESS_VERSION#v}\"" "$UPD"' ""
 
 ###############################################################################
 # ustorage: worm check (new in 6.0) and unknown verbs

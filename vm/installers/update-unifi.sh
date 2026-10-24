@@ -832,8 +832,9 @@ else
     printf "    %-30s %s (not compared: no firmware on this track)\n" \
         "UniFi OS" "${CURRENT_OS_SHORT:-$CURRENT_OS_VERSION}"
 fi
-print_version "unifi-protect"     "$CURRENT_PROTECT"    "$PROTECT_VERSION"
-print_version "unifi-access"      "$CURRENT_ACCESS"     "$ACCESS_VERSION"
+# dpkg says 7.3.70, the API v7.3.70: compare without the v.
+print_version "unifi-protect"     "$CURRENT_PROTECT"    "${PROTECT_VERSION#v}"
+print_version "unifi-access"      "$CURRENT_ACCESS"     "${ACCESS_VERSION#v}"
 echo "    ai-feature package         resolved from Protect at install"
 echo "    (Other packages compared during sync)"
 echo ""
@@ -1189,7 +1190,10 @@ upgrade_access() {
     echo "Upgrading Access to $ACCESS_VERSION ($PROTECT_CHANNEL)"
     echo "=============================================="
 
-    if [ "$CURRENT_ACCESS" = "$ACCESS_VERSION" ]; then
+    # dpkg reports "4.3.22+12152"; the API reports "v4.3.22+12152" -- strip
+    # the v, as upgrade_protect does. Without it Access was reinstalled on
+    # every run.
+    if [ "$CURRENT_ACCESS" = "${ACCESS_VERSION#v}" ]; then
         echo "    Already at latest version. Nothing to do."
         return 0
     fi
