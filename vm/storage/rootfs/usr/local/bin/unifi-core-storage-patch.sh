@@ -25,11 +25,17 @@
 # removed that gate entirely — disks now flow solely via `ustorage disk inspect`
 # — so Patch B is obsolete and no longer applied.
 #
+# UniFi OS 6.0 (unifi-core 6.0.123): the snapshot and its `ustorage space
+# inspect` call are gone; the script recognises that and exits 0 without an
+# alert. See docs/unifi-os-6-compat.md.
+#
 # Idempotent + boot-safe: already-applied, or cleanly-applied-now, exits 0.
 ###############################################################################
 set -u
 
-SVC=/usr/share/unifi-core/app/service.js
+# SVC / PUSH_CONF may be overridden from the environment; only the tests in
+# vm/tests/ do that.
+SVC="${SVC:-/usr/share/unifi-core/app/service.js}"
 
 # Patch A — disk LIST (5.1.132-era anchor)
 # The minifier renames BOTH identifiers every core release:
@@ -41,7 +47,7 @@ MARKER='["disk","inspect"]'
 ANCHOR='iwe={space:e,disks:[],sdcards:[]};'
 REPL='let dd=[];try{dd=JSON.parse((await Q("ustorage",["disk","inspect"])).stdout);}catch(_){Elt.error("Failed to retrieve disk info via ustorage:",_);}iwe={space:e,disks:dd,sdcards:[]};'
 
-PUSH_CONF=/usr/local/etc/md-health-watch.conf
+PUSH_CONF="${PUSH_CONF:-/usr/local/etc/md-health-watch.conf}"
 
 alert() {
     local msg="$1"
@@ -69,6 +75,15 @@ fi
 
 if grep -qF "$MARKER" "$SVC"; then
     echo "storage-patch: already applied"
+    exit 0
+fi
+
+# unifi-core 6.x (UniFi OS 6.0) has no `ustorage space inspect` snapshot left
+# to patch: the storage store takes the disk list from the gRPC DiskState
+# stream that ustated-shim serves. Nothing to do, and no anchor to alert on.
+# A 5.1.x bundle always carries this call, so its anchor check still runs.
+if ! grep -qF '"ustorage",["space","inspect"]' "$SVC"; then
+    echo "storage-patch: not needed (no ustorage space-inspect call in this unifi-core)"
     exit 0
 fi
 

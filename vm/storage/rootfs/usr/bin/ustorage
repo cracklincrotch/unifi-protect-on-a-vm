@@ -600,6 +600,18 @@ def rwfs_check():
             "migratable": {"canMigrate": False, "reason": "not-support"}}
 
 
+def worm_check(details):
+    """`worm check [--details]` - WORM (write-once) disk status, UniFi OS 6.0.
+
+    unifi-core 6.0 asks only on models with storage.supportsWorm (not the
+    UNVR); ubnt-systool's reset2defaults gate asks with --details. A VM has
+    no WORM disks, so answer as the real 6.0 ustorage does without any."""
+    counts = {"compliance": 0, "enterprise": 0}
+    if details:
+        return {"counts": counts, "devices": {}, "worm_found": False}
+    return {"counts": counts, "has_worm": False, "modes": []}
+
+
 def space_nuke():
     """`space nuke` — erase the storage volume and re-provision it.
 
@@ -636,10 +648,15 @@ def main():
             config_hotspare(argv[2] if len(argv) > 2 else "false")
         elif cmd == "rwfs check":
             print(json.dumps(rwfs_check()))
+        elif cmd == "worm check":
+            print(json.dumps(worm_check("--details" in argv)))
         elif cmd == "space nuke":
             space_nuke()
         # Unknown subcommands: print nothing, exit 0 — matches the old
         # fake's behaviour so we don't surprise any caller.
+        # 6.0's boot hook 99-replay-late-mount runs `space replay-late-mount`
+        # to replay usd's mount hooks; provision-storage.sh already made
+        # /srv, so the no-op here is the right answer.
     except Exception:
         # ustorage must never crash. Degrade to an empty-but-valid
         # response of the shape the caller asked for.
