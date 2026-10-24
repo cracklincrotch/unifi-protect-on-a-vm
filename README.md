@@ -191,7 +191,7 @@ The UNVR runs hardware-management services that crash on a VM:
 - `rpsd` (reset power switch daemon) — manages the UNVR's physical reset button
 - `uhwd` (hardware watchdog daemon) — UNVR-specific hardware monitoring
 - `sfpd` (SFP+ optical port daemon) — for the UNVR's network ports
-- `ufcd` (fan control daemon, new in UniFi OS 6.0) - drives the UNVR's fans; masked ahead of time on 5.x, where it does not exist yet
+- `ufcd` (fan control daemon, new in UniFi OS 6.0) - drives the UNVR's fans; masked by the installers whenever they install the Ubiquiti packages (on 5.x, where it does not exist, the mask is a harmless placeholder)
 - `unvr-initramfs` (boot scripts that wait for UNVR-specific MTD flash) — removed entirely
 
 These are masked (not just disabled) because they're triggered as dependencies by `ustated` and would otherwise restart.
@@ -677,7 +677,7 @@ Once running, updates are handled by `update-unifi.sh`:
 
 The script queries Ubiquiti's firmware API (the same one the UNVR uses to find updates) and downloads the latest debs directly. Checksum verification on every download.
 
-**UniFi OS 6.0 and `OS_TRACK`.** UniFi OS 6.0 rebased the UNVR firmware from Debian 11 (bullseye) onto Debian 13 (trixie), and its packages cannot be installed on this VM's Debian 11. So `--sync-os` follows the newest release of the major built on the VM's own Debian release (bullseye: 5.x), not the API's newest of any major. `--check` says when a newer firmware exists outside that line. Pin with `OS_TRACK=5.1` or `OS_TRACK=5.1.33` (or `--os-track`); `OS_TRACK=latest` restores the old behaviour. If the firmware's Debian release does not match the VM's, `--sync-os` stops before it touches anything. The comparison and the route to 6.0 are in [docs/unifi-os-6-compat.md](docs/unifi-os-6-compat.md).
+**UniFi OS 6.0 and `OS_TRACK`.** UniFi OS 6.0 rebased the UNVR firmware from Debian 11 (bullseye) onto Debian 13 (trixie), and its packages cannot be installed on this VM's Debian 11. So `--sync-os` follows the newest release of the major built on the VM's own Debian release (bullseye: 5.x), not the API's newest of any major. `--check` says when a newer firmware exists outside that line. Pin with `OS_TRACK=5.1` or `OS_TRACK=5.1.33` (or `--os-track`); `OS_TRACK=latest` restores the old behaviour. If the firmware's Debian release does not match the VM's, `--sync-os` stops right after downloading and unpacking it, before it stops a service or installs anything. The comparison and the route to 6.0 are in [docs/unifi-os-6-compat.md](docs/unifi-os-6-compat.md).
 
 ### Should I run `apt-get upgrade`?
 

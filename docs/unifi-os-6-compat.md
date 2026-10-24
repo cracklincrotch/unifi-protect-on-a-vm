@@ -17,10 +17,11 @@ result below can be reproduced with the commands in [Method](#method).
 - **Urgent, and fixed in this PR:** 6.0.11 is the API's `firmware-latest`
   for UNVR since 2026-10-07. Before this PR, `update-unifi.sh --sync-os` (or
   `--all`) on the live VM would have stopped Protect, failed apt, carried on,
-  stamped `/usr/lib/version` with 6.0.11, restarted the stack and from then on
-  reported "up to date". unifi-core reports that file as the console's
-  firmware version. A fresh `install-protect-baremetal.sh` run would also
-  pull 6.0.11 and fail in Phase 5, after writing the 6.0.11 version file.
+  stamped `/usr/lib/version` with 6.0.11 and restarted the stack. unifi-core
+  reports that file as the console's `firmwareVersion`, so the console would
+  have shown 6.0.11 while running 5.1.33. A fresh
+  `install-protect-baremetal.sh` run would also pull 6.0.11 and fail in
+  Phase 5, after writing the 6.0.11 version file.
 - **Go for staying on 5.1.x for now.** Protect 7.3.70, Access 4.3.22, ms/msr
   5.1.317 and ds 7.3.6 are still published for `uos-deb11-arm64`, the same
   versions as for `uos-deb13-arm64`. Nothing forces 6.0 today.
@@ -37,12 +38,18 @@ result below can be reproduced with the commands in [Method](#method).
 | 1 | Debian 11 -> 13 rebase | `etc/debian_version` 11.11 -> 13.7. `apt-get -s` of the repacked 6.0 set in an arm64 chroot of the 5.1.33 root: exit 100, unmet dependencies for 24 packages (ble-http-transport, bluez-tools-ui, fluent-bit, jq, libcurlpp, libjq1, libpam-usermapper, libsodiumpp, libubnt, libuled, systemd-networkd-fallbacker, ubnd, ubnt-disk-smart-mon, ubnt-rpsd, ubnt-sfp-handler, ubnt-tools, ubnt-ucp4cpp, ubntnas, ucore-setup-listener, ui-snmp, uled-control, uos, uos-agent, ustate-exporter) | Breaks us. Guarded in this PR; 6.0 itself needs a Debian 13 guest (not done here) |
 | 2 | `update-unifi.sh` follows `firmware-latest` (now 6.0.11) and stamps `/usr/lib/version` even when apt installed nothing (its `apt-get ... \|\| echo NOTE` swallows the failure) | API response, script lines before this PR | Fixed: `OS_TRACK`, Debian guard, version stamped only if unifi-core reached the firmware's version |
 | 3 | `install-protect-baremetal.sh` Phase 4 also takes `firmware-latest`, copies its version file, then fails in Phase 5 | same | Fixed: same track default and Debian guard, before the version file is written |
-| 4 | New `ufcd.service` (UI fan control, package `ustd`): `WantedBy=local-fs.target`, `Wants/After=usdbd.service`, `Restart=always` | unit file in 6.0 `ustd` | Masked in both installers' lists (harmless on 5.x) |
+| 4 | New `ufcd.service` (UI fan control, package `ustd`): `WantedBy=local-fs.target`, `Wants/After=usdbd.service`, `Restart=always`; on a VM it has no fans to drive and can only fail and be restarted (the binary itself was not run) | unit file in 6.0 `ustd` | Masked in both installers' lists (harmless on 5.x) |
 | 5 | Storage Patch A anchor gone: 6.0's unifi-core never calls `ustorage space inspect`, so the patch script would raise its anchor alert (journal error + Pushover) on every unifi-core start | real 6.0.11 `service.js`: 0 matches | Fixed: recognised as not needed, exits 0 quietly; 5.1 path unchanged |
 | 6 | App debs are per Debian base: `uos-deb11-arm64` and `uos-deb13-arm64` (no deb12) | API queries for unifi-protect, unifi-access, ai-feature-console, ms, msr, ds, protect-verify | Fixed: platform derived from `/etc/os-release` (11 -> deb11, so unchanged today) |
 
-Everything else in the brief's checklist is unchanged or changed harmlessly;
-details follow.
+Also fixed here, pre-existing but in the same path: the `--sync-os` version
+diff counted the firmware's bundled `unifi-protect` and `ai-feature-*`
+packages, which the script never installs. On a guest with Protect 7.3.70 a
+sync of the release already installed therefore listed phantom downgrades
+(`unifi-protect 7.3.70 -> 7.1.87`, `ai-feature-controller 2.1.5 -> 2.0.17`)
+and stopped and restarted the whole stack for nothing.
+
+Everything else checked is unchanged or changed harmlessly; details follow.
 
 ## Comparison
 
@@ -55,7 +62,7 @@ details follow.
 | Ubiquiti packages (`@ui.com`/`@ubnt.com`) | 50 | 51 | 3 new, 2 removed, 30 changed, 18 same version |
 | New | - | `bluez-tools-ui` 5.82.1 (`bccmd`, `hciattach_ui`), `diskclass` 1.1.0 ("HDD/SSD classifier"; no caller found in units, udev rules, `/usr/bin`, `/usr/sbin`, ustd or unifi-core), `fluent-bit` 5.0.9 (audit log shipper) | changed, harmless; they are repacked and installed like the rest |
 | Removed | `node20` 20.19.5, `openssh-server-keygen` 0.3 | - | changed, harmless (nothing in the repo uses node20) |
-| Same version, rebuilt | e.g. `jq`/`libjq1` 1.6~ubnt: libc6 >= 2.17 -> >= 2.34/2.39 | | the version string hides a trixie rebuild; covered by item 1 |
+| Same version, rebuilt | e.g. 1.6~ubnt: `jq` libc6 >= 2.17 -> >= 2.34, `libjq1` libc6 >= 2.29 -> >= 2.39 | | the version string hides a trixie rebuild; covered by item 1 |
 | Key versions | unifi-core 5.1.132, ustd 5.1.18, ustate-exporter 1.27.5, ubnt-tools 5.1.11, uos 5.1.5, ulp-go 1.13.11, bundled Protect 7.1.87 | unifi-core 6.0.123, ustd 6.0.9, ustate-exporter 1.32.0, ubnt-tools 6.0.20, uos 6.0.4, ulp-go 1.14.7, bundled Protect 7.2.105 | changed; bundled Protect is never installed (the script installs Protect from the API) |
 | `unifi-email-templates-all` | 1.6.0-rc.12 | 1.4.0-rc.4 (a downgrade) | harmless, the script passes `--allow-downgrades` |
 | Kernel packages the script excludes | `linux-image-4.19.152-alpine-unvr` 4.19.152, `unvr-initramfs` 2.0 | identical | unchanged; the name patterns still match |
@@ -72,11 +79,11 @@ details follow.
 | `usd` | `TimeoutSec` 600 -> 900. Anchors unchanged: `DefaultDependencies=no`, `After=local-fs-pre.target usdbd.service uhwd.service`, `Before=local-fs.target`, `WantedBy=local-fs.target` | unchanged for us. usd's slot exists exactly as `provision-storage.service` copies it; its 600 s start limit is a separate, deliberate choice |
 | `usdbd`, `ustated`, `uhwd`, `uscsi-disk-ready` | identical | unchanged |
 | `ufcd` | new, `WantedBy=local-fs.target`, wants `usdbd` | needs a change in `update-unifi.sh` and `install-protect-baremetal.sh` (done: masked) |
-| `ms`, `msr`, `msp`, `mst` | identical unit files | unchanged; the `10-wait-for-volume1.conf` drop-ins still apply |
-| `unifi-core` | `Wants=` adds `fluent-bit-audit.service`; `Sockets=audit-shipper.socket`; `MemoryMax` 300M -> 1536M, `MemorySwapMax=0`, `OOMScoreAdjust=-900`; `$UNIFI_CORE_HEAP_OPTS`; `KillMode=control-group`; `unifi-core.service.d/memory.conf` removed | changed, harmless; only matters on a Debian 13 guest (the socket's user `audit-shipper` must exist there) |
+| `ms`, `msr`, `msp`, `mst` | the firmware-bundled builds' unit files are identical. The guest's media services come from the API instead (5.1.317, the same version for deb11 and deb13; their Maintainer has no e-mail address, so `--sync-os` never repacks them) | unchanged; the unit names the `10-wait-for-volume1.conf` drop-ins attach to are the same |
+| `unifi-core` | `Wants=` adds `fluent-bit-audit.service`; `Sockets=audit-shipper.socket`; `$UNIFI_CORE_HEAP_OPTS`; `KillMode=control-group`; the 5.1.33 drop-in `unifi-core.service.d/memory.conf` (MemoryMin 200M, MemoryLow 300M, MemoryHigh 1024M, MemoryMax 1536M, MemorySwapMax 200M) is gone and the unit now sets `MemoryMax=1536M`, `MemorySwapMax=0`, `OOMScoreAdjust=-900`: in effect MemoryHigh/Low/Min are dropped and swap goes to 0 | changed, harmless; only matters on a Debian 13 guest (the socket's user `audit-shipper` must exist there) |
 | `ulp-go` | `Restart=always`, memory limits | changed, harmless |
 | `postgresql@14-protect` | only `memory-limits.conf` values | unchanged for us; `10-assert-datadir.conf` still applies, `pg_conftool` comes from the same postgresql-common 293 |
-| `local-fs` ordering | `local-fs.target.wants` gains only `ufcd`; `local-fs-pre.target.wants` (uscsi-reset-wipe, uscsi-rescan, uscsi-disk-ready) unchanged | unchanged once ufcd is masked |
+| `local-fs` ordering | `/etc/.../local-fs.target.wants` gains only `ufcd`; `local-fs-pre.target.wants` (uscsi-reset-wipe, uscsi-rescan, uscsi-disk-ready) unchanged. The vendor `/usr/lib/systemd/system/local-fs.target.wants` gains systemd 257's `tmp.mount` and `run-lock.mount` | unchanged for the current guest once ufcd is masked. On a Debian 13 guest `/tmp` becomes a tmpfs; check nothing of ours keeps large files there |
 | New elsewhere | `fluent-bit-audit`, `audit-shipper.socket`, `unifi-audit-protect` (`chattr +a /data/audit`), `unifi-audit-cleanup.timer`, `unifi-protect-permission-repair` (bundled Protect), systemd 257's `capsule@`, oomd slice drop-ins | changed, harmless for the current VM |
 | Boot hook `55-unmask.py` | now `unmask --no-reload` + one `daemon-reload`; the list it unmasks (`unifi-protect`, `postgresql@14-protect`, `uid-agent`, `smbd` ...) is identical and holds nothing we mask | unchanged |
 | Boot hook `99-replay-late-mount` (new) | runs `ustorage space replay-late-mount` to replay usd's mount hooks | harmless: our `ustorage` exits 0 silently on unknown verbs, and `provision-storage.sh` already makes `/srv` |
@@ -85,9 +92,9 @@ details follow.
 
 | What | 6.0.11 | Verdict |
 |------|--------|---------|
-| `ubnt-tools` (shim at `/sbin/ubnt-tools`) | still installed at `/sbin/ubnt-tools` by `ubnt-tools`. Callers are the same files with the same subcommands: `id` (unifi-core, pre-start hooks, ms pre-start, AI controller, `unifi-protect-tmpfs`, board-info cache hook) and `uuid` (`ubnt-systool`). Fields read: `board.sysid`, `board.shortname`, `board.bom`; new consumer `unifi-protect.service` (bundled Protect) reads `board.sysid`. unifi-core's EEPROM dump (`ubnt-tools id <file>`, behind a predicate) is the same code as in 5.1.33; the shim writes no file there, so if it runs it logs "Failed to read EEPROM" exactly as today | unchanged |
+| `ubnt-tools` (shim at `/sbin/ubnt-tools`) | still installed at `/sbin/ubnt-tools` by `ubnt-tools`. Callers are the same files with the same subcommands: `id` (unifi-core, pre-start hooks, ms pre-start, AI controller, `unifi-protect-tmpfs`, board-info cache hook) and `uuid` (`ubnt-systool`), and the bundled `unifi-protect.service` reads `board.sysid` in both. Fields read: `board.sysid`, `board.shortname`, `board.bom`. unifi-core's EEPROM dump (`ubnt-tools id <file>`, behind a predicate) is the same code as in 5.1.33; the shim writes no file there, so if it runs it logs "Failed to read EEPROM" exactly as today | unchanged |
 | `uled-ctrl`, `smartctl` | `/usr/bin/uled-ctrl`, `/usr/sbin/smartctl` | unchanged |
-| `/usr/bin/ustorage` | still owned by `ustd`, so a sync still overwrites it and `install-storage.sh` re-lays it. Verbs unifi-core 6.0 calls: `config hotspare`, `config prefer`, `rwfs check`, `rwfs migrate`, `space nuke`, new `worm check`. `space inspect` is no longer called; `disk inspect` never was (only by Patch A) | `worm check` is gated by `features.storage.supportsWorm`, set only for an enterprise NAS model, not UNVR. Still answered now (done), in the real 6.0 output shape |
+| `/usr/bin/ustorage` | still owned by `ustd`, so a sync still overwrites it and `install-storage.sh` re-lays it. Verbs unifi-core 6.0 calls: `config hotspare`, `config prefer`, `rwfs check`, `rwfs migrate`, `space nuke`, `disk clean <slot>` and `disk inspect <slot>` (both for the per-disk erase, as in 5.1.33), and new `worm check`. `space inspect` is no longer called | `worm check` is gated by `features.storage.supportsWorm`, set only for an enterprise NAS model, not UNVR. Still answered now (done), in the real 6.0 output shape. Pre-existing, not 6.0: the shim has no `disk clean`, so the UI's per-disk erase does nothing on the VM while unifi-core logs success |
 | unifi-core storage patch | Patch A anchor `iwe={space:e,disks:[],sdcards:[]};` and the `"ustorage",["space","inspect"]` call: 0 matches. Disks come from the gRPC store (`DiskState` stream -> `getV1StorageState()` / `getTransformedDisks()`), which `ustated-shim` feeds. Exec helper renamed `Q` -> `q` | needs a change in `unifi-core-storage-patch.sh` and `update-unifi.sh --verify` (done: "not needed") |
 | storage gRPC API | `@ubnt/unifi-protobufs` 0.115.0 -> 0.143.0; still `storage/v1` and `v2` (no v3), same six v2 RPCs, still `127.0.0.1:11052`; only additive enum values (`DISK_RISK_REASON_INVESTIGATION_NEEDED`, `SPACE_ISSUE_TYPE_RAID_BAD_BLOCKS`, `CACHE_POLICY_LVM_RAND`); `accessory/v1` identical; grpc-js 1.14.1 -> 1.14.3 | unchanged; spot-checked below |
 | UNVR model entry in unifi-core | storage still `{id:1,type:"raid",mountPoint:"/srv",path:"/dev/md3"}` (the `mdadm` wrapper's premise); adds `nonPrivateLocalDiscovery`, `discoverDevices` and a `webrtcWorker` run as a systemd unit | unchanged for the storage path |
@@ -97,7 +104,9 @@ details follow.
 
 ### New hardware queries and checks a VM could fail
 
-- `ufcd` (fan control): would restart forever. Masked by this PR.
+- `ufcd` (fan control, `Restart=always`): no fans to drive on a VM, so it can
+  only fail and be restarted (until systemd's start limit, at best). Masked
+  by this PR.
 - `ubnt-systool network-fec` (FEC on the SFP ports) is newly called by
   unifi-core. Expect at most a logged error on a VM; check on a Debian 13 guest.
 - `diskclass`: shipped, no caller in the image.
@@ -167,32 +176,53 @@ old behaviour was the bug:
   - `OS_TRACK` (`--os-track`): `5`, `5.1`, `5.1.33` or `latest`. Default: the
     major built on the guest's Debian release (bullseye -> 5, trixie -> 6,
     unknown -> latest). On the current guest it resolves to 5.1.33, so
-    `--check` reads "up to date" and names 6.0.11 as outside the track.
+    `--check` reads "up to date" and names 6.0.11 as outside the track. A
+    non-JSON API answer is a clear error.
+  - `--check` warns when the selected firmware is not the line built on the
+    guest's Debian (e.g. `OS_TRACK=6` or `latest` on bullseye) and when a
+    pinned release is older than the installed one (`--allow-downgrades`
+    would apply it).
   - Debian guard in `sync_os_packages`, right after extraction and before any
     service is stopped: refuses a firmware whose `VERSION_CODENAME` differs from
-    the guest's, cleans the work dir, exits non-zero.
+    the guest's, cleans the work dir, exits non-zero. By then the script has
+    asked for a snapshot and downloaded and unpacked the image; nothing is
+    stopped or installed.
   - `/usr/lib/version` is copied only when the installed unifi-core equals the
-    firmware's; otherwise an ERROR, the stack is still re-masked, re-shimmed
-    and restarted as before, and the script exits 1 after cleanup.
-  - `DEB_PLATFORM` from `/etc/os-release` (11 -> `uos-deb11-arm64`, 13 ->
-    `uos-deb13-arm64`; overridable).
+    firmware's and dpkg has it as `ii`; otherwise an ERROR, the stack is still
+    re-masked, re-shimmed and restarted as before, and the script exits 1
+    after cleanup. With `--all` the Protect and Access upgrades are skipped in
+    that case. unifi-core is the marker: a firmware that kept unifi-core's
+    version would pass even if other packages failed.
+  - The version diff skips the firmware's bundled app packages
+    (`unifi-protect`, `ai-feature-*`, `unifi-access`), which the script never
+    installs; this removes the phantom-change restart described above.
+  - `DEB_PLATFORM` from `/etc/os-release`: 13 -> `uos-deb13-arm64`, anything
+    else -> `uos-deb11-arm64` (deb12 is not published); overridable.
   - `ufcd` added to the mask loop; `--verify` checks it when the unit exists and
-    accepts "Patch A not needed" on a bundle without `ustorage space inspect`.
+    accepts "Patch A not needed" on a bundle with neither the
+    `ustorage space inspect` call nor its snapshot.
   - `--check` compares OS versions as X.Y.Z.
   - The helpers sit above a "sourced: return" guard so tests can load them.
 - `vm/installers/install-protect-baremetal.sh`: the same `OS_TRACK` default for
   Phase 4 (`FW_URL` still wins), the Debian guard before `/usr/lib/version` is
-  written, `fw_api_href` picks the newest of a listing, `DEB_PLATFORM` for the
-  Protect and AI queries, `ufcd` masked. The firmware-bundled
-  `AIFC_STABLE_URL` pin stays deb11 (that path is documented as untested).
+  written (it also deletes the refused `fwupdate.bin`, which Phase 4 would
+  otherwise reuse without asking the API again), `fw_api_href` picks the
+  newest of a listing, `DEB_PLATFORM` for the Protect and AI queries, `ufcd`
+  masked. The firmware-bundled `AIFC_STABLE_URL` pin stays deb11 (that path is
+  documented as untested).
 - `vm/storage/rootfs/usr/local/bin/unifi-core-storage-patch.sh`: exits 0 with
-  "not needed" when the bundle has no `ustorage space inspect` call; the 5.1
-  path, including the drift alert, is unchanged. `SVC`/`PUSH_CONF` can be set
-  for tests.
+  "not needed" only when the bundle has neither a `"ustorage",["space","inspect"`
+  call (with any arguments) nor the snapshot's `disks:[],sdcards:[]}` shape.
+  A 5.1 bundle keeps the patch and the drift alert. `SVC`/`PUSH_CONF` can be
+  set for tests.
 - `vm/storage/rootfs/usr/bin/ustorage`: `worm check [--details]`.
-- `vm/tests/test_unifi_os6_compat.sh`: 51 stubbed checks (no root, no VM, no
-  network); 45 of them fail against the code before this PR. With
-  `FW_ROOT_51`/`FW_ROOT_60` pointing at unpacked images it adds 4 checks
+- `vm/tests/test_unifi_os6_compat.sh`: 71 stubbed checks (no root, no VM, no
+  network), covering the helpers, the guard and version-stamp wiring, the
+  installer's track block and guard (run against fixtures), the patch script
+  on 5.1, 6.0 and drifted bundles, and ustorage. It first checks statically
+  that the update script has its sourced-return guard and refuses to source
+  it otherwise, so against the code before this PR it stops at that check.
+  With `FW_ROOT_51`/`FW_ROOT_60` pointing at unpacked images it adds 4 checks
   against the real firmware.
 
 Not changed, on purpose: `ustated-shim.js`, `install-shims.sh`,
@@ -206,19 +236,29 @@ always runs; adding it now would alert on 5.1.33 where it does not exist).
 6.0 needs the guest on Debian 13 first. Two ways, both to be proven on an
 isolated clone:
 
-1. **In-place** (keeps `/data`: identity, databases, the anonid store): with the
-   Ubiquiti pin in place, `apt full-upgrade` bullseye -> bookworm -> trixie,
-   switching the pgdg and nginx.org sources at each step
-   (`fix_apt_ubiquiti_sources.sh` already follows `VERSION_CODENAME`). Re-lay
-   the `mdadm` wrapper if mdadm was upgraded (trixie moves it to
+1. **In-place** (keeps `/data`: identity, databases, the anonid store):
+   `apt full-upgrade` bullseye -> bookworm -> trixie, switching the pgdg and
+   nginx.org sources at each step (`fix_apt_ubiquiti_sources.sh` already
+   follows `VERSION_CODENAME`). The APT pin (`Pin-Priority: -1`) stops apt
+   from *upgrading* the Ubiquiti packages but not from *removing* one whose
+   dependencies break, so `apt-mark hold` them for the dist-upgrades and
+   unhold afterwards (holds break `uos runnable`, so they must not stay).
+   Re-lay the `mdadm` wrapper if mdadm was upgraded (trixie moves it to
    `/usr/sbin/mdadm`; the wrapper is not a dpkg diversion) and run
-   `install-shims.sh` for smartctl. Then `OS_TRACK=6 update-unifi.sh --all`:
-   the guard passes, apps come from `uos-deb13-arm64`. Postgres stays 14 (same
-   on-disk format); check every cluster's collation, since glibc goes from 2.31
-   to 2.41 and indexes on text in a glibc locale other than C would need a
+   `install-shims.sh` for smartctl. Do not run `update-unifi.sh` at the
+   bookworm stop. Then `OS_TRACK=6 update-unifi.sh --sync-os`: the guard
+   passes. The apps need one more step: Protect 7.3.70, ms/msr/msp/mst
+   5.1.317, ds 7.3.6 and the AI packages have the same versions on deb11 and
+   deb13 (Protect's two control files are identical), so `upgrade_protect`
+   says "Already at" and keeps the deb11 builds. Reinstall the deb13 builds
+   by hand (`apt-get install --reinstall` of each downloaded deb) and record
+   whether the deb11 ones ran at all. Postgres stays 14 (same on-disk
+   format); check every cluster's collation, since glibc goes from 2.31 to
+   2.41 and text indexes in a glibc locale other than C would need a
    REINDEX. UniFi's own `pg-cluster-upgrade` creates clusters with
    `--locale=C`; the 14-main cluster made by the installer's
-   `apt-get install postgresql-14` took the guest's default locale.
+   `apt-get install postgresql-14` took the guest's default locale. systemd
+   257 also makes `/tmp` a tmpfs.
 2. **Fresh Debian 13 guest** + restore of the UniFi OS backup. Needs
    `install-protect-baremetal.sh` ported to trixie (its bullseye check, Phase 1
    package list, jq/libjq1 handling) and is a larger change than this PR.
@@ -235,7 +275,9 @@ isolated clone:
   on a VM.
 - When Ubiquiti stops publishing `uos-deb11-arm64` app builds.
 - Pre-existing, not 6.0: the installer downloads the firmware without a
-  SHA256 check, and a Debian `mdadm` update replaces the `/sbin/mdadm` wrapper.
+  SHA256 check; a Debian `mdadm` update replaces the `/sbin/mdadm` wrapper;
+  the `ustorage` shim has no `disk clean`, so the UI's per-disk erase reports
+  success and does nothing.
 
 ## Method
 
@@ -271,59 +313,93 @@ FW_ROOT_51=/path/5.1.33/squashfs-root FW_ROOT_60=/path/6.0.11/squashfs-root \
 ## Test plan for an isolated clone
 
 The clone must not reach the cameras, the live console, or the UniFi cloud
-under the live console's identity, and must not touch the live VM's disks.
+under the live console's identity (its board serial is derived from the NIC
+MAC, which the clone keeps), and must not touch the live VM's disks, sockets
+or host-side state.
 
-1. **Make the clone.** Copy the OS image and the `/ssd1` image (for example with
-   `vm-clone-backup.py`). Give it two or more **new blank** data images
-   instead of the DAS; never attach the live DAS disks. Start it **without the
-   host control channel** (or with a host helper configured for the clone's
-   images only): `update-unifi.sh` asks the host to snapshot over that
-   channel, and the live helper would snapshot the live VM. Take snapshots of
-   the clone's images from the host by hand.
-2. **Network.** QEMU user networking with `restrict=on` (no outbound, no LAN),
-   plus one `guestfwd` to an allowlisting HTTPS proxy on the host that permits
-   only `fw-update.ubnt.com`, `fw-update.ui.com` and `fw-download.ubnt.com`
-   (add `deb.debian.org`, `security.debian.org`, `apt.postgresql.org`,
-   `nginx.org`, `apt.artifacts.ui.com` for step 9 only). Export
-   `https_proxy`/`http_proxy` only in the root shell that runs the scripts;
-   systemd services, unifi-core included, get no proxy and so no way out.
-   Confirm before going on: `ip route` shows only the user-mode route,
-   `curl -m5 https://api.ui.com` fails without the proxy, a camera's address
-   does not answer.
-3. **Deliver the branch** (scripts ISO) and run
-   `bash vm/tests/test_unifi_os6_compat.sh`: 51 passed, 0 failed.
-4. **Re-lay on 5.1.33**: `install-storage.sh`, then `systemctl restart unifi-core`;
+1. **Make the clone's images.** Copy the OS image, the `/ssd1` image and the
+   EFI vars file (QEMU writes to it) into a clone-only directory, for example
+   with `vm-clone-backup.py`. Create **four new blank** qcow2 data images;
+   never attach the live DAS disks.
+2. **Start it by hand, not with `start-protect-vm.sh`.** That script always
+   uses `vmnet-bridged` (the LAN), attaches the control channel, and defaults
+   `QMP_SOCKET`/`CONSOLE_SOCKET` to the global `/var/run/protect-vm.*.sock`
+   paths. QEMU would rebind those, and `snapshot.sh`, `vm-clone-backup.py` and
+   the DAS fault handler would then talk to the clone. Use a hand-written
+   `qemu-system-aarch64` command with: the clone's images and EFI vars; QMP
+   and serial on sockets inside the clone directory; no control-channel
+   chardev (so `md-layout-report.sh` cannot write the live `md-layout.map`
+   that the DAS fault handler reads); and
+   `-netdev user,id=net0,restrict=on,guestfwd=...` pointing at an allowlisting
+   HTTPS proxy on the host. Never run `snapshot.sh` or `vm-clone-backup.py`
+   with the live conf against the clone; take the clone's snapshots with
+   `qemu-img snapshot` while it is shut down.
+3. **Network allowlist.** The proxy permits only `fw-update.ubnt.com`,
+   `fw-update.ui.com` and `fw-download.ubnt.com` (add `deb.debian.org`,
+   `security.debian.org`, `apt.postgresql.org`, `nginx.org`,
+   `apt.artifacts.ui.com` for step 10, plus `www.postgresql.org` and
+   `github.com` for step 11). Export `https_proxy`/`http_proxy` only in the
+   root shell that runs the scripts; systemd services, unifi-core included,
+   get no proxy and so no way out. Check before going on: `ip route` shows only
+   the user-mode route; `getent hosts api.ui.com` and
+   `curl -m5 https://api.ui.com` fail without the proxy; a camera's address
+   does not answer. Move `/usr/local/etc/md-health-watch.conf` (Pushover
+   credentials) aside on the clone so its watchers cannot send anything.
+4. **Storage for the clone.** At first boot no array exists, so provision the
+   four blank images (Storage wizard, or `AUTOMODE=true` in
+   `/etc/default/unifi-storage` for one boot). Until then `--verify` reports
+   `md array [UUUU]` as FAIL, which is expected.
+5. **Deliver the branch** (scripts ISO) and run
+   `bash vm/tests/test_unifi_os6_compat.sh`: 71 passed, 0 failed.
+6. **Re-lay on 5.1.33**: `install-storage.sh`, then `systemctl restart unifi-core`;
    `journalctl -u unifi-core-storage-patch -b` shows "already applied" or
    "Patch A applied", not "not needed". `update-unifi.sh --verify`: all OK.
-   While there: `systemctl show unifi-core -p Environment` and
-   `cat /etc/default/unifi-core` for `NODE_APP_INSTANCE` (open question 2).
-5. **`update-unifi.sh --check`**: "UniFi OS 5.1.33 (up to date)",
+   While there, for open question 2:
+   `tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value unifi-core)/environ | grep NODE_APP_INSTANCE`
+   (`systemctl show -p Environment` does not include `EnvironmentFile` values).
+7. **`update-unifi.sh --check`**: "UniFi OS 5.1.33 (up to date)",
    "OS track: 5 (Debian bullseye, apps from uos-deb11-arm64)", and the note
-   naming v6.0.11 as outside the track. `--os-track bogus` is refused.
-6. **`update-unifi.sh --sync-os --yes`** (track 5): downloads 5.1.33, verifies
-   it, "No package changes detected". Then `--verify` still all OK, and
-   `systemctl is-enabled ufcd.service` says `masked`.
-7. **The guard**: `OS_TRACK=6 update-unifi.sh --sync-os --yes`. Expect the
+   naming v6.0.11 as outside the track. `--os-track 6 --check` adds the
+   "not the 5.x line" warning; `--os-track 5.1.31 --check` adds the downgrade
+   note; `--os-track bogus` is refused.
+8. **`update-unifi.sh --sync-os --yes`** (track 5): downloads 5.1.33, verifies
+   it, prints "No package changes detected" and stops nothing (before this
+   PR it listed Protect and its AI package as downgrades and restarted the
+   stack). A no-change sync never reaches the mask loop, so `ufcd` is not
+   masked by it; on 5.x that is fine, the unit does not exist.
+9. **The guard**: `OS_TRACK=6 update-unifi.sh --sync-os --yes`. Expect the
    download and extraction, then `ERROR: UNVR firmware v6.0.11+dd9ab55 is built
-   on Debian 'trixie'; this system runs Debian 'bullseye'.`, exit 1,
-   `/opt/unifi-update` emptied. Throughout, `unifi-protect` stays active (watch
-   `systemctl is-active unifi-protect` in a second shell) and
+   on Debian 'trixie'; this system runs Debian 'bullseye'.`, exit 1, and the
+   downloads in `/opt/unifi-update` removed. Throughout, `unifi-protect` stays
+   active (watch `systemctl is-active unifi-protect` in a second shell) and
    `/usr/lib/version` is unchanged.
-8. **Reboot the clone**: `--verify` all OK; `systemd-analyze critical-chain
-   local-fs.target` shows `provision-storage.service` before it; ms/msr/msp/mst
-   active; `ubnt-systool anonid` equals `/data/protect-on-mac/anonid`.
-9. **Optional, exploratory: the 6.0 route** on a fresh snapshot of the clone,
-   following "Route to 6.0" option 1. Record: whether the dist-upgrades keep the
-   pinned Ubiquiti packages; `OS_TRACK=6 update-unifi.sh --all` result;
-   unifi-core 6.0.123 active; the Storage panel lists the test disks; the patch
-   journal says "not needed"; `ufcd` masked and inactive; 14-main, 14-protect,
-   14-access up and whether 14-apps exists and runs; Protect 7.3.70 from
-   `uos-deb13-arm64`; `head -3 /sbin/mdadm` still the wrapper;
-   `psql -p 5433 -U postgres -Atc 'select datname, datcollate from pg_database'`;
-   unifi-core log lines about `network-fec`, the WebRTC worker and
-   `audit-shipper`.
-10. **Fresh-install check (optional)**: a new isolated Debian 11 VM with the same
-    network rules. `install-protect-baremetal.sh` logs the 5.1.33 firmware URL
-    and passes the guard; with `OS_TRACK=6` it stops at Phase 4 with the
-    Debian error and `/usr/lib/version` is not written.
-11. Discard the clone and its images.
+10. **The install path, both ways (optional; it downgrades the clone):**
+    `OS_TRACK=5.1.31 update-unifi.sh --sync-os --yes`, then
+    `OS_TRACK=5 update-unifi.sh --sync-os --yes`. Each run must install,
+    stamp `/usr/lib/version` with its release, mask `ufcd`
+    (`systemctl is-enabled ufcd.service` -> `masked`) and pass `--verify`.
+11. **Reboot the clone**: `--verify` all OK; `systemd-analyze critical-chain
+    local-fs.target` shows `provision-storage.service` before it;
+    ms/msr/msp/mst active; `ubnt-systool anonid` equals
+    `/data/protect-on-mac/anonid`.
+12. **Optional, exploratory: the 6.0 route** on a fresh snapshot of the clone,
+    following "Route to 6.0" option 1, with the step 3 Debian hosts added.
+    Record: whether the held Ubiquiti packages survive both dist-upgrades;
+    the `OS_TRACK=6 update-unifi.sh --sync-os` result; unifi-core 6.0.123
+    active; the Storage panel lists the clone's disks; the patch journal says
+    "not needed"; `ufcd` masked and inactive; 14-main, 14-protect, 14-access
+    up and whether 14-apps exists and runs; whether the deb11 Protect build
+    ran before the deb13 reinstall; `head -3 /sbin/mdadm` still the wrapper;
+    the collation of every cluster
+    (`for p in 5432 5433 5434 5435; do psql -p $p -U postgres -Atc 'select datname, datcollate from pg_database'; done`);
+    unifi-core log lines about `network-fec`, the WebRTC worker and
+    `audit-shipper`.
+13. **Fresh-install check (optional)**: a new Debian 11 VM, started the same
+    isolated way (Phase 0 also uses the control channel, so the step 2 rules
+    apply), with the step 3 hosts for Phases 1 to 3 allowed.
+    `install-protect-baremetal.sh` logs the 5.1.33 firmware URL and passes
+    the guard. For the refusal, use another fresh VM, or delete
+    `/opt/unvr-install/firmware-build/fwupdate.bin` first (Phase 4 reuses it):
+    with `OS_TRACK=6` it stops at Phase 4 with the Debian error, removes the
+    download, and `/usr/lib/version` is not written.
+14. Discard the clone and its images.
