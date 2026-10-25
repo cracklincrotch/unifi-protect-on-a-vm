@@ -28,9 +28,9 @@
 # capture a specific scenario, install exactly the disks you want present and,
 # in phase 5, pick the RAID level you want to test in the web UI.
 #
-# REQUIRES (root): tcpdump, mdadm, wipefs. Optional but recommended:
-# sgdisk (gdisk) for a thorough GPT zap, strace to capture the exact
-# ustorage/mdadm commands unifi-core invokes. Missing optionals degrade
+# REQUIRES (root): tcpdump, mdadm, wipefs, mountpoint. Optional but
+# recommended: sgdisk (gdisk) for a thorough GPT zap, strace to capture the
+# exact ustorage/mdadm commands unifi-core invokes. Missing optionals degrade
 # gracefully with a warning.
 #
 # USAGE
@@ -98,9 +98,18 @@ parent_disk() {
 }
 
 # Stop every systemd service holding a file open under /volume1.
+# Only while /volume1 is mounted: fuser -m lists every process on the
+# filesystem holding the path, and unmounted (fresh disks, no array yet, or
+# one that failed to start) that is the root filesystem - nearly every
+# process on the box. Checked every round, so a volume unmounted in between
+# can't turn the next round into a stop-everything.
 stop_volume_users() {
     local round pids pid unit units
     for round in 1 2 3; do
+        if ! mountpoint -q "$STORAGE_VOLUME"; then
+            log "round $round: $STORAGE_VOLUME not mounted - nothing to stop"
+            return 0
+        fi
         pids=$(fuser -m "$STORAGE_VOLUME" 2>/dev/null | tr -s ' ' '\n' \
                | grep -E '^[0-9]+$' || true)
         [ -z "$pids" ] && return 0
@@ -118,6 +127,7 @@ stop_volume_users() {
         sleep 3
     done
     # Anything still holding on after three rounds — name it, don't kill blindly.
+    mountpoint -q "$STORAGE_VOLUME" || return 0
     pids=$(fuser -m "$STORAGE_VOLUME" 2>/dev/null | tr -s ' ' '\n' \
            | grep -E '^[0-9]+$' || true)
     [ -n "$pids" ] && log "WARNING: still open after 3 rounds: PIDs $pids"
@@ -139,6 +149,9 @@ trap cleanup EXIT
 have tcpdump || die "tcpdump not found"
 have mdadm   || die "mdadm not found"
 have wipefs  || die "wipefs not found"
+# Without it every mountpoint check reads "not mounted": a mounted /volume1
+# would keep its users and skip the unmount, then get wiped under them.
+have mountpoint || die "mountpoint not found"
 have ustorage || die "ustorage not found — run this on a UniFi console"
 HAVE_SGDISK=0; have sgdisk && HAVE_SGDISK=1
 HAVE_STRACE=0; have strace && HAVE_STRACE=1
@@ -235,8 +248,13 @@ for d in "${STORAGE_DAEMONS[@]}"; do
     systemctl stop "$d" 2>/dev/null
 done
 
-log "phase 2: unmounting $STORAGE_VOLUME"
-umount "$STORAGE_VOLUME" 2>/dev/null || umount -l "$STORAGE_VOLUME" 2>/dev/null
+if mountpoint -q "$STORAGE_VOLUME"; then
+    log "phase 2: unmounting $STORAGE_VOLUME"
+    umount "$STORAGE_VOLUME" 2>/dev/null || umount -l "$STORAGE_VOLUME" 2>/dev/null \
+        || log "WARNING: could not unmount $STORAGE_VOLUME"
+else
+    log "phase 2: $STORAGE_VOLUME not mounted - nothing to unmount"
+fi
 
 # swapoff anything backed by the target disks/arrays, then stop the arrays.
 for sw in $(awk 'NR>1{print $1}' /proc/swaps 2>/dev/null); do
