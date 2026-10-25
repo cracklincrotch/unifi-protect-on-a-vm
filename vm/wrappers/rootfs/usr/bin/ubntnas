@@ -14,11 +14,14 @@
 #   ubntnas system upgrade <file> -f --no-reboot
 #
 # whenever ubntnas is on PATH, as it is here. ubntnas writes a real UNVR's
-# boot layout: /dev/sda1, sda2, sda5 and sda7, the mtdblock partitions and the
-# uboot environment. On this VM /dev/sd* are the recording array's disks.
-# This guard refuses that one call and passes everything else (ubnt-systool
-# also runs `ubntnas system reset` for reset2defaults) to the real binary.
-# Firmware on this VM moves with update-unifi.sh, never through the UI.
+# boot media (flash partitions, the eMMC's kernel and root partitions, the
+# uboot environment) and first runs the new firmware's own updater. On this
+# VM it stops early because /proc/ubnthal is missing, but nothing should
+# depend on that: docs/unifi-os-6-compat.md, "How a real UNVR upgrades in
+# place". This guard refuses that one call and passes everything else
+# (ubnt-systool also runs `ubntnas system reset` for reset2defaults) to the
+# real binary. Firmware on this VM moves with update-unifi.sh, never through
+# the UI.
 #
 # ubnt-systool shows ubntnas's stdout as the failure reason, so the refusal
 # is printed there; it is also logged.

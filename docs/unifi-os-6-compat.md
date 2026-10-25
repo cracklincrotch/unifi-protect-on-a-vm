@@ -41,7 +41,7 @@ result below can be reproduced with the commands in [Method](#method).
 | 4 | New `ufcd.service` (UI fan control, package `ustd`): `WantedBy=local-fs.target`, `Wants/After=usdbd.service`, `Restart=always`; on a VM it has no fans to drive and can only fail and be restarted (the binary itself was not run) | unit file in 6.0 `ustd` | Masked in both installers' lists (harmless on 5.x) |
 | 5 | Storage Patch A anchor gone: 6.0's unifi-core never calls `ustorage space inspect`, so the patch script would raise its anchor alert (journal error + Pushover) on every unifi-core start | real 6.0.11 `service.js`: 0 matches | Fixed: recognised as not needed, exits 0 quietly; 5.1 path unchanged |
 | 6 | App debs are per Debian base: `uos-deb11-arm64` and `uos-deb13-arm64` (no deb12) | API queries for unifi-protect, unifi-access, ai-feature-console, ms, msr, ds, protect-verify | Fixed: platform derived from `/etc/os-release` (11 -> deb11, so unchanged today) |
-| 7 | The console UI's Update reaches `ubntnas`: `ubnt-systool fwupdate` runs `ubntnas system upgrade <file> -f --no-reboot` whenever `ubntnas` is on PATH (it is), and `ubntnas` writes a real UNVR's boot layout (flash partitions, the eMMC's kernel and root partitions, the uboot environment). Not new in 6.0, but 6.0.11 being the API's latest makes the console's own update offer likely. Correction (2026-10-25): the `/dev/sda*` paths in its strings belong to another board, not the UNVR, and on the VM it stops at the missing `/proc/ubnthal` before writing anything; the risk was the 6.0 updater it runs first, not the recording disks. See "How a real UNVR upgrades in place" | `ubnt-systool` `do_fwupdate`, identical in 5.1.33 and 6.0.11; found by the operator's review; `ubntnas` device table and control flow from its disassembly | Fixed: `ubntnas` guard (`vm/wrappers/rootfs/usr/bin/ubntnas`), installed by `install-shims.sh` with `dpkg-divert` |
+| 7 | The console UI's Update reaches `ubntnas`: `ubnt-systool fwupdate` runs `ubntnas system upgrade <file> -f --no-reboot` whenever `ubntnas` is on PATH (it is), and `ubntnas` writes a real UNVR's boot layout (flash partitions, the eMMC's kernel and root partitions, the uboot environment). Not new in 6.0, but 6.0.11 being the API's latest makes the console's own update offer likely. Correction (2026-10-25): the `/dev/sda*` paths in its strings belong to another board, not the UNVR, and on the VM it stops at the missing `/proc/ubnthal` before writing anything; the risk was the 6.0 updater it runs first, not the recording disks. See "How a real UNVR upgrades in place" | The branch of `ubnt-systool` `do_fwupdate` that calls `ubntnas`, identical in 5.1.33 and 6.0.11; found by the operator's review; `ubntnas` device table and control flow from its disassembly | Fixed: `ubntnas` guard (`vm/wrappers/rootfs/usr/bin/ubntnas`), installed by `install-shims.sh` with `dpkg-divert` |
 
 Also fixed here, pre-existing but in the same path: the `--sync-os` version
 diff counted the firmware's bundled `unifi-protect` and `ai-feature-*`
@@ -328,7 +328,8 @@ device table inside `ubntnas` agree:
 
 `/dev/boot` is the eMMC. It sits behind USB (u-boot loads the kernel with
 `usb start; ext4load usb 0`, and `ubntnas` carries a SCSI-passthrough eMMC
-driver), so it is not an `mmcblk` device; a udev rule names it `boot*`. No
+driver), so it is not an `mmcblk` device. The kernel names it `boot*`;
+Ubiquiti's udev rule only adds by-path and by-partlabel links for it. No
 UNVR entry in `ubntnas` uses `mmcblk`, `by-partlabel` or `/dev/sd*`: those
 belong to other boards (`/dev/sda1`, `sda2`, `sda5`, `sda7` to sysid `e990`,
 the CloudKey Enterprise). The VM's `ubnt-tools` shim reports `ea16`, the
@@ -348,21 +349,31 @@ in order:
 
 1. Reads `systemid` from `/proc/ubnthal/system.info`. If that fails, it stops.
 2. Validates the file: platform match, `/sbin/fwupdate -c` (signature), and
-   no downgrade unless `-f` (`ubnt-systool` always passes `-f`).
+   no downgrade unless `-f`. `ubnt-systool` passes `-f` unless it is called
+   with `--no-downgrade`, which unifi-core does not pass.
 3. Takes `/run/system.lock` and runs the `upgrade-top` hooks
    (`ubnt-dpkg-status` records the installed apps).
 4. Extracts the new firmware's updater to a tmpfs and runs
-   `updater -t top -p <file>`.
-5. Writes the images for its sysid. On eMMC units it remounts
-   `/boot/firmware` read-write; if the running system booted from `rootfs`
-   it deletes `rootfs.bkp` (the 2 GiB partition cannot hold three images:
-   818 + 768 + 818 MB), if it booted from `rootfs.bkp` it renames that to
-   `rootfs`; then it writes `rootfs.new`. The kernel partition is mounted at
-   `/tmp/.kernel`, `uImage` becomes `uImage.bkp`, and the new `uImage` is
-   written. Preloader, ATF, QCA and dtbo steps exist for other boards.
+   `updater -t top -p <file>`. This is skipped on a forced downgrade or when
+   the updater cannot be extracted.
+5. Writes the images for its sysid, in this order: u-boot (only if it
+   differs), kernel, rootfs. Preloader, ATF, QCA and dtbo steps exist for
+   other boards.
+   - eMMC kernel: the kernel partition is mounted at `/tmp/.kernel`,
+     `uImage` becomes `uImage.bkp`, and the new `uImage` is written.
+   - eMMC rootfs: `/boot/firmware` is remounted read-write. `losetup`
+     reports which image the system booted from. If that is `rootfs`, it
+     deletes `rootfs.bkp`; if it is `rootfs.bkp`, it renames it to `rootfs`.
+     Any other backing file fails ("unrecognized type of device") before
+     anything is written. Then it writes `rootfs.new`.
+   - Why the delete (my arithmetic, not from the code): the 2 GiB partition
+     cannot hold the running image, an older backup of similar size and the
+     new one, which is 768 + about 768 + 818 MB for 5.1.33 -> 6.0.11.
+   - NAND units: the kernel and rootfs flash are erased and rewritten.
 6. Mounts the config flash at `/tmp/.config` and creates `.upgrade-bootup`.
 7. Runs `updater -t bottom` and the `upgrade-bottom` hooks, still in the old
-   system. `ubnt-systool` then reboots.
+   system. Both are deferred, so they also run after a failed write; the
+   hooks get the result in `UPGRADE_SUCCESS`. `ubnt-systool` then reboots.
 8. On the next boot the initramfs loop-mounts `rootfs.new` as a check, then
    renames `rootfs` to `rootfs.bkp` and `rootfs.new` to `rootfs`. Because the
    version changed, it deletes from the overlay upper every copy of `bin`,
@@ -374,9 +385,11 @@ in order:
 
 So an upgrade erases: the older backup image and kernel, the u-boot
 environment (only when u-boot changes, not for 5.1.33 -> 6.0.11), and the
-upper-layer copies listed in step 8. It does not touch the data disks on
-either variant. The one exception is the flash storage migration on NAND
-units (section 3).
+upper-layer copies listed in step 8. On NAND units the updater's
+`AutoUNVR4USBMigrate` can also empty `/var/log` when the overlay only fits
+its new home without the logs. The upgrade itself writes nothing to the
+data disks on either variant. The exception is the flash storage migration
+on NAND units, which the next boot carries out (section 3).
 
 **What the updater runs for 5.1.33 -> 6.0.11.** From its dry run
 (`updater -t top|bottom -d -v UNVR4.al324.v5.1.33.44ce47b.260909.0025`),
@@ -406,26 +419,43 @@ not traced end to end.
 - `ubntnas system upgrade` stops at step 1: the VM has no ubnthal module, so
   `/proc/ubnthal/system.info` does not exist. The disassembly shows that
   error returning before the lock, the hooks, the updater or any write.
-- If it ever got a sysid, the VM's answer would be `ea16` (`ea20` with
+- The 5.1.33 `ubntnas` the VM runs today does the same: it reads
+  `systemid=` first and returns on failure (checked in its disassembly).
+- Suppose it ever got a sysid (`ea16` from the shim, or `ea20` with
   `DEVICE=UNVR_PRO`). Both point at `mtd` and `/dev/boot*` devices the VM
-  does not have, so the image writes would fail. But step 4 would already
-  have run the 6.0 updater on the VM's bullseye root, with its network
-  access: `PreStageTrixieCache` contacting Ubiquiti's package servers from
-  the live console, and `CleanDirectSystemdLinks` editing
-  `/etc/systemd/system`.
+  does not have, so the image writes would fail. The 6.0 updater would
+  still run on the VM's bullseye root, with its network access: the top
+  stage before the writes, and the bottom stage and hooks on exit. The top
+  stage includes `PreStageTrixieCache`, contacting Ubiquiti's package
+  servers from the live console, and `CleanDirectSystemdLinks`, editing
+  `/etc/systemd/system`. The updater does not need `/proc/ubnthal`: it
+  falls back to `ubnt-tools id`, so on the VM it sees `ea16`, and
+  `AutoUNVR4USBMigrate` passes its board check. Read from the code, not
+  run: what then stops that step on the VM is the missing `/mnt/.rwfs` and
+  config flash.
 - No UNVR sysid targets `/dev/sd*`, so breaking item 7 overstated the risk
   to the recording disks (corrected there). The guard stays: it costs
   nothing, gives a clear refusal, and keeps the updater from running at all.
 - `ubntnas system reset` (open question): it stops at the same first step.
-  On a real UNVR it only writes `/config/.reset-to-defaults`. The disk wipe
-  happens at the next boot, in the initramfs (`wipe_disks` zeroes the start
-  of every `/dev/sd[a-p]5` and writes a new GPT on it) and in
-  `uscsi-reset-wipe.service`. On the VM the first never runs, because the
-  VM boots Debian's initramfs. The second is installed and enabled (in 5.1
-  as well), but it finds no `config` partition in `/proc/mtd` and does
-  nothing. So a reset is inert here today for two independent reasons.
+  On a real UNVR it runs the reset-top and reset-bottom hooks and writes
+  `/config/.reset-to-defaults`. With the format option, the next boot wipes
+  the data disks in two places:
+  - The initramfs. On NAND units it zeroes the start of each data
+    partition 5 and writes a new GPT on it. On eMMC units it does that to
+    every whole `/dev/sd[a-p]` disk.
+  - `uscsi-reset-wipe.service`, which wipes the slot disks.
+
+  On the VM the first never runs, because the VM boots Debian's initramfs.
+  The second ships enabled in the firmware's `ustd` package, which the VM
+  installs (`ufcd` and `usd` come from it). Its built-in docstrings say it
+  looks for the config partition in `/proc/mtd`, which the VM lacks, so it
+  should do nothing. That is inferred from a compiled binary, and whether
+  the unit is enabled on the VM was not checked (`systemctl is-enabled
+  uscsi-reset-wipe`). So a reset looks inert here today, for two
+  independent reasons.
+
   Recommended, not done in this doc-only commit: add `uscsi-reset-wipe` to
-  the installers' mask lists. It is the one enabled Ubiquiti unit on the VM
+  the installers' mask lists, since it is the one Ubiquiti unit on the VM
   whose job is to wipe the recording disks. Also add `system reset` to the
   guard, for symmetry.
 
@@ -437,8 +467,8 @@ it by dpkg. "Swap the rootfs" therefore means converting the VM to the
 device's model once; after that, every upgrade is a file swap. That is
 option 3 next to the two in "Route to 6.0". Its draw is that apt and Debian
 dependency resolution leave the OS path entirely, because the firmware's
-squashfs already is a complete Debian 13 root with every Ubiquiti package in
-it.
+squashfs already is a complete Debian 13 root with all of UniFi OS in it.
+Apps such as Access are installed on top, as on the device.
 
 **Layout.**
 
@@ -512,27 +542,32 @@ covers `/data`.
 **An extra virtual disk so Ubiquiti's own upgrader runs?** Possible, not
 worth it. What it would take:
 
-- **A sysid.** `ubntnas` reads only `/proc/ubnthal/system.info`, and a
-  procfs entry needs a kernel module. A stub module is small, but every
-  Ubiquiti component that reads `/proc/ubnthal` would then see it too
-  (unifi-core, `ubnt-systool`'s anonid path; `seed-anonid.sh` relies on
-  its absence).
+- **A sysid of `ea1a` or `ea20`.** The shim's `ea16` points at raw flash,
+  which `ubntnas` would erase and rewrite. `ubntnas` reads only
+  `/proc/ubnthal/system.info`, and a procfs entry needs a kernel module. A
+  stub module is small, but every Ubiquiti component that reads
+  `/proc/ubnthal` would then see it too: unifi-core, and `ubnt-systool`'s
+  anonid path (`seed-anonid.sh` relies on its absence).
 - **`/dev/boot1` and `/dev/boot2`.** udev `SYMLINK` rules to partitions of
   the extra disk would do. `ubntnas` checks only the `/dev/boot` prefix and
   mounts by path, with p2 mounted at `/boot/firmware`.
 - **`/dev/mtdblock0`, `1`, `2`, `6`.** `block2mtd` on further partitions,
   created in order so the numbers land right, with 6.0's u-boot preloaded
   so the compare skips the write.
-- **What it would produce:**
+- **A root image already booted from that disk.** `/dev/loop0` must be
+  backed by a file named `rootfs` or `rootfs.bkp`, or `ubntnas` fails
+  before writing `rootfs.new`. So the fake disk can only work on top of
+  the device model above, never instead of it.
+- **What it would add on top of that model:**
   - a uImage the VM cannot boot;
-  - `rootfs.new`, which is the only useful output;
   - a flag in a fake config flash;
-  - the updater's steps run in the old system. `PreStageTrixieCache` needs
-    Ubiquiti's servers: an isolated clone blocks there, and the live VM
-    would contact them as the live console. `CleanDirectSystemdLinks`
-    edits the VM's units.
-- **It still needs the boot side** above, so it does not replace the device
-  model, only adds fakes with a wide blast radius to it.
+  - the updater's top and bottom stages run in the old system.
+    `PreStageTrixieCache` needs Ubiquiti's servers: an isolated clone
+    blocks there, and the live VM would contact them as the live console.
+    `CleanDirectSystemdLinks` edits the VM's units.
+
+  The one useful output, `rootfs.new`, the model's own swap already
+  produces. So the fakes buy nothing and carry a wide blast radius.
 
 Copy the device's model, not its tool.
 
@@ -547,7 +582,7 @@ publishing deb11 app builds before the trixie guest is ready.
 | md3 RAID metadata and the ext4 on it, on the VM | Ubiquiti's storage daemons (`usd`, `usdbd`, `ustated`) stay masked; md3 is assembled and mounted by the VM's own scripts. Nothing from 6.0 that runs on the VM writes md metadata or ext4 features (unit lists, mask loop, `/srv` and `/volume1` paths in units, tmpfiles and hooks: the same set in both images) | Not touched |
 | md3 under a Debian 13 kernel (options 2 and 3: kernel 6.12, mdadm 4.4, e2fsprogs 1.47) | Assembling and mounting do not change the 1.2 superblock format or ext4 feature flags; only `mkfs`, `tune2fs -O` or `mdadm --grow` would. Reasoning from tool behaviour, not tested: record `dumpe2fs -h /dev/md3` features and `mdadm --detail` before and after on the clone | Not touched, if nobody runs those |
 | 6.0 `ustd` on a real UNVR | New modules: `fsck_controller` (fsck started on request, with a remount), `raid_history` (a JSON history of RAID events; where it is stored was not found), `deferred_mount` (flags under `/run`), `zfs_label` (read-only WORM probe). From module names and docstrings only: they are compiled Cython. All masked on the VM | n/a on the VM |
-| Flash storage migration (`unvrFlashStorageMigrationState`) | Same code in 5.1.33 and 6.0.11. unifi-core offers it only when the board is a UNVR with sysid `ea16`. On those units the updater's `AutoUNVR4USBMigrate` sets `/config/.need-migrate-userdev`. The next boot then creates `md1` (RAID1, metadata 1.2, homehost = serial) over every data disk's partition 3, may grow p3 from 1 GiB to 3 GiB in the partition table when the gap before the next partition allows, copies the overlay off the USB stick, and zeroes its first 32 MB. It writes the data disks' partition tables and p3, not p5/md3. Ubiquiti describes this for UNVRs with datecode 2048 or earlier as moving data from failing flash to a mirror on the HDDs ([help article](https://help.ui.com/hc/en-us/articles/11621161633943); official source, but read here only through a search-engine summary because this session could not reach help.ui.com, so medium confidence; it names no sysid). On the VM: the `ustorage` shim answers `rwfs check` with `canMigrate: false`, so unifi-core records `AUTO_MIGRATION_PENDING` (meaning "not migrated, cannot migrate"; that is the value in `firmware.yaml`) and never calls `rwfs migrate` (a no-op in the shim anyway); the updater step needs sysid `ea16` plus a config flash; Ubiquiti's initramfs never runs | Inert on the VM |
+| Flash storage migration (`unvrFlashStorageMigrationState`) | Same code in 5.1.33 and 6.0.11. unifi-core offers it only when the board is a UNVR with sysid `ea16`. On those units the updater's `AutoUNVR4USBMigrate` sets `/config/.need-migrate-userdev`. The next boot then creates `md1` (RAID1, metadata 1.2, homehost = serial) over every data disk's partition 3, may grow p3 from 1 GiB to 3 GiB in the partition table when the gap before the next partition allows, copies the overlay off the USB stick, and zeroes its first 32 MB. Also read from `ui-boot-nand`, all on p3 and partition tables, never p5/md3: before creating `md1` it zeroes the md superblock on every data disk's p3; it creates `md1` whenever the USB stick is missing, flag or not, and can then write a new partition table onto a blank disk; and it retries the p3 grow on every boot, unconditionally when nothing follows p3. Ubiquiti describes this for UNVRs with datecode 2048 or earlier as moving data from failing flash to a mirror on the HDDs ([help article](https://help.ui.com/hc/en-us/articles/11621161633943); official source, but read here only through a search-engine summary because this session could not reach help.ui.com, so medium confidence; it names no sysid). On the VM: the `ustorage` shim answers `rwfs check` with `canMigrate: false`, so unifi-core records `AUTO_MIGRATION_PENDING` (meaning "not migrated, cannot migrate"; that is the value in `firmware.yaml`) and never calls `rwfs migrate` (a no-op in the shim anyway). The updater step would see `ea16` on the VM (section 1) but only runs if `ubntnas` gets past its own sysid read, and then needs `/mnt/.rwfs` and a config flash. Ubiquiti's initramfs never runs | Inert on the VM |
 | Protect | Protect 7.3.70 has the same version for deb11 and deb13, so 6.0 brings no Protect migration. Its database is on `/data` (vda); recordings are on md3 | DB yes, recordings no. Restoring `/data` after the system has recorded for a while leaves recordings written since the snapshot as files with no rows, and recordings removed by retention since then as rows with no files. That skew, not a format change, is what does not roll back, for any upgrade. Keep the window short; how Protect treats the orphans is for the clone to show |
 | unifi-core | One new migration in 6.0.11: `20251104145507_add_smtp_tls_settings` (two boolean columns on `smtp_settings`, with a down step). Database `unifi-core` on port 5432, the 14-main cluster under `/data` | Yes |
 | Postgres | Still 14 (same on-disk format); collation as in "Route to 6.0" | Yes (on `/data`) |
@@ -574,8 +609,9 @@ ls /persistent/dpkg/                                             # app caches th
 sfdisk -d /dev/sda                                               # data-disk layout (the initramfs's own layout starts p5 at 16777216)
 ```
 
-And on the VM, if its data disks came from the UNVR: run
-`mdadm --examine /dev/sd[a-d]3` (read-only). If those partitions carry an
+On the VM: `systemctl is-enabled uscsi-reset-wipe.service` and
+`ls /proc/mtd` (expected: enabled, and no such file). If its data disks came
+from the UNVR, also run `mdadm --examine /dev/sd[a-d]3` (read-only). If those partitions carry an
 `md1` superblock, they hold the UNVR's old overlay, with its identity.
 Never assemble them on a clone.
 
@@ -595,7 +631,7 @@ Never assemble them on a clone.
   reset --no-reboot [--do-format] ...` the same way. It is inert on the VM
   today ("How a real UNVR upgrades in place", section 1): `ubntnas` stops
   without `/proc/ubnthal`, and the wipe itself only happens at the next boot,
-  in code the VM does not run. Recommended for symmetry, together with
+  in code that the VM either never runs or that finds nothing to act on. Recommended for symmetry, together with
   masking `uscsi-reset-wipe`; left passing through until decided.
 - Pre-existing, not 6.0: the installer downloads the firmware without a
   SHA256 check; a Debian `mdadm` update replaces the `/sbin/mdadm` wrapper;
