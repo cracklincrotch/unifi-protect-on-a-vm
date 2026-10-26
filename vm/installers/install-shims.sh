@@ -177,9 +177,10 @@ fi
 
 # --- /usr/bin/ubntnas (refuse the console's firmware update) ---
 # ubnt-systool fwupdate (the console UI's Update) runs `ubntnas system
-# upgrade`, which writes a real UNVR's boot layout (/dev/sda1/2/5/7,
-# mtdblocks, the uboot environment); here /dev/sd* are the recording disks.
-# The guard refuses that call and passes everything else to the real binary.
+# upgrade`, which is built to rewrite a real UNVR's boot flash and first runs
+# the new firmware's own updater. On the VM it stops early (no
+# /proc/ubnthal), but nothing should rely on that. The guard refuses that
+# call and passes everything else to the real binary.
 # dpkg-divert moves the packaged binary to ubntnas.real for good, so a
 # --sync-os reinstall of the ubntnas package lands there and never replaces
 # the guard, not even between apt and this script. Only where ubntnas is

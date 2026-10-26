@@ -40,9 +40,9 @@ for arg in "$@"; do
 done
 
 if [ "${words[0]:-}" = system ] && [ "${words[1]:-}" = upgrade ]; then
-    msg="Firmware update from the console is disabled on this VM: ubntnas would"
-    msg="$msg write a UNVR boot layout onto /dev/sd*, which here are the recording"
-    msg="$msg disks. Update with update-unifi.sh --sync-os instead."
+    msg="Firmware update from the console is disabled on this VM: ubntnas is"
+    msg="$msg built to rewrite a real UNVR's boot flash, which a VM does not have."
+    msg="$msg Update with update-unifi.sh --sync-os instead."
     echo "$msg"
     logger -t ubntnas-vm-guard -p daemon.warning "refused: ubntnas $*" 2>/dev/null || true
     exit 1
