@@ -333,8 +333,8 @@ Ubiquiti's udev rule only adds by-path and by-partlabel links for it. No
 UNVR entry in `ubntnas` uses `mmcblk`, `by-partlabel` or `/dev/sd*`: those
 belong to other boards (`/dev/sda1`, `sda2`, `sda5`, `sda7` to sysid `e990`,
 the CloudKey Enterprise). The VM's `ubnt-tools` shim reports `ea16`, the
-UNVR. If that was copied from the operator's unit, the unit is a NAND one;
-only the unit can confirm it (checks below).
+UNVR, and the operator confirms the real unit is the NAND model (see "Facts
+about the real UNVR" below).
 
 **Slots.** There are no A/B partitions. The backup is one release deep, by
 file name: u-boot's `multiboot` tries `uImage` with `root=rootfs`, then
@@ -449,10 +449,10 @@ not traced end to end.
   The second ships enabled in the firmware's `ustd` package, which the VM
   installs (`ufcd` and `usd` come from it). Its built-in docstrings say it
   looks for the config partition in `/proc/mtd`, which the VM lacks, so it
-  should do nothing. That is inferred from a compiled binary, and whether
-  the unit is enabled on the VM was not checked (`systemctl is-enabled
-  uscsi-reset-wipe`). So a reset looks inert here today, for two
-  independent reasons.
+  should do nothing. The operator confirmed on the live VM that the unit is
+  enabled and that there is no config partition in `/proc/mtd`; that it
+  then does nothing is still inferred from the compiled binary. So a reset
+  looks inert here today, for two independent reasons.
 
   Recommended, not done in this doc-only commit: add `uscsi-reset-wipe` to
   the installers' mask lists, since it is the one Ubiquiti unit on the VM
@@ -610,10 +610,44 @@ sfdisk -d /dev/sda                                               # data-disk lay
 ```
 
 On the VM: `systemctl is-enabled uscsi-reset-wipe.service` and
-`ls /proc/mtd` (expected: enabled, and no such file). If its data disks came
-from the UNVR, also run `mdadm --examine /dev/sd[a-d]3` (read-only). If those partitions carry an
-`md1` superblock, they hold the UNVR's old overlay, with its identity.
-Never assemble them on a clone.
+`ls /proc/mtd` (done by the operator: enabled, and no config partition). The
+VM's data disks came from the UNVR, so also run `mdadm --examine
+/dev/sd[a-d]3` (read-only). If those partitions carry an `md1` superblock,
+they hold the UNVR's old overlay, with its identity. Never assemble them on
+a clone.
+
+### Facts about the real UNVR (from the operator, 2026-10-26)
+
+- It is the NAND model (`ea16`). So its kernel and root image live raw in
+  flash with no backup copy (section 1), and its overlay is on the internal
+  USB stick or on `md1` across the data disks' p3.
+- Whether it ever did the flash storage migration is unknown. The
+  `mdadm --examine` check above answers it from the disks alone, without
+  powering up the unit.
+- It left service in March/April 2026. If the disks ever go back, it will
+  first be updated to the latest firmware with no disks installed, and the
+  disks added afterwards. What the 6.0 code says about that plan:
+  - With no disks, the migration step has nothing to migrate to, and the
+    overlay comes from the USB stick. If the stick was emptied by an
+    earlier migration, the boot formats it, so the unit starts like a
+    factory-default one. That matches Ubiquiti's help article (search
+    summary, medium confidence).
+  - The 6.0 updater downloads Debian 13 app builds before writing, so that
+    update needs internet access (section 1).
+  - Keep power stable during it: NAND units rewrite the kernel and root
+    flash in place, with no backup image.
+  - When the disks go back in, `ui-boot-nand` tries to assemble `md1`
+    first, on every boot. If the disks' p3 carry an `md1` with this
+    unit's serial, the unit switches its overlay to that copy: the state
+    from before it left service, not the one just set up. The version
+    change then clears its old vendor files, as after any upgrade. Read
+    from the script, not run. Decide before reinserting whether that old
+    state is wanted. If not, the scripts show a reset without the format
+    option reformatting only the overlay (here `md1`) and leaving the data
+    partitions alone; with the format option it also wipes the recordings.
+  - The VM writes to p3 only when it provisions a blank disk or on a
+    deliberate `ustorage space nuke`. So on the imported disks, whatever
+    is on p3 is the UNVR's own.
 
 ## Open questions
 
