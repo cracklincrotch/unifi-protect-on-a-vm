@@ -44,9 +44,18 @@ case "$GAP" in
     ''|*[!0-9]*) WHY="$GAP" ;;                              # a reason in words
     *)           WHY="VM was paused ${GAP}s, clock stepped" ;;
 esac
-# The array behind /volume1: md3, unless an imported array is mounted there.
+# The device behind /volume1 by its kernel name, as /proc/diskstats lists it
+# (/dev/md/NAME and /dev/mapper/NAME are symlinks): md3, unless an imported
+# array is mounted there.
 MD=$(awk '$2 == "/volume1" { print $1; exit }' /proc/self/mounts)
+[ -n "$MD" ] && MD=$(readlink -f "$MD")
 MD=${MD##*/}; MD=${MD:-md3}
+
+# One recovery at a time. provision-storage.sh nuke (an Erase) refuses to
+# start while this is held, and holds it itself, so a recovery waits for an
+# Erase to finish instead of racing it.
+{ exec 9>/run/vm-resume-recover.lock && flock 9; } \
+    || say "warning: cannot take /run/vm-resume-recover.lock; running without it"
 say "=== recovery starting: $WHY ==="
 
 # 1. The accessory API must be served or Protect 7.2 blocks on the peripheral

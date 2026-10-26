@@ -12,9 +12,9 @@
 # runs vm-resume-recover.sh: the media services started without the array
 # (msr records nothing until restarted), and that script restarts them in the
 # only order that works and checks that recording really resumed. It never
-# assembles, starts, creates or wipes an array, and takes
-# provision-storage.sh's lock (not while recovering) so it cannot overlap an
-# Erase.
+# assembles, starts, creates or wipes an array. It cannot overlap an Erase:
+# it holds provision-storage.sh's lock while it scans and mounts, and an
+# Erase refuses to start while vm-resume-recover.sh runs.
 #
 # Why a separate unit, not a retry loop inside boot mode: boot mode holds
 # local-fs.target, and with it sysinit.target, networking and ssh. Waiting

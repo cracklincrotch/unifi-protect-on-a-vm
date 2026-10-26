@@ -102,6 +102,8 @@ RETRY_SECS=600
 RETRY_EVERY=5
 MEDIA_SVCS="ms.service msp.service msr.service mst.service"
 RECOVER=/usr/local/sbin/vm-resume-recover.sh
+# vm-resume-recover.sh holds this while it runs; an Erase refuses then.
+RECOVER_LOCK=/run/vm-resume-recover.lock
 # Boot mode waits at most this long for the lock: it holds usd's slot.
 BOOT_LOCK_WAIT=30
 
@@ -364,9 +366,11 @@ md_members() {
 # True if assembled array "$1" is this VM's own, the only kind boot mode
 # starts: every member is a partition of a data disk (data_disks: never the
 # OS disk or /ssd1), and its name ends in :0 (swap) or :3 (data), as
-# provision() and a UNVR's usd name them. Anything else is left alone.
+# provision() and a UNVR's usd name them. The name comes from the first
+# member that answers, so one flaky member does not make it foreign.
+# Anything else is left alone.
 own_array() {
-    local members m p disks
+    local members m p disks name=""
     members=$(md_members "$1")
     [ -n "${members// /}" ] || return 1
     disks=" $(data_disks | tr '\n' ' ') "
@@ -375,7 +379,11 @@ own_array() {
         [ "$p" != "$m" ] || return 1                      # a whole disk
         case "$disks" in *" $p "*) ;; *) return 1 ;; esac
     done
-    case "$(member_md_name "/dev/${members%% *}")" in
+    for m in $members; do
+        name=$(member_md_name "/dev/$m")
+        [ -n "$name" ] && break
+    done
+    case "$name" in
         *:0|*:3) return 0 ;;
     esac
     return 1
@@ -669,6 +677,14 @@ do_nuke() {
     have fuser  || die "fuser not found (psmisc)"
     have wipefs || die "wipefs not found (util-linux)"
 
+    # vm-resume-recover.sh restarts the media stack for several minutes, after
+    # a VM pause or after retry mounted the array late (with the lock above
+    # dropped on purpose). An Erase in the middle races its restarts: a lazy
+    # umount, a failed mdadm --stop, a reprovision that dies. Refuse while one
+    # runs, and hold its lock (fd 8) so none starts until this Erase ends.
+    { exec 8>"$RECOVER_LOCK" && flock -n 8; } \
+        || die "vm-resume-recover.sh is running; try the Erase again once it has finished"
+
     if [ -t 0 ]; then
         printf '%s\n' "space nuke ERASES $STORAGE_VOLUME and every recording on it."
         printf 'Type ERASE to confirm: '
@@ -795,16 +811,20 @@ do_boot() {
         die "failed to mount existing array $DATA_MD"
     fi
 
-    # 1b. Still no data array, but there was one that could not start (too
-    #     few members): it may start later, when a member comes back (mdadm's
-    #     own incremental assembly or mdadm-last-resort@ then starts it) or by
-    #     hand. Hand it to the retry unit, which mounts it then; waiting here
-    #     would hold networking and ssh. --no-block: that unit orders after
-    #     sysinit.target, which waits for this one. Never provision past such
-    #     an array: blank disks here may be its replacement members.
-    if [ -n "$ours" ]; then
-        warn "no data array is running; not touching any disk (assembled, not running:$ours)"
-        if systemctl --no-block start "$RETRY_UNIT" 2>/dev/null; then
+    # 1b. Still no data array, but an array is assembled and not running.
+    #     Never provision past one, ours or not: blank disks here may be its
+    #     replacement members, and "not ours" may be ours misread. If it is
+    #     ours and could not start (too few members), it may start later,
+    #     when a member comes back (mdadm's own incremental assembly or
+    #     mdadm-last-resort@ then starts it) or by hand: hand it to the retry
+    #     unit, which mounts it then; waiting here would hold networking and
+    #     ssh. --no-block: that unit orders after sysinit.target, which waits
+    #     for this one.
+    if [ -n "${pending// /}" ]; then
+        warn "no data array is running; not touching any disk (assembled, not running: ${pending% })"
+        if [ -z "$ours" ]; then
+            warn "  none of them is this VM's own; nothing will mount them"
+        elif systemctl --no-block start "$RETRY_UNIT" 2>/dev/null; then
             warn "  $RETRY_UNIT mounts the data array once it runs (waits up to ${RETRY_SECS}s)"
         else
             warn "  could not start $RETRY_UNIT; once the array runs: $0 retry"

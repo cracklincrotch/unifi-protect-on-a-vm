@@ -33,6 +33,7 @@ set +u
 FSTAB="$T/fstab"
 MDSTAT="$T/mdstat"      # absent until a test writes it: never the real one
 LOCK="$T/lock"
+RECOVER_LOCK="$T/recover.lock"
 STORAGE_VOLUME="$T/volume1"
 # Keep the real ones that the stubs below replace, to test them directly.
 eval "real_$(declare -f scan_arrays)"
@@ -57,7 +58,14 @@ mdadm() {
 mkswap()    { rec mkswap "$@"; }
 mkfs.ext4() { rec mkfs.ext4 "$@"; }
 sgdisk()    { rec sgdisk "$@"; }
-wipefs()    { rec wipefs "$@"; }
+# wipefs also notes whether vm-resume-recover.sh's lock is held meanwhile.
+wipefs() {
+    rec wipefs "$@"
+    if command -v flock >/dev/null 2>&1 && ! flock -n "$RECOVER_LOCK" true 2>/dev/null; then
+        rec "wipefs: recover lock held"
+    fi
+    return 0
+}
 swapoff()   { rec swapoff "$@"; }
 partprobe() { :; }
 udevadm()   { :; }
@@ -317,6 +325,8 @@ check "own_array: a member on a disk that is not a data disk (vdb, /ssd1) does n
 printf 'md3 : inactive sdy[1](S) sdx[0](S)\n' > "$MDSTAT"; NAMES="/dev/sdy=testhost:3"
 check "own_array: whole-disk members do not" '! own_array /dev/md3' ""
 check "own_array: an array mdstat does not list does not" '! own_array /dev/md9' ""
+cp "$T/mdstat.inactive" "$MDSTAT"; NAMES="/dev/sdx5=testhost:3"   # sdy5, listed first, does not answer
+check "own_array: the name comes from the first member that answers" 'own_array /dev/md3' ""
 NAMES=$OWN_NAMES; rm -f "$MDSTAT"
 
 # The real scan_arrays: which ext4 array becomes /volume1.
@@ -393,6 +403,15 @@ printf 'md127 : inactive sdy1[1](S) sdx1[0](S)\n      2095104 blocks super 1.2\n
 NAMES="/dev/sdy1=otherbox:127"; RUN_OK="/dev/md127"
 reset; out=$( (do_boot) 2>&1 ); rc=$?
 check "boot: a foreign inactive array is not started, loudly, and no retry unit" '[ $rc = 0 ] && ! calls | grep -q "mdadm --run" && ! calls | grep -q provision-storage-retry && grep -q "not this VM.s own array" <<<"$out"' "$out
+$(calls)"
+AUTOMODE=true; is_blank() { return 0; }
+reset; out=$( (do_boot) 2>&1 ); rc=$?
+check "boot: nothing is provisioned past a foreign inactive array, AUTOMODE and blank disks notwithstanding" '[ $rc = 0 ] && [ -z "$(writes)" ] && ! calls | grep -q "mdadm --run" && ! calls | grep -q provision-storage-retry && grep -q "none of them is this VM.s own" <<<"$out"' "$out
+$(calls)"
+AUTOMODE=false; is_blank() { return 1; }
+cp "$T/mdstat.inactive" "$MDSTAT"; NAMES="/dev/sdx5=testhost:3 /dev/sdy2=testhost:0"; RUN_OK="/dev/md0 /dev/md3"
+reset; out=$( (do_boot) 2>&1 ); rc=$?
+check "boot: md3 is still ours, started and mounted, when its first listed member does not answer --examine" '[ $rc = 0 ] && calls | grep -qx "mdadm --run /dev/md3" && calls | grep -q "^mount_arrays /dev/md3"' "$out
 $(calls)"
 NAMES=$OWN_NAMES; RUN_OK=""
 
@@ -517,6 +536,21 @@ scan_arrays() { rec scan; DATA_MD=""; SWAP_MD=""; }
 reset; out=$( (do_nuke) </dev/null 2>&1 ); rc=$?
 check "Erase with /volume1 not mounted: no service stopped, the Erase completes" '[ $rc = 0 ] && ! calls | grep -q "^fuser" && ! calls | grep -q "systemctl stop" && calls | grep -q "^mkswap"' "$out
 $(calls)"
+
+# An Erase and vm-resume-recover.sh never overlap.
+if command -v flock >/dev/null 2>&1; then
+    flock "$RECOVER_LOCK" bash -c 'touch "$1.held"; exec sleep 2' _ "$RECOVER_LOCK" & H=$!
+    while [ ! -e "$RECOVER_LOCK.held" ]; do command sleep 0.1; done; rm -f "$RECOVER_LOCK.held"
+    reset; out=$( (main nuke) </dev/null 2>&1 ); rc=$?
+    wait "$H"
+    check "an Erase refuses while vm-resume-recover.sh runs, and touches nothing" '[ $rc != 0 ] && grep -q "vm-resume-recover.sh is running" <<<"$out" && ! calls | grep -q "^wipefs" && ! calls | grep -q "^mkswap"' "$out
+$(calls)"
+    reset; out=$( (main nuke) </dev/null 2>&1 ); rc=$?
+    check "... and holds vm-resume-recover.sh's lock while it runs, so none starts meanwhile" '[ $rc = 0 ] && calls | grep -qx "wipefs: recover lock held"' "$out
+$(calls)"
+else
+    echo "SKIP  Erase / recovery lock checks (no flock)"
+fi
 
 check "no real tool was reached" '[ ! -s "$T/guard.log" ]' "$(cat "$T/guard.log" 2>/dev/null)"
 echo; echo "$pass passed, $fail failed"
