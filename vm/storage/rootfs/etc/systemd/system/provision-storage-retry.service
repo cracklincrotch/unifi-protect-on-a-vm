@@ -1,0 +1,48 @@
+###############################################################################
+# provision-storage-retry.service - mount the array when it starts late.
+#
+# provision-storage.service (boot mode) starts this, without waiting for it,
+# when an md array is assembled but cannot be started: too few of its members
+# are present. (Boot mode starts one that is merely degraded itself.) If it
+# starts later - a member comes back and mdadm's incremental assembly or
+# mdadm-last-resort@ starts it, or an operator runs `mdadm --run` - Protect's
+# media services are up by then. `provision-storage.sh retry` looks for a
+# running data array every 5 s for up to 10 minutes (usd's own start limit),
+# mounts it at /volume1 (logging loudly that it is late, and degraded), then
+# runs vm-resume-recover.sh: the media services started without the array
+# (msr records nothing until restarted), and that script restarts them in the
+# only order that works and checks that recording really resumed. It never
+# assembles, starts, creates or wipes an array. It cannot overlap an Erase:
+# it holds provision-storage.sh's lock while it scans and mounts, and an
+# Erase refuses to start while vm-resume-recover.sh runs.
+#
+# Why a separate unit, not a retry loop inside boot mode: boot mode holds
+# local-fs.target, and with it sysinit.target, networking and ssh. Waiting
+# there for a member that may never come back would hold all of that,
+# exactly when the operator wants to log in. A real UNVR's usd is a daemon
+# and keeps retrying after boot; this unit is that part of it.
+#
+# Why not a timer or path unit that re-runs boot mode: boot mode provisions
+# blank disks when AUTOMODE=true, which must never happen while an array is
+# still coming up (a blank disk may be its replacement member); a timer has
+# no natural end; and a path unit cannot watch md state (sysfs has no
+# inotify). This unit runs only when boot mode asks for it and stops by
+# itself.
+#
+# Started on demand only - NOT enabled, no [Install] section, like
+# storage-nuke.service. Type=exec, so the wait never holds a boot job open.
+# By hand, once the array runs:  /usr/local/sbin/provision-storage.sh retry
+#
+# INSTALL (inside the VM, as root)
+#   install -m 0644 provision-storage-retry.service /etc/systemd/system/
+#   systemctl daemon-reload
+###############################################################################
+[Unit]
+Description=Mount the storage array once it starts after boot (usd-role retry)
+After=provision-storage.service
+# Boot mode, or someone else, got there first.
+ConditionPathIsMountPoint=!/volume1
+
+[Service]
+Type=exec
+ExecStart=/usr/local/sbin/provision-storage.sh retry

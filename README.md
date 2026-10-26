@@ -60,6 +60,7 @@ host/                       Runs on the macOS host
   das-marker-format.sh      Format the DAS marker partitions, mark them noauto
   protect-on-mac.conf.example   Config template (copy to protect-on-mac.conf)
   com.protect-on-mac.vm.plist   launchd plist template
+  tests/                    Tests for snapshot.sh and control-host-helper.sh
 
 vm/                         Copied into the VM and run there
   installers/               Run once, from /root, to set the VM up
@@ -75,6 +76,8 @@ vm/                         Copied into the VM and run there
     usr/local/bin/ustated-shim.js
     usr/local/bin/unifi-core-storage-patch.sh
     etc/systemd/system/*.service
+  storage/tests/            Stubbed tests for provision-storage.sh (any Linux,
+                            no root, no disks)
   wrappers/                 Control-channel guest pieces + binary interceptors
     rootfs/usr/local/bin/protect-on-mac-ctl   control channel guest client
     rootfs/usr/local/sbin/protect-installed-snapshot   one-shot checkpoint
@@ -1073,6 +1076,7 @@ See "Repository layout" near the top for the directory tree. The detail:
 - **`etc/systemd/system/provision-storage.service`** - runs the provisioner in `usd`'s slot (after `local-fs-pre.target`, before `local-fs.target`), so `/volume1` and `/srv` are ready before `sysinit.target` and every media service, as on a real UNVR.
 - **`etc/systemd/system/ustated-shim.service`** — runs `ustated-shim.js` at boot.
 - **`etc/systemd/system/unifi-core-storage-patch.service`** — runs the patch guard before `unifi-core` starts.
+- **`etc/systemd/system/provision-storage-retry.service`** - started by `provision-storage.service` when an array is assembled but cannot start yet (too few members; boot mode itself starts one that is merely degraded). Mounts it if it starts later, logs loudly, and runs `vm-resume-recover.sh` to restart the media stack, which started without it, and confirm recording resumed (not enabled at boot).
 - **`etc/systemd/system/storage-nuke.service`** — on-demand teardown worker, triggered by `ustorage space nuke` (not enabled at boot).
 
 ### `vm/wrappers/` — control-channel client and binary interceptors

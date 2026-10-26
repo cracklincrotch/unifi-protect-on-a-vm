@@ -53,6 +53,7 @@
 #
 #   install -m 0755 provision-storage.sh /usr/local/sbin/provision-storage.sh
 #   install -m 0644 provision-storage.service /etc/systemd/system/
+#   install -m 0644 provision-storage-retry.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl reenable provision-storage.service
 #
 # provision-storage.service runs `boot` in usd's slot (after
@@ -66,7 +67,17 @@
 #   provision-storage.sh boot      # same
 #   provision-storage.sh provision # force-provision blank disks (no assemble)
 #   provision-storage.sh nuke      # erase /volume1 + reprovision (see below)
+#   provision-storage.sh retry     # mount an array that starts late (below)
 #   provision-storage.sh status    # show what it sees, change nothing
+#
+# Boot mode starts an array that is assembled but not running because a
+# member is missing (degraded), then mounts it. One that cannot start yet
+# (too few members) goes to provision-storage-retry.service: `retry` waits
+# (bounded) for it to start later, mounts it, and restarts the media
+# services that started without it with vm-resume-recover.sh. It never
+# assembles, starts, creates or wipes anything. See that unit for why it is a
+# separate unit and not a loop here. Boot mode only ever starts this VM's own
+# arrays (own_array), and prefers /dev/md3 as the data array (scan_arrays).
 #
 # `nuke` is the worker behind `ustorage space nuke` (the Storage UI "Erase"
 # button): it stops the services using /volume1, tears down and wipes the
@@ -77,11 +88,53 @@
 set -u
 
 STORAGE_VOLUME=/volume1
-CONFIG=/etc/default/unifi-storage
+# The tests (vm/storage/tests/) point this at a scratch file.
+CONFIG=${PROVISION_STORAGE_CONFIG:-/etc/default/unifi-storage}
+FSTAB=/etc/fstab
+MDSTAT=/proc/mdstat
+LOCK=/run/provision-storage.lock
+
+# retry: how long to wait for a late array (usd's own 600 s start limit), how
+# often to look, the media services that may have started without it, and
+# the script that restarts them in the order that works.
+RETRY_UNIT=provision-storage-retry.service
+RETRY_SECS=600
+RETRY_EVERY=5
+MEDIA_SVCS="ms.service msp.service msr.service mst.service"
+RECOVER=/usr/local/sbin/vm-resume-recover.sh
+# vm-resume-recover.sh holds this while it runs; an Erase refuses then.
+RECOVER_LOCK=/run/vm-resume-recover.lock
+# Boot mode waits at most this long for the lock: it holds usd's slot.
+BOOT_LOCK_WAIT=30
 
 log()  { echo "[provision-storage] $*"; }
+# warn: for what needs the operator. Under systemd the <3> prefix files the
+# line at priority "err" (sd-daemon(3)), so it stands out in journalctl.
+# Only when stdout really is the journal stream JOURNAL_STREAM names
+# ("dev:ino"): a child that inherited the variable may be writing elsewhere.
+TO_JOURNAL=""
+[ -n "${JOURNAL_STREAM:-}" ] \
+    && [ "$(stat -L -c %d:%i "/proc/$$/fd/1" 2>/dev/null)" = "$JOURNAL_STREAM" ] \
+    && TO_JOURNAL=1
+warn() {
+    if [ -n "$TO_JOURNAL" ]; then
+        echo "<3>[provision-storage] $*"
+    else
+        echo "[provision-storage] WARNING: $*"
+    fi
+}
 die()  { echo "[provision-storage] FATAL: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# One run at a time: boot, provision, nuke and each retry attempt hold this
+# lock, so a late retry can never scan or mount while a nuke is tearing the
+# arrays down, and the reverse. Released on exit. take_lock [seconds]: give
+# up after that long (default: wait as long as it takes).
+take_lock() {
+    exec 9>"$LOCK" || return 1
+    if [ -n "${1:-}" ]; then flock -w "$1" 9; else flock 9; fi
+}
+drop_lock() { exec 9>&-; }
 
 [ "$(id -u)" -eq 0 ] || die "must run as root"
 
@@ -211,11 +264,11 @@ is_system_disk() {
         [ -b "$d" ] || continue
         awk -v d="$d" '$1 == d { f = 1 } END { exit !f }' /proc/self/mounts && return 0
         awk -v d="$d" 'NR > 1 && $1 == d { f = 1 } END { exit !f }' /proc/swaps && return 0
-        grep -Eq "^[[:space:]]*$d[[:space:]]" /etc/fstab 2>/dev/null && return 0
+        grep -Eq "^[[:space:]]*$d[[:space:]]" "$FSTAB" 2>/dev/null && return 0
         for t in UUID PARTUUID LABEL; do
             v=$(blkid -o value -s "$t" "$d" 2>/dev/null)
             [ -n "$v" ] || continue
-            grep -Fq "$t=$v" /etc/fstab 2>/dev/null && return 0
+            grep -Fq "$t=$v" "$FSTAB" 2>/dev/null && return 0
         done
     done
     return 1
@@ -257,18 +310,95 @@ is_blank() {
 # Assemble + mount an already-provisioned array
 ###############################################################################
 
-# Find assembled md arrays: sets DATA_MD (ext4) and SWAP_MD (swap).
+# The md block devices: /dev/md0, /dev/md3, /dev/md126 ...
+md_devices() {
+    local md
+    for md in /dev/md*; do [ -b "$md" ] && echo "$md"; done
+}
+
+# The name ("host:3") of running array "$1", or of the array member "$1"
+# belongs to.
+md_name()        { mdadm --detail --export "$1" 2>/dev/null | sed -n 's/^MD_NAME=//p'; }
+member_md_name() { mdadm --examine --export "$1" 2>/dev/null | sed -n 's/^MD_NAME=//p'; }
+
+# Find assembled md arrays: sets DATA_MD (ext4) and SWAP_MD (swap). The data
+# array is /dev/md3 when that holds ext4, else one named "*:3" (the data
+# array as provision() and a UNVR's usd name it), else the first ext4 array.
+# /dev/md126 and /dev/md127 sort before /dev/md3, and a foreign array there
+# must not be mounted at /volume1 in place of this VM's own.
 scan_arrays() {
     DATA_MD=""; SWAP_MD=""
-    local md t
-    for md in /dev/md*; do
-        [ -b "$md" ] || continue
+    local md t first="" named=""
+    for md in $(md_devices); do
         t=$(blkid -o value -s TYPE "$md" 2>/dev/null)
         case "$t" in
-            ext4)            [ -z "$DATA_MD" ] && DATA_MD=$md ;;
+            ext4)
+                [ -z "$first" ] && first=$md
+                if [ "$md" = /dev/md3 ]; then
+                    DATA_MD=$md
+                elif [ -z "$named" ]; then
+                    case "$(md_name "$md")" in *:3) named=$md ;; esac
+                fi ;;
             swap|linux-swap) [ -z "$SWAP_MD" ] && SWAP_MD=$md ;;
         esac
     done
+    [ -n "$DATA_MD" ] || DATA_MD=${named:-$first}
+}
+
+# md arrays that are assembled but not running ("inactive" in /proc/mdstat):
+# on this VM, an array missing a member that was there when it last ran.
+# External-metadata containers (IMSM/DDF; "super external:" on the next line)
+# always show as inactive and are left out.
+inactive_arrays() {
+    awk 'md != "" { if ($0 !~ /super external:/) print "/dev/" md; md = "" }
+         $2 == ":" && $3 == "inactive" { md = $1 }
+         END { if (md != "") print "/dev/" md }' "$MDSTAT" 2>/dev/null
+}
+
+# The members of array "$1" as /proc/mdstat lists them: "sdc5 sdb5 ".
+md_members() {
+    awk -v md="${1##*/}" '$1 == md && $2 == ":" {
+             for (i = 3; i <= NF; i++)
+                 if ($i ~ /\[[0-9]+\]/) { sub(/\[.*/, "", $i); printf "%s ", $i } }' \
+        "$MDSTAT" 2>/dev/null
+}
+
+# True if assembled array "$1" is this VM's own, the only kind boot mode
+# starts: every member is a partition of a data disk (data_disks: never the
+# OS disk or /ssd1), and its name ends in :0 (swap) or :3 (data), as
+# provision() and a UNVR's usd name them. The name comes from the first
+# member that answers, so one flaky member does not make it foreign.
+# Anything else is left alone.
+own_array() {
+    local members m p disks name=""
+    members=$(md_members "$1")
+    [ -n "${members// /}" ] || return 1
+    disks=" $(data_disks | tr '\n' ' ') "
+    for m in $members; do
+        p=$(parent_disk "$m")
+        [ "$p" != "$m" ] || return 1                      # a whole disk
+        case "$disks" in *" $p "*) ;; *) return 1 ;; esac
+    done
+    for m in $members; do
+        name=$(member_md_name "/dev/$m")
+        [ -n "$name" ] && break
+    done
+    case "$name" in
+        *:0|*:3) return 0 ;;
+    esac
+    return 1
+}
+
+# How many members running array "$1" is missing, by md's own count.
+md_degraded() { cat "/sys/block/${1##*/}/md/degraded" 2>/dev/null; }
+
+# Say so, loudly, when the data array runs without all its members.
+report_degraded() {
+    local n
+    n=$(md_degraded "$DATA_MD")
+    case "$n" in ''|0|*[!0-9]*) return 0 ;; esac
+    warn "data array $DATA_MD is DEGRADED: running with $n member(s) missing"
+    warn "  replace the disk; see /proc/mdstat and: mdadm --detail $DATA_MD"
 }
 
 # Mount the data array at /volume1, enable swap, migrate + symlink /srv.
@@ -342,8 +472,62 @@ mount_arrays() {
 # Fresh provision of blank disks
 ###############################################################################
 
+# The swap UUID /etc/fstab names for md0, so that a re-provision gives the new
+# md0 the same one (mkswap -U) and fstab keeps matching it. Plain mkswap picks
+# a random UUID, and after an Erase every boot then waited about 90 s for the
+# swap device fstab named, which no longer existed.
+#
+# fstab_swap_uuid [UUID], where UUID is that of the md swap array about to be
+# replaced (empty or absent when there is none), prints:
+#   1. UUID, if a swap line in fstab names it: that line is md0's.
+#   2. Otherwise the UUID of the one swap line that no present device carries
+#      and that has pri=1, the md0 swap line as this project lays fstab out.
+#      That is md0's line after its disks were wiped or swapped, including an
+#      fstab an older Erase left out of step. pri=1 is required so md0 can
+#      never pick up another line's priority (e.g. pri=100, the NVMe swap's).
+#   3. Nothing otherwise: several candidates (a warning, no guess), none, or a
+#      missing, unreadable or malformed fstab. md0 then gets a new UUID.
+# It never edits fstab. Only swap lines whose first field is UUID=<lowercase
+# UUID> count: the form blkid prints and systemd looks up in
+# /dev/disk/by-uuid. Comments and malformed lines do not match.
+fstab_swap_uuid() {
+    local re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+    local cur="${1:-}" u p seen="" orphans="" others="" upper="" n=0
+    while read -r u p; do
+        if ! [[ $u =~ $re ]]; then
+            [[ ${u,,} =~ $re ]] && upper="$upper $u"
+            continue
+        fi
+        if [ -n "$cur" ] && [ "$u" = "$cur" ]; then
+            echo "$u"; return 0
+        fi
+        case "$seen " in *" $u "*) continue ;; esac      # listed twice
+        seen="$seen $u"
+        blkid -U "$u" >/dev/null 2>&1 && continue          # a present device has it
+        if [ "$p" = pri1 ]; then
+            orphans="$orphans $u"; n=$((n + 1))
+        else
+            others="$others $u"
+        fi
+    done < <(awk '$1 ~ /^UUID=/ && $3 == "swap" {
+                     u = substr($1, 6); gsub(/"/, "", u)
+                     print u, ($4 ~ /(^|,)pri=1(,|$)/ ? "pri1" : "-") }' "$FSTAB" 2>/dev/null)
+    [ -z "$upper" ] || warn "$FSTAB names swap UUID(s) in upper case, which systemd never matches (blkid prints lower case); ignored:$upper" >&2
+    if [ "$n" -eq 1 ]; then
+        echo "${orphans# }"
+    elif [ "$n" -gt 1 ]; then
+        warn "$FSTAB names $n pri=1 swap UUIDs that no disk carries:$orphans" >&2
+        warn "  cannot tell which one is md0's, so md0 gets a new UUID; fix $FSTAB by hand" >&2
+    elif [ -n "$others" ]; then
+        warn "$FSTAB names swap UUID(s) that no disk carries:$others" >&2
+        warn "  not given to md0: without pri=1 they would change its swap priority" >&2
+    fi
+}
+
+# provision "<disks>" "<swap UUID or empty>": the UUID comes from
+# fstab_swap_uuid, worked out by the caller before anything is wiped.
 provision() {
-    local disks="$1" host n active spare members p2list p5list
+    local disks="$1" swap_uuid="$2" host n active spare members p2list p5list
     host=$(hostname -s 2>/dev/null || hostname)
 
     n=$(echo "$disks" | wc -w)
@@ -428,9 +612,14 @@ provision() {
           --name="$host:3" $assume_clean $p5list >/dev/null 2>&1 \
         || die "mdadm create md3 failed"
 
-    # 3. Filesystems.
-    log "mkswap /dev/md0"
-    mkswap /dev/md0 >/dev/null 2>&1 || die "mkswap md0 failed"
+    # 3. Filesystems. md0 keeps the swap UUID fstab names for it, if any.
+    if [ -n "$swap_uuid" ]; then
+        log "mkswap /dev/md0 (UUID $swap_uuid, as $FSTAB names it)"
+        mkswap -U "$swap_uuid" /dev/md0 >/dev/null 2>&1 || die "mkswap md0 failed"
+    else
+        log "mkswap /dev/md0 (new UUID; $FSTAB has no md0 swap line to keep, left alone)"
+        mkswap /dev/md0 >/dev/null 2>&1 || die "mkswap md0 failed"
+    fi
     log "mkfs.ext4 /dev/md3"
     mkfs.ext4 -F -L volume1 /dev/md3 >/dev/null 2>&1 || die "mkfs.ext4 md3 failed"
 
@@ -445,7 +634,7 @@ provision() {
 ###############################################################################
 
 # Services that orchestrate or self-recover — never stopped by a nuke.
-NEVER_STOP='unifi-core.service ustated-shim.service provision-storage.service storage-nuke.service'
+NEVER_STOP='unifi-core.service ustated-shim.service provision-storage.service storage-nuke.service provision-storage-retry.service'
 
 # systemd unit owning a PID, via its cgroup. Empty if not a service.
 unit_of_pid() {
@@ -457,6 +646,10 @@ unit_of_pid() {
 # stopped so the caller can restart them. Three rounds, since stopping one
 # service can release another's grip.
 stop_volume_users() {
+    # Not mounted: nothing can be using it, and `fuser -m` on a plain
+    # directory lists every process on the filesystem holding it, here the
+    # root filesystem (sshd, journald, udevd, postgres...).
+    mountpoint -q "$STORAGE_VOLUME" || return 0
     local round pids pid unit units all=""
     for round in 1 2 3; do
         pids=$(fuser -m "$STORAGE_VOLUME" 2>/dev/null | tr -s ' ' '\n' \
@@ -484,6 +677,14 @@ do_nuke() {
     have fuser  || die "fuser not found (psmisc)"
     have wipefs || die "wipefs not found (util-linux)"
 
+    # vm-resume-recover.sh restarts the media stack for several minutes, after
+    # a VM pause or after retry mounted the array late (with the lock above
+    # dropped on purpose). An Erase in the middle races its restarts: a lazy
+    # umount, a failed mdadm --stop, a reprovision that dies. Refuse while one
+    # runs, and hold its lock (fd 8) so none starts until this Erase ends.
+    { exec 8>"$RECOVER_LOCK" && flock -n 8; } \
+        || die "vm-resume-recover.sh is running; try the Erase again once it has finished"
+
     if [ -t 0 ]; then
         printf '%s\n' "space nuke ERASES $STORAGE_VOLUME and every recording on it."
         printf 'Type ERASE to confirm: '
@@ -492,11 +693,16 @@ do_nuke() {
     fi
     log "space nuke: tearing down $STORAGE_VOLUME"
 
-    local stopped d p md
+    local stopped d p md swap_uuid
     stopped=$(stop_volume_users)
 
     # Release the volume + swap.
     scan_arrays
+    # The new md0 keeps the swap UUID fstab names for the old one. Read it
+    # now: the wipe below destroys it.
+    swap_uuid=""
+    [ -n "$SWAP_MD" ] && swap_uuid=$(blkid -o value -s UUID "$SWAP_MD" 2>/dev/null)
+    swap_uuid=$(fstab_swap_uuid "$swap_uuid")
     [ -n "$SWAP_MD" ] && swapoff "$SWAP_MD" 2>/dev/null && log "swapoff $SWAP_MD"
     if mountpoint -q "$STORAGE_VOLUME"; then
         umount "$STORAGE_VOLUME" 2>/dev/null || umount -l "$STORAGE_VOLUME" 2>/dev/null
@@ -528,7 +734,7 @@ do_nuke() {
     local blank=""
     for d in $(data_disks); do is_blank "$d" && blank="$blank $d"; done
     [ -n "${blank// /}" ] || die "no blank disks after wipe — aborting"
-    provision "${blank# }" || die "reprovision failed"
+    provision "${blank# }" "$swap_uuid" || die "reprovision failed"
 
     # Restart the services we stopped — they come up against the fresh volume.
     if [ -n "${stopped// /}" ]; then
@@ -569,11 +775,61 @@ do_boot() {
     # 1. Existing arrays take priority — never re-provision over them.
     mdadm --assemble --scan >/dev/null 2>&1 || true
     sleep 1
+
+    # 1a. Arrays assembled but not running, i.e. short a member. The
+    #     initramfs assembles arrays incrementally and leaves such an array
+    #     inactive. The assemble above then finds every member busy, and
+    #     udev's re-run of `mdadm --incremental` after the switch to the real
+    #     root fails the same way, so mdadm-last-resort@ is never armed for
+    #     it (mdadm 4.2 Assemble.c and Incremental.c). Nothing else would
+    #     ever start it. Start it degraded, as usd does on a UNVR and as the
+    #     assemble above would have if the initramfs had not claimed the
+    #     members first. `mdadm --run` only starts an existing array, and md
+    #     refuses unless its level has enough members; nothing is created,
+    #     added or wiped. Only this VM's own arrays (own_array); anything else
+    #     is left alone. Read before the scan below, so an array that starts
+    #     in between is found by the scan.
+    local pending md ours=""
+    pending=$(inactive_arrays | tr '\n' ' ')
+    for md in $pending; do
+        if ! own_array "$md"; then
+            warn "$md is assembled but not running, and not this VM's own array (members on data disks, named *:0 or *:3): left alone"
+            continue
+        fi
+        ours="$ours $md"
+        if mdadm --run "$md" >/dev/null 2>&1; then
+            warn "$md was assembled but not running (a member is missing): started it DEGRADED"
+        else
+            warn "$md is assembled but cannot start: too few members"
+        fi
+    done
     scan_arrays
     if [ -n "$DATA_MD" ]; then
         log "existing data array $DATA_MD — assembling and mounting"
+        report_degraded
         mount_arrays && exit 0
         die "failed to mount existing array $DATA_MD"
+    fi
+
+    # 1b. Still no data array, but an array is assembled and not running.
+    #     Never provision past one, ours or not: blank disks here may be its
+    #     replacement members, and "not ours" may be ours misread. If it is
+    #     ours and could not start (too few members), it may start later,
+    #     when a member comes back (mdadm's own incremental assembly or
+    #     mdadm-last-resort@ then starts it) or by hand: hand it to the retry
+    #     unit, which mounts it then; waiting here would hold networking and
+    #     ssh. --no-block: that unit orders after sysinit.target, which waits
+    #     for this one.
+    if [ -n "${pending// /}" ]; then
+        warn "no data array is running; not touching any disk (assembled, not running: ${pending% })"
+        if [ -z "$ours" ]; then
+            warn "  none of them is this VM's own; nothing will mount them"
+        elif systemctl --no-block start "$RETRY_UNIT" 2>/dev/null; then
+            warn "  $RETRY_UNIT mounts the data array once it runs (waits up to ${RETRY_SECS}s)"
+        else
+            warn "  could not start $RETRY_UNIT; once the array runs: $0 retry"
+        fi
+        exit 0
     fi
 
     # 2. No array. Look at the data disks.
@@ -597,20 +853,103 @@ do_boot() {
         exit 0
     fi
 
-    provision "${blank# }"
+    provision "${blank# }" "$(fstab_swap_uuid)"
 }
 
-case "${1:-boot}" in
-    boot)      do_boot ;;
-    provision)
-        # Force-provision blank disks without the assemble step. Used by the
-        # `ustorage space nuke` reprovision path.
-        disks=""
-        for d in $(data_disks); do is_blank "$d" && disks="$disks $d"; done
-        [ -n "${disks// /}" ] || die "no blank disks to provision"
-        provision "${disks# }"
-        ;;
-    nuke)      do_nuke ;;
-    status)    do_status ;;
-    *) echo "usage: $0 [boot|provision|nuke|status]" >&2; exit 1 ;;
-esac
+# ms, msp, msr and mst look at /srv once, when they start. Started before the
+# array was mounted, msr marks the recording path non-operational and records
+# nothing, msp never starts playback, ms and mst log to the local fallback,
+# each until restarted (see their 10-wait-for-volume1.conf drop-ins, which
+# cannot order them after a mount that is not in fstab). vm-resume-recover.sh
+# restarts the media stack in the only order that works (unifi-protect
+# stopped; ds, mst, msp, msr, ms one at a time; unifi-protect started), then
+# proves recording by bytes written: on 2026-08-26 every unit was "active"
+# and nothing was recorded. Only the retry unit gets here, never usd's slot.
+# Nothing to do while no media service has started yet.
+recover_protect() {
+    local s up=""
+    for s in $MEDIA_SVCS; do
+        case "$(systemctl is-active "$s" 2>/dev/null)" in
+            active|activating|reloading|failed) up="$up $s" ;;
+        esac
+    done
+    if [ -z "$up" ]; then
+        log "no media service has started yet; nothing to restart"
+        return 0
+    fi
+    if [ ! -x "$RECOVER" ]; then
+        warn "$RECOVER not found: msr records nothing until the media services are restarted"
+        return 1
+    fi
+    log "media services started without $STORAGE_VOLUME:$up; running $RECOVER"
+    # shellcheck disable=SC2086
+    systemctl reset-failed $up 2>/dev/null       # clear a start limit
+    if "$RECOVER" "array mounted late by $RETRY_UNIT"; then
+        log "recording confirmed after the late mount"
+    else
+        warn "recording did NOT resume after the late mount; see /var/log/vm-resume-recover.log"
+        return 1
+    fi
+}
+
+# retry: for an array boot mode found assembled but could not start (see step
+# 1b of do_boot). Look every RETRY_EVERY s, for up to RETRY_SECS, for a running
+# data array; mount it and restart Protect's media stack (recover_protect),
+# without the lock: that takes minutes and must not hold off an Erase. Only
+# ever mounts an array that is already running: never assembles, starts,
+# creates or wipes one. Safe to run by hand.
+do_retry() {
+    local waited=0
+    log "waiting up to ${RETRY_SECS}s for the data array to run"
+    while :; do
+        take_lock || die "cannot take $LOCK"
+        if mountpoint -q "$STORAGE_VOLUME"; then
+            log "$STORAGE_VOLUME is mounted now - nothing to do"
+            exit 0
+        fi
+        scan_arrays
+        if [ -n "$DATA_MD" ]; then
+            warn "data array $DATA_MD is running now; mounting it late, after Protect started"
+            report_degraded
+            mount_arrays
+            drop_lock
+            recover_protect || exit 1
+            exit 0
+        fi
+        drop_lock
+        [ "$waited" -lt "$RETRY_SECS" ] || break
+        sleep "$RETRY_EVERY"
+        waited=$((waited + RETRY_EVERY))
+    done
+    warn "gave up after ${RETRY_SECS}s: no data array is running, so $STORAGE_VOLUME is NOT mounted and Protect records nothing"
+    warn "  assembled but not running: $(inactive_arrays | tr '\n' ' ')(see /proc/mdstat)"
+    warn "  once the array runs: $0 retry"
+    exit 1
+}
+
+main() {
+    local disks d
+    case "${1:-boot}" in
+        boot)
+            take_lock "$BOOT_LOCK_WAIT" \
+                || warn "cannot take $LOCK within ${BOOT_LOCK_WAIT}s; carrying on without it"
+            do_boot ;;
+        provision)
+            # Force-provision blank disks without the assemble step. Used by
+            # the `ustorage space nuke` reprovision path.
+            take_lock || die "cannot take $LOCK"
+            disks=""
+            for d in $(data_disks); do is_blank "$d" && disks="$disks $d"; done
+            [ -n "${disks// /}" ] || die "no blank disks to provision"
+            provision "${disks# }" "$(fstab_swap_uuid)"
+            ;;
+        nuke)      take_lock || die "cannot take $LOCK"; do_nuke ;;
+        retry)     do_retry ;;
+        status)    do_status ;;
+        *) echo "usage: $0 [boot|provision|nuke|retry|status]" >&2; exit 1 ;;
+    esac
+}
+
+# Sourced (the tests in vm/storage/tests/ do that): define, do not run.
+[ "${BASH_SOURCE[0]}" = "$0" ] || return 0
+main "$@"

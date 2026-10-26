@@ -24,7 +24,10 @@
 #
 # Where this differs from usd.service, and why:
 #   - Type=oneshot + RemainAfterExit=yes, no Restart=: the script is not a
-#     daemon. Unlike usd it cannot pick up an array that appears later.
+#     daemon. Boot mode starts an array that is assembled but not running
+#     because a member is missing (degraded). One that cannot start yet (too
+#     few members) is handed to provision-storage-retry.service, which
+#     mounts it if it starts later and restarts Protect's media stack.
 #   - No Requires=usdbd.service / Wants=uhwd.service: those Ubiquiti daemons
 #     are masked on the VM, as usd is.
 #   - After=swap.target (VM only): /etc/fstab owns the md0 swap (pri=1,
@@ -33,7 +36,10 @@
 #     path it was when this unit ran after sysinit.target. Without it they
 #     race, and the swap unit won by only about 0.4 s on 2026-10-23. No cost
 #     on a normal boot: md0 swap is active before local-fs-pre.target, and
-#     sysinit.target already waits for swap.target.
+#     sysinit.target already waits for swap.target. The cost is on a boot
+#     with a DAS disk missing: md0 is then inactive too, its fstab swap waits
+#     out the device timeout (about 90 s), and only then does this unit run
+#     and start md0 and md3 degraded.
 #   - TimeoutStartSec=600 instead of usd's TimeoutSec=600: the same start
 #     limit. The stop limit stays at the default; there is no ExecStop.
 #   - Before= ustated-shim, unifi-core, unifi-protect, postgresql: kept from
@@ -61,6 +67,7 @@
 # INSTALL (inside the VM, as root)
 #   install -m 0755 provision-storage.sh /usr/local/sbin/provision-storage.sh
 #   install -m 0644 provision-storage.service /etc/systemd/system/
+#   install -m 0644 provision-storage-retry.service /etc/systemd/system/
 #   systemctl daemon-reload
 #   systemctl reenable provision-storage.service
 # Use reenable, not enable: it removes the multi-user.target.wants link left
