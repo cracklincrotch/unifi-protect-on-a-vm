@@ -416,7 +416,8 @@ out=$(UBNTNAS_REAL="$T/missing" bash "$GUARD" system reset 2>&1); rc=$?
 check "ubntnas guard: no real binary -> clear error, not a loop" '[ $rc = 1 ] && grep -q "no real ubntnas" <<<"$out"' "$out"
 cp "$GUARD" "$T/guard-as-real"
 to=(); command -v timeout >/dev/null 2>&1 && to=(timeout 10)   # none on macOS
-out=$(UBNTNAS_REAL="$T/guard-as-real" "${to[@]}" bash "$GUARD" system reset 2>&1); rc=$?
+# ${to[@]+...}: bash 3.2 (macOS) treats an empty array as unbound under set -u.
+out=$(UBNTNAS_REAL="$T/guard-as-real" ${to[@]+"${to[@]}"} bash "$GUARD" system reset 2>&1); rc=$?
 check "ubntnas guard: refuses to exec itself as the real binary" '[ $rc = 1 ] && grep -q "no real ubntnas" <<<"$out"' "$out"
 check "install-shims.sh diverts ubntnas to ubntnas.real and installs the guard" \
     'grep -q "dpkg-divert --local --rename --divert /usr/bin/ubntnas.real" "$SHIMS" && grep -qF "wrappers/rootfs/usr/bin/ubntnas" "$SHIMS" && grep -q "mv -f /usr/bin/ubntnas.new /usr/bin/ubntnas" "$SHIMS"' ""
