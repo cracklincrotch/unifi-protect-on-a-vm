@@ -1,0 +1,69 @@
+#!/bin/bash
+###############################################################################
+# ubntnas  (ubntnas-vm-guard: VM-side guard for the console's update and reset)
+#
+# In the repo this file lives at vm/wrappers/rootfs/usr/bin/ubntnas, the
+# path it installs to. install-shims.sh installs it and moves the packaged
+# binary aside with dpkg-divert, to /usr/bin/ubntnas.real.
+#
+# WHY
+#
+# The console UI's Update (and its auto-update) runs `ubnt-systool fwupdate`,
+# which hands the downloaded firmware to
+#
+#   ubntnas system upgrade <file> -f --no-reboot
+#
+# whenever ubntnas is on PATH, as it is here. ubntnas writes a real UNVR's
+# boot media (flash partitions, the eMMC's kernel and root partitions, the
+# uboot environment) and first runs the new firmware's own updater. On this
+# VM it stops early because /proc/ubnthal is missing, but nothing should
+# depend on that: docs/unifi-os-6-compat.md, "How a real UNVR upgrades in
+# place". The UI's Reset (reset2defaults) runs `ubntnas system reset`, which
+# arms a real UNVR's next boot to reformat its overlay and, with "format",
+# wipe the data disks; refused for the same reason. This guard refuses those
+# two calls and passes everything else to the real binary. Firmware on this
+# VM moves with update-unifi.sh, and a VM rolls back with snapshot.sh, never
+# through the UI.
+#
+# ubnt-systool shows ubntnas's stdout as the failure reason, so the refusal
+# is printed there; it is also logged.
+#
+# UBNTNAS_REAL overrides the real binary's path (vm/tests/ only).
+###############################################################################
+
+REAL="${UBNTNAS_REAL:-/usr/bin/ubntnas.real}"
+
+# The first two words that are not flags name the command, so a global flag
+# in front (`ubntnas -v system upgrade ...`) does not slip past.
+words=()
+for arg in "$@"; do
+    case "$arg" in -*) ;; *) words+=("$arg") ;; esac
+    [ "${#words[@]}" -ge 2 ] && break
+done
+
+msg=""
+if [ "${words[0]:-}" = system ]; then
+    case "${words[1]:-}" in
+        upgrade)
+            msg="Firmware update from the console is disabled on this VM: ubntnas is"
+            msg="$msg built to rewrite a real UNVR's boot flash, which a VM does not have."
+            msg="$msg Update with update-unifi.sh --sync-os instead." ;;
+        reset)
+            msg="Reset to defaults from the console is disabled on this VM: ubntnas"
+            msg="$msg resets a real UNVR's boot flash and disks, not a VM. Roll back"
+            msg="$msg with snapshot.sh on the host instead." ;;
+    esac
+fi
+if [ -n "$msg" ]; then
+    echo "$msg"
+    logger -t ubntnas-vm-guard -p daemon.warning "refused: ubntnas $*" 2>/dev/null || true
+    exit 1
+fi
+
+if [ ! -x "$REAL" ] || head -3 "$REAL" 2>/dev/null | grep -q 'ubntnas-vm-guard'; then
+    echo "ubntnas guard: no real ubntnas at $REAL" >&2
+    echo "  reinstall the ubntnas package, then re-run vm/installers/install-shims.sh" >&2
+    exit 1
+fi
+
+exec "$REAL" "$@"

@@ -82,6 +82,8 @@ vm/                         Copied into the VM and run there
     rootfs/usr/sbin/smartctl     SMART proxy wrapper
     rootfs/sbin/mdadm            /dev/md3 resolution fix
     smartctl-proxy.conf.example
+  tests/                    Stubbed tests for the vm/ scripts (any Linux, no
+                            root, no VM)
 
 capture/                    Diagnostic gRPC/storage capture tools
 ```
@@ -179,6 +181,7 @@ The Ubiquiti software expects certain UNVR-specific hardware interfaces (storage
 - **`ubnt-tools id`**: a binary that reports board ID, serial number, hardware revision. Some Protect features check this. We wrap it with a script that returns sensible defaults.
 - **`/sbin/ustorage`**: the UNVR has a storage daemon (`usd`) that reports disk topology. It crashes in a VM. We provide a fake script that returns the size of `/srv` instead, and mask the real services.
 - **`/sbin/mdadm`**: the real `unifi-core` runs an `mdadm --detail` check on its storage array roughly every minute. We wrap `mdadm` so this check returns success even when the storage looks different from what `unifi-core` expects. On a real UNVR the array is typically `/dev/md3`; on the VM, the array may have a different device number depending on whether you imported existing disks or let the VM create a fresh array.
+- **`ubntnas`**: the console UI's Update hands the firmware to `ubntnas system upgrade`, which is built to rewrite a real UNVR's boot flash and first runs the new firmware's own updater. On the VM it finds no `/proc/ubnthal` and stops before doing either, but nothing should rely on that. The UI's Reset reaches it the same way, as `ubntnas system reset`. A guard (`vm/wrappers/rootfs/usr/bin/ubntnas`, diverted into place by `install-shims.sh`) refuses those two calls and passes everything else to the real binary. Update with `update-unifi.sh` instead, and roll back with `snapshot.sh`. `install-shims.sh` also masks `uscsi-reset-wipe.service`, ustd's reset-time disk wipe.
 - **Storage array existence**: the install script creates a small array so `unifi-core` and the storage stack have something to look at. See **Storage layout** below for what this means for multi-disk setups.
 
 ### Services we disable
@@ -189,6 +192,7 @@ The UNVR runs hardware-management services that crash on a VM:
 - `rpsd` (reset power switch daemon) — manages the UNVR's physical reset button
 - `uhwd` (hardware watchdog daemon) — UNVR-specific hardware monitoring
 - `sfpd` (SFP+ optical port daemon) — for the UNVR's network ports
+- `ufcd` (fan control daemon, new in UniFi OS 6.0) - drives the UNVR's fans; masked by the installers whenever they install the Ubiquiti packages (on 5.x, where it does not exist, the mask is a harmless placeholder)
 - `unvr-initramfs` (boot scripts that wait for UNVR-specific MTD flash) — removed entirely
 
 These are masked (not just disabled) because they're triggered as dependencies by `ustated` and would otherwise restart.
@@ -665,7 +669,7 @@ Once running, updates are handled by `update-unifi.sh`:
 ```bash
 ./update-unifi.sh              # Show what's available
 ./update-unifi.sh --check      # Same as default
-./update-unifi.sh --sync-os    # Update UniFi OS packages from latest UNVR firmware
+./update-unifi.sh --sync-os    # Update UniFi OS packages from the newest UNVR firmware on OS_TRACK
 ./update-unifi.sh --protect    # Update Protect to latest stable
 ./update-unifi.sh --access     # Update Access to latest stable
 ./update-unifi.sh --all        # Sync OS + upgrade Protect + Access
@@ -673,6 +677,8 @@ Once running, updates are handled by `update-unifi.sh`:
 ```
 
 The script queries Ubiquiti's firmware API (the same one the UNVR uses to find updates) and downloads the latest debs directly. Checksum verification on every download.
+
+**UniFi OS 6.0 and `OS_TRACK`.** UniFi OS 6.0 rebased the UNVR firmware from Debian 11 (bullseye) onto Debian 13 (trixie), and its packages cannot be installed on this VM's Debian 11. So `--sync-os` follows the newest release of the major built on the VM's own Debian release (bullseye: 5.x), not the API's newest of any major. `--check` says when a newer firmware exists outside that line. Pin with `OS_TRACK=5.1` or `OS_TRACK=5.1.33` (or `--os-track`); `OS_TRACK=latest` restores the old behaviour. If the firmware's Debian release does not match the VM's, `--sync-os` stops right after downloading and unpacking it, before it stops a service or installs anything. The comparison and the route to 6.0 are in [docs/unifi-os-6-compat.md](docs/unifi-os-6-compat.md).
 
 ### Should I run `apt-get upgrade`?
 
