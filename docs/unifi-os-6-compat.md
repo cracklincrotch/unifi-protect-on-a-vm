@@ -232,12 +232,14 @@ old behaviour was the bug:
   set for tests.
 - `vm/storage/rootfs/usr/bin/ustorage`: `worm check [--details]`.
 - `vm/wrappers/rootfs/usr/bin/ubntnas` (new) and `vm/installers/install-shims.sh`:
-  the guard refuses `system upgrade` (also behind a leading flag), prints the
-  reason `ubnt-systool` shows in the UI, logs it, and passes everything else
-  to the real binary. `install-shims.sh` diverts the packaged binary to
+  the guard refuses `system upgrade` and `system reset` (also behind a
+  leading flag), prints the reason `ubnt-systool` shows in the UI, logs it,
+  and passes everything else to the real binary. `install-shims.sh` also
+  masks `uscsi-reset-wipe.service` where `ustd` ships it, and `--verify`
+  checks both (separate commit, so it can be dropped). `install-shims.sh` diverts the packaged binary to
   `/usr/bin/ubntnas.real` with `dpkg-divert`, so a `--sync-os` reinstall of
   the `ubntnas` package lands there and never replaces the guard.
-- `vm/tests/test_unifi_os6_compat.sh`: 91 stubbed checks (no root, no VM, no
+- `vm/tests/test_unifi_os6_compat.sh`: 96 stubbed checks (no root, no VM, no
   network; Linux, and macOS with python3 and jq, where the dpkg-only checks
   are skipped), covering the helpers, the guard and version-stamp wiring,
   the installer's track block and guard (run against fixtures), the patch
@@ -245,7 +247,7 @@ old behaviour was the bug:
   that the update script has its sourced-return guard and refuses to source
   it otherwise, so against the code before this PR it stops at that check.
   With `FW_ROOT_51`/`FW_ROOT_60` pointing at unpacked images it adds 4 checks
-  against the real firmware.
+  against the real firmware (100 in all).
 
 Not changed, on purpose: `ustated-shim.js`, the `ubnt-tools` and smartctl
 parts of `install-shims.sh`, `seed-anonid.sh`, the ms/msr/msp/mst and postgres drop-ins,
@@ -436,7 +438,7 @@ not traced end to end.
 - No UNVR sysid targets `/dev/sd*`, so breaking item 7 overstated the risk
   to the recording disks (corrected there). The guard stays: it costs
   nothing, gives a clear refusal, and keeps the updater from running at all.
-- `ubntnas system reset` (open question): it stops at the same first step.
+- `ubntnas system reset` (an open question until 2026-10-26): it stops at the same first step.
   On a real UNVR it runs the reset-top and reset-bottom hooks and writes
   `/config/.reset-to-defaults`. With the format option, the next boot wipes
   the data disks in two places:
@@ -454,10 +456,10 @@ not traced end to end.
   then does nothing is still inferred from the compiled binary. So a reset
   looks inert here today, for two independent reasons.
 
-  Recommended, not done in this doc-only commit: add `uscsi-reset-wipe` to
-  the installers' mask lists, since it is the one Ubiquiti unit on the VM
-  whose job is to wipe the recording disks. Also add `system reset` to the
-  guard, for symmetry.
+  Done anyway, as defence in depth and in a separate commit that can be
+  dropped: `install-shims.sh` masks `uscsi-reset-wipe`, the one Ubiquiti
+  unit on the VM whose job is to wipe the recording disks, and the guard
+  refuses `system reset` as it does `system upgrade`.
 
 ### 2. A device-style in-place path for the VM (design only)
 
@@ -660,13 +662,6 @@ a clone.
 - Whether `ubnt-systool network-fec` and the systemd-mode WebRTC worker behave
   on a VM.
 - When Ubiquiti stops publishing `uos-deb11-arm64` app builds.
-- Whether the `ubntnas` guard should also refuse `system reset`:
-  reset2defaults (the UI's Reset, with "format" optional) runs `ubntnas system
-  reset --no-reboot [--do-format] ...` the same way. It is inert on the VM
-  today ("How a real UNVR upgrades in place", section 1): `ubntnas` stops
-  without `/proc/ubnthal`, and the wipe itself only happens at the next boot,
-  in code that the VM either never runs or that finds nothing to act on. Recommended for symmetry, together with
-  masking `uscsi-reset-wipe`; left passing through until decided.
 - Pre-existing, not 6.0: the installer downloads the firmware without a
   SHA256 check; a Debian `mdadm` update replaces the `/sbin/mdadm` wrapper;
   the `ustorage` shim has no `disk clean`, so the UI's per-disk erase reports
@@ -743,7 +738,7 @@ or host-side state.
    `/etc/default/unifi-storage` for one boot). Until then `--verify` reports
    `md array [UUUU]` as FAIL, which is expected.
 5. **Deliver the branch** (scripts ISO) and run
-   `bash vm/tests/test_unifi_os6_compat.sh`: 91 passed, 0 failed.
+   `bash vm/tests/test_unifi_os6_compat.sh`: 96 passed, 0 failed.
 6. **Re-lay on 5.1.33**: `install-storage.sh`, then `systemctl restart unifi-core`;
    `journalctl -u unifi-core-storage-patch -b` shows "already applied" or
    "Patch A applied", not "not needed". `update-unifi.sh --verify`: all OK.
@@ -773,7 +768,9 @@ or host-side state.
    run): `head -3 /usr/bin/ubntnas` shows `ubntnas-vm-guard`,
    `dpkg-divert --list /usr/bin/ubntnas` names `/usr/bin/ubntnas.real`, and
    `ubntnas system upgrade /nonexistent -f --no-reboot` prints the refusal
-   and exits 1 (`journalctl -t ubntnas-vm-guard` logs it). Only once those
+   and exits 1 (`journalctl -t ubntnas-vm-guard` logs it). The same for
+   `ubntnas system reset --no-reboot` (the reset refusal), and
+   `systemctl is-enabled uscsi-reset-wipe.service` says `masked`. Only once those
    hold, and on the clone only, the full UI path with a valid image (it
    checks the file with `fwinfo` before calling `ubntnas`):
    `ubnt-systool fwupdate /opt/unifi-update/fwupdate.bin` from step 8 must

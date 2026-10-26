@@ -377,9 +377,12 @@ verify_shims() {
     if [ -e /lib/systemd/system/ufcd.service ] || [ -e /usr/lib/systemd/system/ufcd.service ]; then
         [ "$(systemctl is-enabled ufcd.service 2>/dev/null)" = masked ]; _ck $? "ufcd masked"
     fi
+    if [ -e /lib/systemd/system/uscsi-reset-wipe.service ] || [ -e /usr/lib/systemd/system/uscsi-reset-wipe.service ]; then
+        [ "$(systemctl is-enabled uscsi-reset-wipe.service 2>/dev/null)" = masked ]; _ck $? "uscsi-reset-wipe masked (reset-time disk wipe)"
+    fi
     if dpkg-query -W -f='${Status}' ubntnas 2>/dev/null | grep -q 'install ok installed'; then
         head -3 /usr/bin/ubntnas 2>/dev/null | grep -q 'ubntnas-vm-guard' &&
-            [ -x /usr/bin/ubntnas.real ]; _ck $? "ubntnas firmware-update guard (UI Update refused)"
+            [ -x /usr/bin/ubntnas.real ]; _ck $? "ubntnas firmware-update guard (UI Update and Reset refused)"
     fi
     grep -q 'UUUU' /proc/mdstat 2>/dev/null;                      _ck $? "md array [UUUU]"
     [ -s /var/run/anonymous_device_id ];                          _ck $? "anonymous_device_id present"

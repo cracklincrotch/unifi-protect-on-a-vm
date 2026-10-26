@@ -11,7 +11,8 @@
 #                                 the ufcd mask, the platform
 #   unifi-core-storage-patch.sh   5.1 patch, 6.0 no-op, anchor-drift alert
 #   ustorage                      worm check, unknown verbs
-#   ubntnas guard                 refuses `system upgrade`, passes the rest
+#   ubntnas guard                 refuses `system upgrade` and `system reset`,
+#                                 passes the rest
 #
 # Needs bash, python3 and jq. Written for Linux; it also runs on macOS
 # (checks that need dpkg are skipped there).
@@ -391,7 +392,7 @@ out=$(runpatch "$T/svcshape.js")
 check "patch: snapshot shape without the call -> anchor check, alert" 'grep -q "ALERT" <<<"$out"' "$out"
 
 ###############################################################################
-# ubntnas guard: the console UI's Update must not reach ubntnas
+# ubntnas guard: the console UI's Update and Reset must not reach ubntnas
 ###############################################################################
 # A fake real binary that records how it was called.
 cat > "$T/ubntnas.real" <<EOF
@@ -409,19 +410,29 @@ check "ubntnas guard: the refusal is logged" \
 out=$(guard -v system upgrade /tmp/f); rc=$?
 check "ubntnas guard: a global flag in front does not get past" '[ $rc = 1 ] && [ ! -s "$T/real.calls" ]' "$out"
 out=$(guard system reset --no-reboot --do-format); rc=$?
-check "ubntnas guard: everything else (system reset ...) runs the real binary, args and rc intact" \
-    '[ $rc = 7 ] && [ "$(cat "$T/real.calls")" = "real system reset --no-reboot --do-format" ]' "$out
+check "ubntnas guard: reset2defaults' 'system reset --no-reboot --do-format' is refused" \
+    '[ $rc = 1 ] && grep -q "Reset to defaults from the console is disabled" <<<"$out" && grep -q "snapshot.sh" <<<"$out" && [ ! -s "$T/real.calls" ]' "$out"
+check "ubntnas guard: the reset refusal is logged" \
+    'grep -q "logger -t ubntnas-vm-guard -p daemon.warning refused: ubntnas system reset --no-reboot --do-format" <<<"$(calls)"' "$(calls)"
+out=$(guard --verbose system reset); rc=$?
+check "ubntnas guard: a global flag in front of reset does not get past" '[ $rc = 1 ] && [ ! -s "$T/real.calls" ]' "$out"
+out=$(guard system id --json); rc=$?
+check "ubntnas guard: everything else (system id ...) runs the real binary, args and rc intact" \
+    '[ $rc = 7 ] && [ "$(cat "$T/real.calls")" = "real system id --json" ]' "$out
 $(cat "$T/real.calls")"
-out=$(UBNTNAS_REAL="$T/missing" bash "$GUARD" system reset 2>&1); rc=$?
+out=$(UBNTNAS_REAL="$T/missing" bash "$GUARD" version 2>&1); rc=$?
 check "ubntnas guard: no real binary -> clear error, not a loop" '[ $rc = 1 ] && grep -q "no real ubntnas" <<<"$out"' "$out"
 cp "$GUARD" "$T/guard-as-real"
 to=(); command -v timeout >/dev/null 2>&1 && to=(timeout 10)   # none on macOS
 # ${to[@]+...}: bash 3.2 (macOS) treats an empty array as unbound under set -u.
-out=$(UBNTNAS_REAL="$T/guard-as-real" ${to[@]+"${to[@]}"} bash "$GUARD" system reset 2>&1); rc=$?
+out=$(UBNTNAS_REAL="$T/guard-as-real" ${to[@]+"${to[@]}"} bash "$GUARD" version 2>&1); rc=$?
 check "ubntnas guard: refuses to exec itself as the real binary" '[ $rc = 1 ] && grep -q "no real ubntnas" <<<"$out"' "$out"
 check "install-shims.sh diverts ubntnas to ubntnas.real and installs the guard" \
     'grep -q "dpkg-divert --local --rename --divert /usr/bin/ubntnas.real" "$SHIMS" && grep -qF "wrappers/rootfs/usr/bin/ubntnas" "$SHIMS" && grep -q "mv -f /usr/bin/ubntnas.new /usr/bin/ubntnas" "$SHIMS"' ""
 check "--verify checks the ubntnas guard" 'grep -q "ubntnas firmware-update guard" "$UPD"' ""
+check "install-shims.sh masks uscsi-reset-wipe.service where ustd ships it" \
+    'grep -q "systemctl mask uscsi-reset-wipe.service" "$SHIMS" && grep -q "/usr/lib/systemd/system/uscsi-reset-wipe.service" "$SHIMS"' ""
+check "--verify checks that uscsi-reset-wipe is masked" 'grep -q "uscsi-reset-wipe masked" "$UPD"' ""
 check "--access and --check compare app versions without the API's leading v" \
     'grep -qF "if [ \"\$CURRENT_ACCESS\" = \"\${ACCESS_VERSION#v}\" ]; then" "$UPD" && grep -qF "\"\$CURRENT_PROTECT\"    \"\${PROTECT_VERSION#v}\"" "$UPD" && grep -qF "\"\$CURRENT_ACCESS\"     \"\${ACCESS_VERSION#v}\"" "$UPD"' ""
 

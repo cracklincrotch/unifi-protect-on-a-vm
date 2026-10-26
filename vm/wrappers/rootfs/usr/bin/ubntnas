@@ -1,6 +1,6 @@
 #!/bin/bash
 ###############################################################################
-# ubntnas  (ubntnas-vm-guard: VM-side guard for the console firmware update)
+# ubntnas  (ubntnas-vm-guard: VM-side guard for the console's update and reset)
 #
 # In the repo this file lives at vm/wrappers/rootfs/usr/bin/ubntnas, the
 # path it installs to. install-shims.sh installs it and moves the packaged
@@ -18,10 +18,12 @@
 # uboot environment) and first runs the new firmware's own updater. On this
 # VM it stops early because /proc/ubnthal is missing, but nothing should
 # depend on that: docs/unifi-os-6-compat.md, "How a real UNVR upgrades in
-# place". This guard refuses that one call and passes everything else
-# (ubnt-systool also runs `ubntnas system reset` for reset2defaults) to the
-# real binary. Firmware on this VM moves with update-unifi.sh, never through
-# the UI.
+# place". The UI's Reset (reset2defaults) runs `ubntnas system reset`, which
+# arms a real UNVR's next boot to reformat its overlay and, with "format",
+# wipe the data disks; refused for the same reason. This guard refuses those
+# two calls and passes everything else to the real binary. Firmware on this
+# VM moves with update-unifi.sh, and a VM rolls back with snapshot.sh, never
+# through the UI.
 #
 # ubnt-systool shows ubntnas's stdout as the failure reason, so the refusal
 # is printed there; it is also logged.
@@ -39,10 +41,20 @@ for arg in "$@"; do
     [ "${#words[@]}" -ge 2 ] && break
 done
 
-if [ "${words[0]:-}" = system ] && [ "${words[1]:-}" = upgrade ]; then
-    msg="Firmware update from the console is disabled on this VM: ubntnas is"
-    msg="$msg built to rewrite a real UNVR's boot flash, which a VM does not have."
-    msg="$msg Update with update-unifi.sh --sync-os instead."
+msg=""
+if [ "${words[0]:-}" = system ]; then
+    case "${words[1]:-}" in
+        upgrade)
+            msg="Firmware update from the console is disabled on this VM: ubntnas is"
+            msg="$msg built to rewrite a real UNVR's boot flash, which a VM does not have."
+            msg="$msg Update with update-unifi.sh --sync-os instead." ;;
+        reset)
+            msg="Reset to defaults from the console is disabled on this VM: ubntnas"
+            msg="$msg resets a real UNVR's boot flash and disks, not a VM. Roll back"
+            msg="$msg with snapshot.sh on the host instead." ;;
+    esac
+fi
+if [ -n "$msg" ]; then
     echo "$msg"
     logger -t ubntnas-vm-guard -p daemon.warning "refused: ubntnas $*" 2>/dev/null || true
     exit 1
